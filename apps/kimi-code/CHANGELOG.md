@@ -1,5 +1,13 @@
 # @moonshot-ai/kimi-code
 
+## 0.39.1
+
+### Patch Changes
+
+- [#3307](https://github.com/MoonshotAI/kimi-code/pull/3307) [`0310f22`](https://github.com/MoonshotAI/kimi-code/commit/0310f223daf9596ac403e94c7224ce2f744951c3) Thanks [@kimi-agent-bot](https://github.com/kimi-agent-bot)! - Increase the request timeout for `kimi update`.
+
+- [#3292](https://github.com/MoonshotAI/kimi-code/pull/3292) [`23921e9`](https://github.com/MoonshotAI/kimi-code/commit/23921e9f2c5a50f66ad5616554fac8565772919d) Thanks [@7Sageer](https://github.com/7Sageer)! - When a session resumes, the assistant is warned that background tasks from the previous session may still be running.
+
 ## 0.39.0
 
 ### Minor Changes
