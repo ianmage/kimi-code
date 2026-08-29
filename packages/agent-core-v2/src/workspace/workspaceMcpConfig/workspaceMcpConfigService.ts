@@ -107,6 +107,7 @@ export class WorkspaceMcpConfigService extends Disposable implements IWorkspaceM
         cwd: this.workspace.cwd,
         homeDir: this.bootstrap.homeDir,
         includeProject: this.trust.isTrusted(),
+        onWarn: (message) => this.log.warn(message),
       }),
       this.plugins.enabledMcpServers(),
     ]);
@@ -166,6 +167,7 @@ export class WorkspaceMcpConfigService extends Disposable implements IWorkspaceM
         cwd: this.workspace.cwd,
         homeDir: this.bootstrap.homeDir,
         includeProject: this.trust.isTrusted(),
+        onWarn: (message) => this.log.warn(message),
       });
       this.fileServers = new Map(Object.entries(fresh));
       await this.publishIfChanged();

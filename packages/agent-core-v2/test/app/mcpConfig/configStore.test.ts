@@ -131,6 +131,44 @@ describe('McpConfigStore', () => {
 
       expect(await readRaw()).toBe(before);
     });
+
+    it('rejects add/update with a placeholder remote url without touching the file', async () => {
+      await store.add(stdioServer('seed'));
+      const before = await readRaw();
+
+      await expect(
+        store.add({ name: 'bad', transport: 'http', url: 'https://x.com/${P}' }),
+      ).rejects.toMatchObject({
+        code: ErrorCodes.CONFIG_INVALID,
+        message: expect.stringContaining('bad'),
+      });
+      await expect(
+        store.update({ name: 'seed', transport: 'http', url: 'https://x.com/${P}' }),
+      ).rejects.toMatchObject({ code: ErrorCodes.CONFIG_INVALID });
+
+      expect(await readRaw()).toBe(before);
+      expect((await store.list()).map((server) => server.name)).toEqual(['seed']);
+    });
+
+    it('lists and removes entries of a file that already contains a placeholder remote url', async () => {
+      await seedJson({
+        mcpServers: {
+          poisoned: { transport: 'http', url: 'https://x.com/${P}' },
+          healthy: { transport: 'stdio', command: 'node' },
+        },
+      });
+
+      expect((await store.list()).map((server) => server.name).toSorted()).toEqual([
+        'healthy',
+        'poisoned',
+      ]);
+
+      const remaining = await store.remove('poisoned');
+      expect(remaining.map((server) => server.name)).toEqual(['healthy']);
+      expect(JSON.parse((await readRaw())!).mcpServers).toEqual({
+        healthy: { transport: 'stdio', command: 'node' },
+      });
+    });
   });
 
   describe('name normalization', () => {

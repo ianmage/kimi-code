@@ -394,6 +394,75 @@ describe('parseManifest', () => {
     );
   });
 
+  it('warns and drops a remote mcpServer whose url contains env template expansion', async () => {
+    const root = await makePlugin({
+      'kimi.plugin.json': JSON.stringify({
+        name: 'demo',
+        mcpServers: {
+          bad: { transport: 'http', url: 'https://x.com/${TOKEN}/mcp' },
+          good: { transport: 'stdio', command: 'npx', args: ['-y', 'server'] },
+        },
+      }),
+    });
+    const result = await parseManifest(root);
+    expect(result.manifest?.mcpServers?.['bad']).toBeUndefined();
+    expect(result.manifest?.mcpServers?.['good']).toEqual({
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', 'server'],
+    });
+    expect(result.diagnostics).toContainEqual(
+      expect.objectContaining({
+        severity: 'warn',
+        message: expect.stringContaining(
+          '"mcpServers.bad.url" does not support environment variable expansion',
+        ),
+      }),
+    );
+  });
+
+  it('warns and drops a stdio mcpServer whose command contains a placeholder', async () => {
+    const root = await makePlugin({
+      'kimi.plugin.json': JSON.stringify({
+        name: 'demo',
+        mcpServers: {
+          bad: { command: '${BIN}/server', cwd: './bin' },
+          good: { command: 'npx' },
+        },
+      }),
+    });
+    const result = await parseManifest(root);
+    expect(result.manifest?.mcpServers?.['bad']).toBeUndefined();
+    expect(result.manifest?.mcpServers?.['good']).toEqual({ transport: 'stdio', command: 'npx' });
+    expect(result.diagnostics).toContainEqual(
+      expect.objectContaining({
+        severity: 'warn',
+        message: expect.stringContaining('"mcpServers.bad.command"'),
+      }),
+    );
+  });
+
+  it('warns and drops a stdio mcpServer whose cwd contains a placeholder', async () => {
+    const root = await makePlugin({
+      'kimi.plugin.json': JSON.stringify({
+        name: 'demo',
+        mcpServers: {
+          bad: { command: 'npx', cwd: '${ROOT}/bin' },
+          good: { command: 'node' },
+        },
+      }),
+    });
+    const result = await parseManifest(root);
+    expect(result.manifest?.mcpServers?.['bad']).toBeUndefined();
+    expect(result.manifest?.mcpServers?.['good']).toEqual({ transport: 'stdio', command: 'node' });
+    expect(result.diagnostics).toContainEqual(
+      expect.objectContaining({
+        severity: 'warn',
+        message: expect.stringContaining('"mcpServers.bad.cwd"'),
+      }),
+    );
+  });
+
   it('captures interface.displayName and shortDescription', async () => {
     const root = await makePlugin({
       'kimi.plugin.json': JSON.stringify({

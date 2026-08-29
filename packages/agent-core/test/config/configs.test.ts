@@ -17,6 +17,8 @@ import { ErrorCodes, KimiError } from '../../src/errors';
 import {
   KimiConfigSchema,
   McpServerConfigSchema,
+  McpServerHttpConfigSchema,
+  McpServerSseConfigSchema,
   applyPrintModeConfigDefaults,
   configToTomlData,
   ensureConfigFile,
@@ -669,6 +671,48 @@ micro_compaction = false
         },
       }),
     ).toThrow();
+  });
+
+  it('marks bearerTokenEnvVar as deprecated with a headers migration example', () => {
+    const httpDesc = McpServerHttpConfigSchema.shape.bearerTokenEnvVar?.description ?? '';
+    const sseDesc = McpServerSseConfigSchema.shape.bearerTokenEnvVar?.description ?? '';
+
+    expect(httpDesc).toMatch(/deprecated/i);
+    expect(httpDesc).toContain('headers: {"Authorization": "Bearer ${TOKEN}"}');
+    expect(sseDesc).toMatch(/deprecated/i);
+    expect(sseDesc).toContain('headers: {"Authorization": "Bearer ${TOKEN}"}');
+  });
+
+  it('still validates bearerTokenEnvVar on http/sse MCP server configs', () => {
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'http',
+      url: 'https://mcp.example.com/mcp',
+      bearerTokenEnvVar: 'MY_TOKEN',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'http',
+      url: 'https://mcp.example.com/mcp',
+      bearerTokenEnvVar: '',
+    }).success).toBe(false);
+
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'sse',
+      url: 'https://mcp.example.com/sse',
+      bearerTokenEnvVar: 'MY_TOKEN',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'sse',
+      url: 'https://mcp.example.com/sse',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'sse',
+      url: 'https://mcp.example.com/sse',
+      bearerTokenEnvVar: '',
+    }).success).toBe(false);
   });
 });
 

@@ -348,4 +348,49 @@ describe('WorkspaceMcpConfigService', () => {
     );
     expect(service.servers()).toEqual({ added: stdioConfig('added') });
   }, 20000);
+
+  it('warns once per dropped placeholder-url entry and keeps the valid servers', async () => {
+    const warnings: string[] = [];
+    const capturingLog: ILogService = {
+      ...stubLog(),
+      warn: (message: string) => warnings.push(message),
+    };
+    await writeProjectConfig({
+      ok: stdioConfig('node'),
+      bad: { transport: 'http', url: 'https://x.com/${P}' },
+    });
+
+    const ix = createServices(disposables, {
+      strict: true,
+      additionalServices: (reg) => {
+        reg.definePartialInstance(IBootstrapService, { homeDir });
+        reg.definePartialInstance(IWorkspaceContext, { cwd });
+        reg.definePartialInstance(IPluginService, {
+          enabledMcpServers: async () => ({}),
+          onDidReload: pluginReloads.event,
+        });
+        reg.defineInstance(ILogService, capturingLog);
+        reg.definePartialInstance(IConfigService, {
+          ready: Promise.resolve(),
+          get: <T = unknown>(domain: string): T => (domain === MCP_SECTION ? undefined : undefined) as T,
+        });
+        reg.defineInstance(IHostFsWatchService, fsWatchStub());
+        reg.defineInstance(IHostFileSystem, new HostFileSystem());
+        reg.definePartialInstance(IWorkspaceTrust, {
+          ready: Promise.resolve(),
+          isTrusted: () => true,
+          onDidChange: trustFlips.event,
+        });
+        reg.definePartialInstance(IMcpConfigStore, { onDidWrite: storeWrites.event });
+        reg.define(IWorkspaceMcpConfigService, WorkspaceMcpConfigService);
+      },
+    });
+    const service = ix.get(IWorkspaceMcpConfigService);
+    await service.ready;
+
+    expect(service.servers()).toEqual({ ok: stdioConfig('node') });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('bad');
+    expect(warnings[0]).toContain('url');
+  }, 20000);
 });

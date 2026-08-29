@@ -17,6 +17,7 @@ export interface SessionMcpConfig {
 export interface ResolveSessionMcpConfigInput {
   readonly cwd: string;
   readonly homeDir?: string;
+  readonly onWarn?: (message: string) => void;
 }
 
 export async function resolveSessionMcpConfig(
@@ -25,6 +26,7 @@ export async function resolveSessionMcpConfig(
   const servers = await loadMcpServers({
     cwd: input.cwd,
     homeDir: input.homeDir,
+    onWarn: input.onWarn,
   });
   if (Object.keys(servers).length === 0) return undefined;
   return {

@@ -11,6 +11,7 @@ import { SseMcpClient } from './client-sse';
 import type { UnexpectedCloseReason } from './client-shared';
 import { StdioMcpClient } from './client-stdio';
 import { toMcpServerConfigView, type McpServerConfigView } from './config-view';
+import { expandServerConfig } from './env-expand';
 import type { McpOAuthService } from './oauth';
 import type { McpRegistryEntry, McpServerSource } from './registry';
 import { assertMcpInputSchema, type MCPClient, type MCPToolDefinition } from './types';
@@ -450,7 +451,11 @@ export class McpConnectionManager {
 
     let client: RuntimeMcpClient | undefined;
     try {
-      const startupClient = this.createClient(entry.config, entry.name, timeoutMs);
+      const expanded = expandServerConfig(
+        entry.config,
+        this.options.envLookup ?? ((name: string) => process.env[name]),
+      );
+      const startupClient = this.createClient(entry.config, expanded, entry.name, timeoutMs);
       client = startupClient;
       entry.client = startupClient;
       const discovered = await withTimeout(
@@ -532,26 +537,27 @@ export class McpConnectionManager {
 
   private createClient(
     config: McpServerConfig,
+    expanded: McpServerConfig,
     name: string,
     startupTimeoutMs: number,
   ): RuntimeMcpClient {
     const toolCallTimeoutMs = config.toolTimeoutMs ?? this.options.defaultToolTimeoutMs;
-    if (config.transport === 'stdio') {
-      return new StdioMcpClient(config, {
+    if (expanded.transport === 'stdio') {
+      return new StdioMcpClient(expanded, {
         startupTimeoutMs,
         toolCallTimeoutMs,
         defaultCwd: this.options.stdioCwd,
       });
     }
-    if (config.transport === 'sse') {
-      return new SseMcpClient(config, {
+    if (expanded.transport === 'sse') {
+      return new SseMcpClient(expanded, {
         startupTimeoutMs,
         toolCallTimeoutMs,
         envLookup: this.options.envLookup,
         oauthProvider: this.resolveOAuthProvider(config, name),
       });
     }
-    return new HttpMcpClient(config, {
+    return new HttpMcpClient(expanded, {
       startupTimeoutMs,
       toolCallTimeoutMs,
       envLookup: this.options.envLookup,

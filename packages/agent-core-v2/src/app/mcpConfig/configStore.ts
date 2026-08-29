@@ -175,7 +175,15 @@ export class McpConfigStore extends Disposable implements IMcpConfigStore {
 const NO_ABORT = new AbortController().signal;
 
 function parseServerInput(server: GlobalMcpServerConfig): GlobalMcpServerConfig {
-  return parseServer(normalizeServerName(server.name), server);
+  const normalized = parseServer(normalizeServerName(server.name), server);
+  if (normalized.transport === 'http' || normalized.transport === 'sse') {
+    if (normalized.url.includes('${')) {
+      throw configError(
+        `Invalid MCP server "${normalized.name}": url does not support environment variable expansion; use templated "headers" for credentials instead`,
+      );
+    }
+  }
+  return normalized;
 }
 
 function parseServer(name: string, value: unknown): GlobalMcpServerConfig {

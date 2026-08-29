@@ -352,4 +352,126 @@ describe('loadMcpServers', () => {
       else process.env['KIMI_CODE_HOME'] = saved;
     }
   });
+
+  it('drops a remote url containing env template expansion (bare placeholder) and warns', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: {
+        bad: { transport: 'http', url: 'https://base/${PATH_SEG}' },
+        ok: { transport: 'stdio', command: 'node' },
+      },
+    });
+    const warnings: string[] = [];
+    const servers = await loadMcpServers({ cwd, homeDir: home, onWarn: (m) => warnings.push(m) });
+    expect(Object.keys(servers)).toEqual(['ok']);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('bad');
+    expect(warnings[0]).toContain('url');
+  });
+
+  it('drops a remote url containing env template expansion (interpolated) and warns', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: { bad: { transport: 'http', url: 'https://x.com/${P}' } },
+    });
+    const warnings: string[] = [];
+    const servers = await loadMcpServers({ cwd, homeDir: home, onWarn: (m) => warnings.push(m) });
+    expect(servers).toEqual({});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('bad');
+  });
+
+  it('keeps other entries when one remote url contains a placeholder (per-layer isolation)', async () => {
+    const home = makeTempDir();
+    const repoRoot = makeTempDir();
+    const cwd = join(repoRoot, 'pkg');
+    await mkdir(join(repoRoot, '.git'), { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: {
+        userOk: { transport: 'stdio', command: 'node' },
+        userBad: { transport: 'http', url: 'https://x.com/${P}' },
+      },
+    });    await writeJson(join(repoRoot, '.mcp.json'), {
+      mcpServers: {
+        rootOk: { transport: 'http', url: 'https://mcp.example.com/mcp' },
+      },
+    });
+    await writeJson(join(cwd, '.kimi-code', 'mcp.json'), {
+      mcpServers: {
+        projBad: { transport: 'sse', url: 'https://y.com/${Q}' },
+        projOk: { transport: 'stdio', command: 'node' },
+      },
+    });
+    const warnings: string[] = [];
+    const detailed = await loadMcpServersDetailed({
+      cwd,
+      homeDir: home,
+      onWarn: (m) => warnings.push(m),
+    });
+    expect(Object.keys(detailed.servers).toSorted()).toEqual(['projOk', 'rootOk', 'userOk']);
+    expect(warnings).toHaveLength(2);
+    expect(warnings.some((m) => m.includes('userBad'))).toBe(true);
+    expect(warnings.some((m) => m.includes('projBad'))).toBe(true);
+    expect(Object.keys(detailed.origins)).not.toContain('userBad');
+    expect(Object.keys(detailed.origins)).not.toContain('projBad');
+  });
+
+  it('loads a valid remote url without env template expansion', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: { ok: { transport: 'http', url: 'https://mcp.example.com/mcp' } },
+    });
+    const servers = await loadMcpServers({ cwd, homeDir: home });
+    expect(servers['ok']).toEqual({ transport: 'http', url: 'https://mcp.example.com/mcp' });
+  });
+
+  it('keeps a stdio cwd and env with env template placeholders verbatim', async () => {
+    const home = makeTempDir();
+    const repoRoot = makeTempDir();
+    const cwd = join(repoRoot, 'packages', 'agent-core');
+    await mkdir(join(repoRoot, '.git'), { recursive: true });
+    await mkdir(cwd, { recursive: true });
+
+    await writeJson(join(repoRoot, '.mcp.json'), {
+      mcpServers: {
+        templated: { command: 'node', cwd: '${ROOT}/s', env: { K: '${V}' } },
+      },
+    });
+
+    const servers = await loadMcpServers({ cwd, homeDir: home });
+
+    expect(servers['templated']).toEqual({
+      transport: 'stdio',
+      command: 'node',
+      cwd: '${ROOT}/s',
+      env: { K: '${V}' },
+    });
+  });
+
+  it('keeps the headered entry and drops only the placeholder-url entry when they coexist', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: {
+        headered: {
+          transport: 'http',
+          url: 'https://mcp.example.com/mcp',
+          headers: { Authorization: 'Bearer ${T}' },
+        },
+        urlExpanded: {
+          transport: 'http',
+          url: 'https://base/${BASE}',
+        },
+      },
+    });
+    const warnings: string[] = [];
+    const servers = await loadMcpServers({ cwd, homeDir: home, onWarn: (m) => warnings.push(m) });
+    expect(Object.keys(servers)).toEqual(['headered']);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('urlExpanded');
+  });
 });

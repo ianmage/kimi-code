@@ -54,7 +54,7 @@ MCP server 配置写在 `mcp.json` 中，分两层：
 | `env` | `Record<string, string>` | stdio | 注入子进程的环境变量 |
 | `cwd` | `string` | stdio | 子进程工作目录 |
 | `headers` | `Record<string, string>` | HTTP、SSE | 附加到每次请求的静态请求头 |
-| `bearerTokenEnvVar` | `string` | HTTP、SSE | 存放 bearer token 的环境变量名 |
+| `bearerTokenEnvVar` | `string` | HTTP、SSE | 存放 bearer token 的环境变量名。已废弃：推荐改用带环境变量模板的 `headers`，例如 `{"Authorization": "Bearer ${TOKEN}"}` |
 | `enabled` | `boolean` | 全部 | 设为 `false` 可禁用该 server |
 | `startupTimeoutMs` | `number` | 全部 | 连接超时，取值范围为 `1` 到 `2147483647` 毫秒，默认 `30000` |
 | `toolTimeoutMs` | `number` | 全部 | 单次工具调用超时，取值范围为 `1` 到 `2147483647` 毫秒 |
@@ -63,13 +63,44 @@ MCP server 配置写在 `mcp.json` 中，分两层：
 
 连接超时和单次工具调用超时的默认值都不必逐个 server 设置：`config.toml` 的 `[mcp] startup_timeout_ms` / `[mcp] tool_timeout_ms` 或环境变量 `KIMI_MCP_STARTUP_TIMEOUT_MS` / `KIMI_MCP_TOOL_TIMEOUT_MS` 可以调整全局默认值，优先级为 server 字段 > 环境变量 > `config.toml` > 内置默认。详见 [配置文件](../configuration/config-files.md#mcp)。
 
-HTTP 与 SSE server 支持通过 `headers` 或 `bearerTokenEnvVar` 提供静态凭证。需要 OAuth 时，运行 `/mcp-config login <server-name>` 完成浏览器授权。
+HTTP 与 SSE server 支持通过 `headers` 或 `bearerTokenEnvVar` 提供静态凭证；新配置推荐使用带环境变量模板的 `headers`（见[环境变量模板](#环境变量模板)），`bearerTokenEnvVar` 已废弃。需要 OAuth 时，运行 `/mcp-config login <server-name>` 完成浏览器授权。
 
 Plugins 也可以在 manifest 中声明 MCP servers。Plugin 声明的 servers 默认启用，可以在 `/plugins` 中禁用或重新启用：禁用或移除后，已打开会话中的工具调用会失败并返回移除提示；新增或启用 server 会立即连接到已打开的会话。详见 [Plugins](./plugins.md#plugin-中的-mcp-servers)。
 
 ::: warning 注意
 项目级 `.kimi-code/mcp.json` 中的 stdio 条目会在会话启动时执行本地命令，只在你信任的仓库里启用。
 :::
+
+### 环境变量模板
+
+部分字段的字符串值可以用 `${VAR}` 占位符引用环境变量，密钥因此不必写进 `mcp.json` 本身。例如：
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+语法为单趟替换：没有转义写法，也不支持嵌套——形如 `${${X}}` 的值在遇到第一个 `}` 后不会再次扫描。占位符只支持以下字段：
+
+- **stdio**：`command`、`args` 的每个元素、`env` 的每个值、`cwd`
+- **HTTP 与 SSE**：`headers` 的每个值
+
+`url` 不支持占位符：url 含 `${` 的远程 server 会在配置加载时被跳过并给出指名该 server 的告警，文件中的其余条目仍正常加载。凭证请改用 `headers`（如上例）。stdio 的 `cwd` 占位符必须展开为绝对路径，展开结果是相对路径时连接会以配置错误失败，与是否配置基准目录无关。
+
+两个需要记住的行为：
+
+- 引用的变量未定义或为空字符串时，server 启动即失败。错误信息只包含变量名和它出现的字段（例如 `env.API_KEY`），绝不包含变量值。
+- stdio 的 `env` 值先展开、再与父进程环境变量 merge，因此 `env` 中声明的变量会覆盖继承的同名变量。
+
+展开值只在建立连接期间存在：不会写回 `mcp.json`，不会出现在配置视图的 wire 输出中，也不会被持久化。因此含 `${...}` 占位符的 `mcp.json` 可以安全地提交到版本库。
 
 ## 工具命名与权限
 

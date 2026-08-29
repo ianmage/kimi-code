@@ -36,6 +36,7 @@ export interface LoadMcpServersInput {
   readonly cwd: string;
   readonly homeDir?: string;
   readonly includeProject?: boolean;
+  readonly onWarn?: (message: string) => void;
 }
 
 export interface LoadMcpServersDetailedResult {
@@ -54,14 +55,17 @@ export async function loadMcpServersDetailed(
 ): Promise<LoadMcpServersDetailedResult> {
   const paths = await resolveMcpJsonPaths(input);
   if (input.includeProject === false) {
-    const user = await readMcpJson(input.fs, paths.user);
+    const user = await readMcpJson(input.fs, paths.user, { onWarn: input.onWarn });
     return { servers: user, origins: mapValuesToPath(user, paths.user) };
   }
   const layers: readonly [path: string, servers: Record<string, McpServerConfig>][] =
     await Promise.all([
-      readMcpJson(input.fs, paths.user),
-      readMcpJson(input.fs, paths.projectRoot, { stdioCwdBase: dirname(paths.projectRoot) }),
-      readMcpJson(input.fs, paths.project),
+      readMcpJson(input.fs, paths.user, { onWarn: input.onWarn }),
+      readMcpJson(input.fs, paths.projectRoot, {
+        stdioCwdBase: dirname(paths.projectRoot),
+        onWarn: input.onWarn,
+      }),
+      readMcpJson(input.fs, paths.project, { onWarn: input.onWarn }),
     ]).then(([user, projectRoot, project]) => [
       [paths.user, user],
       [paths.projectRoot, projectRoot],
@@ -80,6 +84,7 @@ export async function loadMcpServersDetailed(
 
 interface ReadMcpJsonOptions {
   readonly stdioCwdBase?: string;
+  readonly onWarn?: (message: string) => void;
 }
 
 async function readMcpJson(
@@ -148,20 +153,29 @@ function normalizeMcpServers(
   options: ReadMcpJsonOptions,
 ): Record<string, McpServerConfig> {
   const stdioCwdBase = options.stdioCwdBase;
-  if (stdioCwdBase === undefined) return servers;
+  const onWarn = options.onWarn;
+  const out: Record<string, McpServerConfig> = Object.create(null);
+  for (const [name, config] of Object.entries(servers)) {
+    if (isRemoteUrlPlaceholder(config)) {
+      onWarn?.(
+        `mcpServers.${name}.url does not support environment variable expansion; the server is ignored. Use templated "headers" for credentials instead`,
+      );
+      continue;
+    }
+    out[name] = stdioCwdBase === undefined ? config : normalizeStdioCwd(config, stdioCwdBase);
+  }
+  return out;
+}
 
-  return Object.fromEntries(
-    Object.entries(servers).map(([name, config]) => [
-      name,
-      normalizeStdioCwd(config, stdioCwdBase),
-    ]),
-  );
+function isRemoteUrlPlaceholder(config: McpServerConfig): boolean {
+  return (config.transport === 'http' || config.transport === 'sse') && config.url.includes('${');
 }
 
 function normalizeStdioCwd(config: McpServerConfig, cwdBase: string): McpServerConfig {
   if (config.transport !== 'stdio') return config;
-  const cwd = config.cwd === undefined ? cwdBase : resolvePath(cwdBase, config.cwd);
-  return { ...config, cwd };
+  if (config.cwd === undefined) return { ...config, cwd: cwdBase };
+  if (config.cwd.includes('${')) return { ...config };
+  return { ...config, cwd: resolvePath(cwdBase, config.cwd) };
 }
 
 function mapValuesToPath(

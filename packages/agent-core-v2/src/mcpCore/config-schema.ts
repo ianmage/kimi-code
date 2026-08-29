@@ -31,7 +31,13 @@ export const McpServerHttpConfigSchema = z.object({
   url: z.string().url(),
   headers: StringRecordSchema.optional(),
   auth: z.literal('oauth').optional(),
-  bearerTokenEnvVar: z.string().min(1).optional(),
+  bearerTokenEnvVar: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Deprecated: use headers: {"Authorization": "Bearer ${TOKEN}"} with environment variable template expansion instead.',
+    ),
   ...McpServerCommonFields,
 });
 
@@ -42,7 +48,13 @@ export const McpServerSseConfigSchema = z.object({
   url: z.string().url(),
   headers: StringRecordSchema.optional(),
   auth: z.literal('oauth').optional(),
-  bearerTokenEnvVar: z.string().min(1).optional(),
+  bearerTokenEnvVar: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Deprecated: use headers: {"Authorization": "Bearer ${TOKEN}"} with environment variable template expansion instead.',
+    ),
   ...McpServerCommonFields,
 });
 
