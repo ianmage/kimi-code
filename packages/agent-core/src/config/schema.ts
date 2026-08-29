@@ -306,7 +306,13 @@ export const McpServerHttpConfigSchema = z.object({
   auth: z.literal('oauth').optional(),
   // Indirect secret reference: the bearer token is looked up from
   // `process.env[bearerTokenEnvVar]` at connection time, never committed.
-  bearerTokenEnvVar: z.string().min(1).optional(),
+  bearerTokenEnvVar: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Deprecated: use headers: {"Authorization": "Bearer ${TOKEN}"} with environment variable template expansion instead.',
+    ),
   ...McpServerCommonFields,
 });
 
@@ -319,7 +325,13 @@ export const McpServerSseConfigSchema = z.object({
   auth: z.literal('oauth').optional(),
   // Indirect secret reference: the bearer token is looked up from
   // `process.env[bearerTokenEnvVar]` at connection time, never committed.
-  bearerTokenEnvVar: z.string().min(1).optional(),
+  bearerTokenEnvVar: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Deprecated: use headers: {"Authorization": "Bearer ${TOKEN}"} with environment variable template expansion instead.',
+    ),
   ...McpServerCommonFields,
 });
 

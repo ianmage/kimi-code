@@ -11,6 +11,7 @@ import { SseMcpClient } from './client-sse';
 import type { UnexpectedCloseReason } from './client-shared';
 import { StdioMcpClient } from './client-stdio';
 import type { McpOAuthService } from '#/mcpCore/oauth/service';
+import { expandServerConfig } from './envExpand';
 import { assertMcpInputSchema, type MCPClient, type MCPToolDefinition } from './types';
 
 export type McpServerStatus = 'pending' | 'connected' | 'failed' | 'disabled' | 'needs-auth' | 'removed';
@@ -312,7 +313,11 @@ export class McpConnectionManager implements McpConnectionView {
 
     let client: RuntimeMcpClient | undefined;
     try {
-      const startupClient = await this.createClient(entry.config, entry.name, timeoutMs);
+      const expanded = expandServerConfig(
+        entry.config,
+        this.options.envLookup ?? ((name: string) => process.env[name]),
+      );
+      const startupClient = await this.createClient(entry.config, expanded, entry.name, timeoutMs);
       client = startupClient;
       entry.client = startupClient;
       const discovered = await withTimeout(
@@ -380,20 +385,21 @@ export class McpConnectionManager implements McpConnectionView {
 
   private async createClient(
     config: McpServerConfig,
+    expanded: McpServerConfig,
     name: string,
     startupTimeoutMs: number,
   ): Promise<RuntimeMcpClient> {
     const toolCallTimeoutMs =
       config.toolTimeoutMs ?? this.options.resolveDefaultTimeouts?.().toolTimeoutMs;
     const clientName = this.options.resolveClientName?.();
-    if (config.transport === 'stdio') {
+    if (expanded.transport === 'stdio') {
       const runtimeResolver = this.options.runtimeResolver;
       const workspaceId = this.options.workspaceId;
-      const runtimeId = config.runtime_id ?? this.options.runtimeId;
-      if (runtimeResolver === undefined || workspaceId === undefined || runtimeId === undefined || (this.options.requireStdioRuntimeId === true && config.runtime_id === undefined)) {
+      const runtimeId = expanded.runtime_id ?? this.options.runtimeId;
+      if (runtimeResolver === undefined || workspaceId === undefined || runtimeId === undefined || (this.options.requireStdioRuntimeId === true && expanded.runtime_id === undefined)) {
         throw new Error('MCP stdio requires runtime_id and runtime binding');
       }
-      return new StdioMcpClient(config, {
+      return new StdioMcpClient(expanded, {
         startupTimeoutMs,
         toolCallTimeoutMs,
         defaultCwd: this.options.stdioCwd,
@@ -403,8 +409,8 @@ export class McpConnectionManager implements McpConnectionView {
         runtimeId,
       });
     }
-    if (config.transport === 'sse') {
-      return new SseMcpClient(config, {
+    if (expanded.transport === 'sse') {
+      return new SseMcpClient(expanded, {
         startupTimeoutMs,
         toolCallTimeoutMs,
         envLookup: this.options.envLookup,
@@ -412,7 +418,7 @@ export class McpConnectionManager implements McpConnectionView {
         clientName,
       });
     }
-    return new HttpMcpClient(config, {
+    return new HttpMcpClient(expanded, {
       startupTimeoutMs,
       toolCallTimeoutMs,
       envLookup: this.options.envLookup,

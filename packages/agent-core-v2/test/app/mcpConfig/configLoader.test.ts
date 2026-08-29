@@ -6,6 +6,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { ErrorCodes, Error2 } from '#/errors';
 import { loadMcpServers, resolveMcpJsonPaths } from '#/app/mcpConfig/configLoader';
+import {
+  McpServerConfigSchema,
+  McpServerHttpConfigSchema,
+  McpServerSseConfigSchema,
+} from '#/mcpCore/config-schema';
 import { HostFileSystem } from '#/os/backends/node-local/hostFsService';
 
 const fs = new HostFileSystem();
@@ -390,5 +395,186 @@ describe('loadMcpServers', () => {
       if (saved === undefined) delete process.env['KIMI_CODE_HOME'];
       else process.env['KIMI_CODE_HOME'] = saved;
     }
+  });
+
+  it('drops a remote url containing env template expansion (bare placeholder) and warns', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: {
+        bad: { transport: 'http', url: 'https://base/${PATH_SEG}' },
+        ok: { transport: 'stdio', command: 'node' },
+      },
+    });
+    const warnings: string[] = [];
+    const servers = await loadMcpServers({
+      fs,
+      cwd,
+      homeDir: home,
+      onWarn: (m) => warnings.push(m),
+    });
+    expect(Object.keys(servers)).toEqual(['ok']);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('bad');
+    expect(warnings[0]).toContain('url');
+  });
+
+  it('drops a remote url containing env template expansion (interpolated) and warns', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: { bad: { transport: 'http', url: 'https://x.com/${P}' } },
+    });
+    const warnings: string[] = [];
+    const servers = await loadMcpServers({
+      fs,
+      cwd,
+      homeDir: home,
+      onWarn: (m) => warnings.push(m),
+    });
+    expect(servers).toEqual({});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('bad');
+  });
+
+  it('keeps other entries when one remote url contains a placeholder (per-layer isolation)', async () => {
+    const home = makeTempDir();
+    const repoRoot = makeTempDir();
+    const cwd = join(repoRoot, 'pkg');
+    await mkdir(join(repoRoot, '.git'), { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: {
+        userOk: { transport: 'stdio', command: 'node' },
+        userBad: { transport: 'http', url: 'https://x.com/${P}' },
+      },
+    });
+    await writeJson(join(repoRoot, '.mcp.json'), {
+      mcpServers: {
+        rootOk: { transport: 'http', url: 'https://mcp.example.com/mcp' },
+      },
+    });
+    await writeJson(join(cwd, '.kimi-code', 'mcp.json'), {
+      mcpServers: {
+        projBad: { transport: 'sse', url: 'https://y.com/${Q}' },
+        projOk: { transport: 'stdio', command: 'node' },
+      },
+    });
+    const warnings: string[] = [];
+    const servers = await loadMcpServers({
+      fs,
+      cwd,
+      homeDir: home,
+      onWarn: (m) => warnings.push(m),
+    });
+    expect(Object.keys(servers).toSorted()).toEqual(['projOk', 'rootOk', 'userOk']);
+    expect(warnings).toHaveLength(2);
+    expect(warnings.some((m) => m.includes('userBad'))).toBe(true);
+    expect(warnings.some((m) => m.includes('projBad'))).toBe(true);
+  });
+
+  it('loads a valid remote url without env template expansion', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: { ok: { transport: 'http', url: 'https://mcp.example.com/mcp' } },
+    });
+    const servers = await loadMcpServers({ fs, cwd, homeDir: home });
+    expect(servers['ok']).toEqual({ transport: 'http', url: 'https://mcp.example.com/mcp' });
+  });
+
+  it('keeps a stdio cwd and env with env template placeholders verbatim', async () => {
+    const home = makeTempDir();
+    const repoRoot = makeTempDir();
+    const cwd = join(repoRoot, 'packages', 'agent-core');
+    await mkdir(join(repoRoot, '.git'), { recursive: true });
+    await mkdir(cwd, { recursive: true });
+
+    await writeJson(join(repoRoot, '.mcp.json'), {
+      mcpServers: {
+        templated: { command: 'node', cwd: '${ROOT}/s', env: { K: '${V}' } },
+      },
+    });
+
+    const servers = await loadMcpServers({ fs, cwd, homeDir: home });
+
+    expect(servers['templated']).toEqual({
+      transport: 'stdio',
+      command: 'node',
+      cwd: '${ROOT}/s',
+      env: { K: '${V}' },
+    });
+  });
+
+  it('keeps the headered entry and drops only the placeholder-url entry when they coexist', async () => {
+    const home = makeTempDir();
+    const cwd = makeTempDir();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: {
+        headered: {
+          transport: 'http',
+          url: 'https://mcp.example.com/mcp',
+          headers: { Authorization: 'Bearer ${T}' },
+        },
+        urlExpanded: {
+          transport: 'http',
+          url: 'https://base/${BASE}',
+        },
+      },
+    });
+    const warnings: string[] = [];
+    const servers = await loadMcpServers({
+      fs,
+      cwd,
+      homeDir: home,
+      onWarn: (m) => warnings.push(m),
+    });
+    expect(Object.keys(servers)).toEqual(['headered']);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('urlExpanded');
+  });
+});
+
+describe('MCP server config schema: bearerTokenEnvVar deprecation', () => {
+  it('marks bearerTokenEnvVar as deprecated with a headers migration example', () => {
+    const httpDesc = McpServerHttpConfigSchema.shape.bearerTokenEnvVar?.description ?? '';
+    const sseDesc = McpServerSseConfigSchema.shape.bearerTokenEnvVar?.description ?? '';
+
+    expect(httpDesc).toMatch(/deprecated/i);
+    expect(httpDesc).toContain('headers: {"Authorization": "Bearer ${TOKEN}"}');
+    expect(sseDesc).toMatch(/deprecated/i);
+    expect(sseDesc).toContain('headers: {"Authorization": "Bearer ${TOKEN}"}');
+  });
+
+  it('still validates bearerTokenEnvVar on http/sse MCP server configs', () => {
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'http',
+      url: 'https://mcp.example.com/mcp',
+      bearerTokenEnvVar: 'MY_TOKEN',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'http',
+      url: 'https://mcp.example.com/mcp',
+      bearerTokenEnvVar: '',
+    }).success).toBe(false);
+
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'sse',
+      url: 'https://mcp.example.com/sse',
+      bearerTokenEnvVar: 'MY_TOKEN',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'sse',
+      url: 'https://mcp.example.com/sse',
+    }).success).toBe(true);
+    expect(McpServerConfigSchema.safeParse({
+      transport: 'sse',
+      url: 'https://mcp.example.com/sse',
+      bearerTokenEnvVar: '',
+    }).success).toBe(false);
   });
 });

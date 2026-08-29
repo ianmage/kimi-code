@@ -18,9 +18,11 @@ import type {
 import { z } from 'zod';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { Error2 } from '#/errors';
+import { ErrorCodes, Error2 } from '#/errors';
 import { KIMI_MCP_CLIENT_NAME } from '#/mcpCore/client-shared';
 import { McpConnectionManager, type McpConnectionManagerOptions, type McpServerEntry } from '#/mcpCore/connection-manager';
+import { expandServerConfig, expandTemplateString } from '#/mcpCore/envExpand';
+import type { McpServerConfig } from '#/mcpCore/config-schema';
 import { McpOAuthService } from '#/mcpCore/oauth/service';
 import { FakeRuntime } from '#/runtime/fakeRuntime';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
@@ -62,6 +64,7 @@ import {
   hangingListStdioFixture,
   slowStdioFixture,
   slowToolStdioFixture,
+  startInProcessHttpMcpServer,
   stderrThenExitFixture,
   stdioFixture,
 } from './stubs';
@@ -974,4 +977,458 @@ describe('McpConnectionManager', () => {
       await closeServer(server);
     }
   }, 15000);
+});
+
+describe('connectOne env expansion', () => {
+  it('marks the entry failed with the variable name and field path when a variable is missing in command', async () => {
+    const cm = createManager({ envLookup: () => undefined });
+    try {
+      await cm.connectAll({
+        missing: {
+          transport: 'stdio',
+          command: '${NOPE}',
+        },
+      });
+      const entry = cm.get('missing');
+      expect(entry?.status).toBe('failed');
+      expect(entry?.error).toContain('NOPE');
+      expect(entry?.error).toContain('command');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+
+  it('marks the entry failed with args field path when a variable is missing in args', async () => {
+    const cm = createManager({ envLookup: () => undefined });
+    try {
+      await cm.connectAll({
+        missing: {
+          transport: 'stdio',
+          command: process.execPath,
+          args: ['${MISSING_ARG}'],
+        },
+      });
+      const entry = cm.get('missing');
+      expect(entry?.status).toBe('failed');
+      expect(entry?.error).toContain('MISSING_ARG');
+      expect(entry?.error).toContain('args[0]');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+
+  it('marks the entry failed with env field path when a variable is missing in env', async () => {
+    const cm = createManager({ envLookup: () => undefined });
+    try {
+      await cm.connectAll({
+        missing: {
+          transport: 'stdio',
+          command: process.execPath,
+          env: { TOKEN: '${MISSING_ENV}' },
+        },
+      });
+      const entry = cm.get('missing');
+      expect(entry?.status).toBe('failed');
+      expect(entry?.error).toContain('MISSING_ENV');
+      expect(entry?.error).toContain('env.TOKEN');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+
+  it('preserves the raw config in configOf after expansion fails', async () => {
+    const cm = createManager({ envLookup: () => undefined });
+    try {
+      await cm.connectAll({
+        templated: {
+          transport: 'stdio',
+          command: '${NOPE}',
+        },
+      });
+      expect(cm.get('templated')?.status).toBe('failed');
+      expect((cm.configOf('templated') as { command?: string })?.command).toBe('${NOPE}');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+
+  it('expands ${VAR} in remote headers and connects with the resolved value', async () => {
+    const { url, close } = await startInProcessHttpMcpServer({ authToken: 'tok' });
+    const cm = createManager({ envLookup: (name) => (name === 'T' ? 'tok' : undefined) });
+    try {
+      await cm.connectAll({
+        remote: {
+          transport: 'http',
+          url,
+          headers: { Authorization: 'Bearer ${T}' },
+          startupTimeoutMs: 5_000,
+        },
+      });
+      expect(cm.get('remote')?.status).toBe('connected');
+    } finally {
+      await cm.shutdown();
+      await close();
+    }
+  }, 15000);
+
+  it('marks remote failed when a header variable is missing', async () => {
+    const cm = createManager({ envLookup: () => undefined });
+    try {
+      await cm.connectAll({
+        remote: {
+          transport: 'http',
+          url: 'https://example.invalid/mcp',
+          headers: { Authorization: 'Bearer ${MISSING_HEADER}' },
+        },
+      });
+      const entry = cm.get('remote');
+      expect(entry?.status).toBe('failed');
+      expect(entry?.error).toContain('MISSING_HEADER');
+      expect(entry?.error).toContain('headers.Authorization');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+
+  it('preserves the raw cwd and env templates in configOf after cwd expansion fails', async () => {
+    const cm = createManager({ envLookup: () => undefined });
+    try {
+      await cm.connectAll({
+        templated: {
+          transport: 'stdio',
+          command: process.execPath,
+          cwd: '${ROOT}/s',
+          env: { K: '${V}' },
+        },
+      });
+      expect(cm.get('templated')?.status).toBe('failed');
+      const raw = cm.configOf('templated') as { cwd?: string; env?: Record<string, string> };
+      expect(raw?.cwd).toBe('${ROOT}/s');
+      expect(raw?.env?.['K']).toBe('${V}');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+
+  it('fails with a cwd field-path error when an expanded cwd is relative, even with stdioCwd provided', async () => {
+    const cm = createManager({
+      envLookup: (name) => (name === 'ROOT' ? 'rel/path' : undefined),
+      stdioCwd: process.cwd(),
+    });
+    try {
+      await cm.connectAll({
+        relative: {
+          transport: 'stdio',
+          command: process.execPath,
+          cwd: '${ROOT}/s',
+        },
+      });
+      const entry = cm.get('relative');
+      expect(entry?.status).toBe('failed');
+      expect(entry?.error).toContain('cwd');
+      expect(entry?.error).not.toContain('rel/path');
+      const raw = cm.configOf('relative') as { cwd?: string };
+      expect(raw?.cwd).toBe('${ROOT}/s');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+});
+
+describe('env expand', () => {
+  describe('expandTemplateString', () => {
+    it('returns a string without ${ unchanged', () => {
+      const envLookup = (name: string) => (name === 'X' ? '1' : undefined);
+      expect(expandTemplateString('plain text', 'command', envLookup)).toBe('plain text');
+    });
+
+    it('expands a single placeholder', () => {
+      const envLookup = (name: string) => (name === 'X' ? '1' : undefined);
+      expect(expandTemplateString('${X}', 'command', envLookup)).toBe('1');
+    });
+
+    it('expands multiple placeholders in one pass (A3)', () => {
+      const envLookup = (name: string) => {
+        if (name === 'X') return '1';
+        if (name === 'Y') return '2';
+        return undefined;
+      };
+      expect(expandTemplateString('a${X}b${Y}c', 'command', envLookup)).toBe('a1b2c');
+    });
+
+    it('throws CONFIG_INVALID when a variable is undefined (A1)', () => {
+      const envLookup = () => undefined;
+      expect(() => expandTemplateString('${K}', 'env.K', envLookup)).toThrowError(
+        expect.objectContaining({ code: ErrorCodes.CONFIG_INVALID }),
+      );
+      try {
+        expandTemplateString('${K}', 'env.K', envLookup);
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error2);
+        expect((error as Error2).code).toBe(ErrorCodes.CONFIG_INVALID);
+        expect((error as Error).message).toContain('K');
+        expect((error as Error).message).toContain('env.K');
+      }
+    });
+
+    it('throws CONFIG_INVALID when a variable resolves to empty string (A2)', () => {
+      const envLookup = () => '';
+      try {
+        expandTemplateString('${K}', 'env.K', envLookup);
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error2);
+        expect((error as Error2).code).toBe(ErrorCodes.CONFIG_INVALID);
+        expect((error as Error).message).toContain('K');
+        expect((error as Error).message).toContain('env.K');
+      }
+    });
+
+    it('does not recursively expand ${${X}} — captures ${X as the name (A3)', () => {
+      const envLookup = (name: string) => (name === 'X' ? '1' : undefined);
+      try {
+        expandTemplateString('${${X}}', 'command', envLookup);
+        throw new Error('expected throw');
+      } catch (error) {
+        if (!(error instanceof Error2)) throw error;
+        expect(error.code).toBe(ErrorCodes.CONFIG_INVALID);
+        expect(error.message).toContain('${X');
+        expect(error.message).not.toBe('1');
+      }
+    });
+
+    it('treats an unclosed ${ as literal text', () => {
+      const envLookup = () => undefined;
+      expect(expandTemplateString('no close ${here', 'command', envLookup)).toBe(
+        'no close ${here',
+      );
+    });
+
+    it('does not leak env values into the error message (A6)', () => {
+      const SECRET = 'super-secret-value-xyz';
+      const envLookup = () => undefined;
+      try {
+        expandTemplateString('${TOKEN}', 'headers.Authorization', envLookup);
+      } catch (error) {
+        expect((error as Error).message).not.toContain(SECRET);
+      }
+      const envLookupWithValue = (name: string) => (name === 'TOKEN' ? SECRET : undefined);
+      try {
+        expandTemplateString('${OTHER}', 'headers.Authorization', envLookupWithValue);
+      } catch (error) {
+        expect((error as Error).message).not.toContain(SECRET);
+      }
+    });
+  });
+
+  describe('expandServerConfig', () => {
+    it('returns a deep-equal config when there are no placeholders (A4)', () => {
+      const envLookup = () => undefined;
+      const config: McpServerConfig = {
+        transport: 'stdio',
+        command: '/usr/bin/node',
+        args: ['server.mjs', '--port', '3000'],
+        env: { NODE_ENV: 'production' },
+        cwd: '/app',
+      };
+      expect(expandServerConfig(config, envLookup)).toEqual(config);
+    });
+
+    it('returns a new object and does not mutate the input (A5)', () => {
+      const envLookup = (name: string) => (name === 'X' ? 'expanded' : undefined);
+      const config: McpServerConfig = {
+        transport: 'stdio',
+        command: '${X}-cmd',
+        args: ['${X}-arg'],
+        env: { KEY: '${X}-val' },
+        cwd: '/abs/${X}-cwd',
+      };
+      const snapshot = structuredClone(config);
+      const result = expandServerConfig(config, envLookup);
+      expect(result).not.toBe(config);
+      expect(config).toEqual(snapshot);
+      expect(result).toEqual({
+        transport: 'stdio',
+        command: 'expanded-cmd',
+        args: ['expanded-arg'],
+        env: { KEY: 'expanded-val' },
+        cwd: '/abs/expanded-cwd',
+      });
+    });
+
+    it('expands stdio fields: command, args[], env{}, cwd', () => {
+      const envLookup = (name: string) => {
+        const map: Record<string, string> = { CMD: 'node', A1: 'a1', A2: 'a2', EV: 'secret', CWD: '/work' };
+        return map[name];
+      };
+      const config: McpServerConfig = {
+        transport: 'stdio',
+        command: '${CMD}',
+        args: ['server.mjs', '${A1}', '${A2}'],
+        env: { TOKEN: '${EV}' },
+        cwd: '${CWD}',
+      };
+      const result = expandServerConfig(config, envLookup);
+      expect(result).toEqual({
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.mjs', 'a1', 'a2'],
+        env: { TOKEN: 'secret' },
+        cwd: '/work',
+      });
+    });
+
+    it('expands remote (http) headers{} values', () => {
+      const envLookup = (name: string) => (name === 'AUTH' ? 'tok' : undefined);
+      const config: McpServerConfig = {
+        transport: 'http',
+        url: 'https://example.test/mcp',
+        headers: { Authorization: 'Bearer ${AUTH}', 'X-Other': 'static' },
+      };
+      const result = expandServerConfig(config, envLookup);
+      expect(result).toEqual({
+        transport: 'http',
+        url: 'https://example.test/mcp',
+        headers: { Authorization: 'Bearer tok', 'X-Other': 'static' },
+      });
+    });
+
+    it('expands remote (sse) headers{} values', () => {
+      const envLookup = (name: string) => (name === 'AUTH' ? 'Bearer tok' : undefined);
+      const config: McpServerConfig = {
+        transport: 'sse',
+        url: 'https://example.test/sse',
+        headers: { Authorization: '${AUTH}' },
+      };
+      const result = expandServerConfig(config, envLookup);
+      expect(result).toEqual({
+        transport: 'sse',
+        url: 'https://example.test/sse',
+        headers: { Authorization: 'Bearer tok' },
+      });
+    });
+
+    it('passes through non-whitelist fields byte-identical (A5)', () => {
+      const envLookup = (name: string) => (name === 'CMD' ? 'node' : undefined);
+      const config: McpServerConfig = {
+        transport: 'http',
+        url: 'https://example.test/mcp',
+        headers: { Authorization: 'Bearer ${CMD}' },
+        enabledTools: ['echo', 'boom'],
+        disabledTools: ['bad'],
+        startupTimeoutMs: 5_000,
+        toolTimeoutMs: 10_000,
+        enabled: false,
+        auth: 'oauth',
+        bearerTokenEnvVar: 'REMOTE_TOKEN',
+      };
+      const result = expandServerConfig(config, envLookup);
+      expect(result.url).toBe('https://example.test/mcp');
+      expect(result.enabledTools).toBe(config.enabledTools);
+      expect(result.disabledTools).toBe(config.disabledTools);
+      expect(result.startupTimeoutMs).toBe(5_000);
+      expect(result.toolTimeoutMs).toBe(10_000);
+      expect(result.enabled).toBe(false);
+      expect(result.auth).toBe('oauth');
+      expect(result.bearerTokenEnvVar).toBe('REMOTE_TOKEN');
+    });
+
+    it('passes through stdio executor and runtime_id byte-identical', () => {
+      const envLookup = () => undefined;
+      const config: McpServerConfig = {
+        transport: 'stdio',
+        command: 'node',
+        executor: 'kaos',
+        runtime_id: 'local-1',
+      };
+      const result = expandServerConfig(config, envLookup);
+      expect(result.executor).toBe('kaos');
+      expect(result.runtime_id).toBe('local-1');
+    });
+
+    it('throws CONFIG_INVALID mentioning the fieldPath for undefined env var (A1)', () => {
+      const envLookup = () => undefined;
+      const cases: Array<{ config: McpServerConfig; fieldPath: string }> = [
+        { config: { transport: 'stdio', command: '${MISSING}' }, fieldPath: 'command' },
+        { config: { transport: 'stdio', command: 'node', args: ['a', 'b', '${MISSING}'] }, fieldPath: 'args[2]' },
+        { config: { transport: 'stdio', command: 'node', env: { K: '${MISSING}' } }, fieldPath: 'env.K' },
+        { config: { transport: 'stdio', command: 'node', cwd: '${MISSING}' }, fieldPath: 'cwd' },
+        {
+          config: { transport: 'http', url: 'https://x.test', headers: { Authorization: '${MISSING}' } },
+          fieldPath: 'headers.Authorization',
+        },
+      ];
+      for (const { config, fieldPath } of cases) {
+        try {
+          expandServerConfig(config, envLookup);
+          throw new Error(`expected throw for ${fieldPath}`);
+        } catch (error) {
+          expect(error).toBeInstanceOf(Error2);
+          expect((error as Error2).code).toBe(ErrorCodes.CONFIG_INVALID);
+          expect((error as Error).message).toContain(fieldPath);
+        }
+      }
+    });
+
+    it('throws CONFIG_INVALID for empty-string env var (A2)', () => {
+      const envLookup = () => '';
+      try {
+        expandServerConfig(
+          { transport: 'stdio', command: '${EMPTY}' },
+          envLookup,
+        );
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error2);
+        expect((error as Error2).code).toBe(ErrorCodes.CONFIG_INVALID);
+        expect((error as Error).message).toContain('command');
+      }
+    });
+
+    it('throws CONFIG_INVALID when an expanded cwd is a relative path', () => {
+      const envLookup = (name: string) => (name === 'ROOT' ? 'rel/path' : undefined);
+      try {
+        expandServerConfig(
+          { transport: 'stdio', command: 'node', cwd: '${ROOT}/s' },
+          envLookup,
+        );
+        throw new Error('expected throw');
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error2);
+        expect((error as Error2).code).toBe(ErrorCodes.CONFIG_INVALID);
+        expect((error as Error).message).toContain('cwd');
+        expect((error as Error).message).not.toContain('rel/path');
+      }
+    });
+
+    it('accepts POSIX, drive-letter, and UNC absolute expanded cwds', () => {
+      const map: Record<string, string> = {
+        POSIX: '/abs/work',
+        DRIVE: 'C:/Users/x/work',
+        UNC: '//server/share/work',
+      };
+      for (const expected of Object.values(map)) {
+        const result = expandServerConfig(
+          { transport: 'stdio', command: 'node', cwd: '${X}' },
+          (name) => (name === 'X' ? expected : undefined),
+        );
+        expect(result.cwd).toBe(expected);
+      }
+    });
+
+    it('does not leak env values in error messages for any field (A6)', () => {
+      const SECRET = 'leak-me-if-you-can-12345';
+      const envLookup = (name: string) => (name === 'PRESENT' ? SECRET : undefined);
+      const configs: McpServerConfig[] = [
+        { transport: 'stdio', command: '${ABSENT}' },
+        { transport: 'stdio', command: 'node', env: { K: '${ABSENT}' } },
+        { transport: 'http', url: 'https://x.test', headers: { Authorization: '${ABSENT}' } },
+      ];
+      for (const config of configs) {
+        try {
+          expandServerConfig(config, envLookup);
+        } catch (error) {
+          expect((error as Error).message).not.toContain(SECRET);
+        }
+      }
+    });
+  });
 });

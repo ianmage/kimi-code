@@ -54,7 +54,7 @@ Optional fields:
 | `env` | `Record<string, string>` | stdio | Environment variables injected into the child process |
 | `cwd` | `string` | stdio | Working directory for the child process |
 | `headers` | `Record<string, string>` | HTTP, SSE | Static request headers appended to every request |
-| `bearerTokenEnvVar` | `string` | HTTP, SSE | Name of an environment variable that contains a bearer token |
+| `bearerTokenEnvVar` | `string` | HTTP, SSE | Name of an environment variable that contains a bearer token. Deprecated: prefer `headers` with an environment variable template, for example `{"Authorization": "Bearer ${TOKEN}"}` |
 | `enabled` | `boolean` | All | Set to `false` to disable this server |
 | `startupTimeoutMs` | `number` | All | Connection timeout from `1` to `2147483647` milliseconds; default `30000` |
 | `toolTimeoutMs` | `number` | All | Timeout from `1` to `2147483647` milliseconds for a single tool call |
@@ -63,13 +63,44 @@ Optional fields:
 
 You do not have to set the connection timeout or the single tool-call timeout per server: `[mcp] startup_timeout_ms` / `[mcp] tool_timeout_ms` in `config.toml` or the `KIMI_MCP_STARTUP_TIMEOUT_MS` / `KIMI_MCP_TOOL_TIMEOUT_MS` environment variables change the global defaults. Precedence is: per-server field > environment variable > `config.toml` > built-in default. See [Configuration files](../configuration/config-files.md#mcp).
 
-HTTP and SSE servers support providing static credentials via `headers` or `bearerTokenEnvVar`. When OAuth is needed, run `/mcp-config login <server-name>` to complete browser-based authorization.
+HTTP and SSE servers support providing static credentials via `headers` or `bearerTokenEnvVar`; for new configurations prefer `headers` with environment variable templates (see [Environment Variable Templates](#environment-variable-templates)), since `bearerTokenEnvVar` is deprecated. When OAuth is needed, run `/mcp-config login <server-name>` to complete browser-based authorization.
 
 Plugins can also declare MCP servers in their manifest. Servers declared by a plugin are enabled by default and can be disabled or re-enabled in `/plugins`: disabling or removing stops the tools in open sessions — calls fail with a removal notice — and adding or enabling a server connects it in open sessions right away. See [Plugins](./plugins.md#mcp-servers-in-plugins) for details.
 
 ::: warning Note
 stdio entries in a project-level `.kimi-code/mcp.json` execute local commands when a session starts. Only enable these in repositories you trust.
 :::
+
+### Environment Variable Templates
+
+String values in certain fields can reference environment variables with `${VAR}` placeholders, so secrets never need to be written into `mcp.json` itself. For example:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+The syntax is a single-pass substitution: there is no escape sequence and no nesting — a value like `${${X}}` is not re-scanned after the first `}`. Placeholders are supported only in these fields:
+
+- **stdio**: `command`, each entry of `args`, each value of `env`, and `cwd`
+- **HTTP and SSE**: each value of `headers`
+
+`url` does not support placeholders: a remote server whose `url` contains `${` is skipped when the configuration loads, with a warning naming the server, and the rest of the file still loads. Use `headers` (as above) for credentials instead. A stdio `cwd` placeholder must resolve to an absolute path; a relative result fails the connection with a configuration error, regardless of any configured base directory.
+
+Two behaviors to keep in mind:
+
+- A referenced variable that is undefined or set to an empty string fails the connection when the server starts. The error names the variable and the field it appeared in (for example `env.API_KEY`) — never the value.
+- stdio `env` values are expanded first, then merged over the parent process environment, so a variable declared in `env` overrides the inherited one.
+
+Expanded values exist only while the connection is being established: they are never written back to `mcp.json`, never sent over the wire in config views, and never persisted. An `mcp.json` containing `${...}` placeholders is therefore safe to commit to version control.
 
 ## Tool Naming and Permissions
 

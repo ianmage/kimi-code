@@ -6,12 +6,13 @@
  * Run with `pnpm --filter @moonshot-ai/agent-core exec vitest run test/mcp/registry.test.ts`.
  */
 
-import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'pathe';
 
 import { describe, expect, it } from 'vitest';
 
+import { ErrorCodes } from '../../src/errors';
 import { GlobalMcpConfigStore } from '../../src/mcp/global-config';
 import { McpServerRegistry, mcpServerConfigsEqual } from '../../src/mcp/registry';
 import { PluginManager } from '../../src/plugin/manager';
@@ -219,6 +220,44 @@ describe('McpServerRegistry', () => {
     // A disabled descriptor alone never becomes the runtime target.
     await plugins.setEnabled('demo', true);
     await expect(registry.resolveRuntimeTarget('plugin-demo:api')).resolves.toBeUndefined();
+  });
+
+  it('rejects add/update with a placeholder remote url without touching the file', async () => {
+    const home = await makeKimiHome();
+    const store = new GlobalMcpConfigStore(home);
+    await store.add({ name: 'seed', transport: 'stdio', command: 'node' });
+    const before = await readFile(join(home, 'mcp.json'), 'utf8');
+
+    await expect(
+      store.add({ name: 'bad', transport: 'http', url: 'https://x.com/${P}' }),
+    ).rejects.toMatchObject({ code: ErrorCodes.CONFIG_INVALID });
+    await expect(
+      store.update({ name: 'seed', transport: 'http', url: 'https://x.com/${P}' }),
+    ).rejects.toMatchObject({ code: ErrorCodes.CONFIG_INVALID });
+
+    expect(await readFile(join(home, 'mcp.json'), 'utf8')).toBe(before);
+    expect((await store.list()).map((server) => server.name)).toEqual(['seed']);
+  });
+
+  it('lists and removes entries of a file that already contains a placeholder remote url', async () => {
+    const home = await makeKimiHome();
+    await writeJson(join(home, 'mcp.json'), {
+      mcpServers: {
+        poisoned: { transport: 'http', url: 'https://x.com/${P}' },
+        healthy: { transport: 'stdio', command: 'node' },
+      },
+    });
+    const store = new GlobalMcpConfigStore(home);
+
+    expect((await store.list()).map((server) => server.name).toSorted()).toEqual([
+      'healthy',
+      'poisoned',
+    ]);
+
+    const remaining = await store.remove('poisoned');
+    expect(remaining.map((server) => server.name)).toEqual(['healthy']);
+    const raw = JSON.parse(await readFile(join(home, 'mcp.json'), 'utf8'));
+    expect(Object.keys(raw.mcpServers)).toEqual(['healthy']);
   });
 });
 

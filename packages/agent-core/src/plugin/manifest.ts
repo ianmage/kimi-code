@@ -479,9 +479,25 @@ async function normalizePluginMcpServer(input: {
   readonly diagnostics: PluginDiagnostic[];
 }): Promise<McpServerConfig | undefined> {
   const { config } = input;
-  if (config.transport === 'http' || config.transport === 'sse') return config;
+  if (config.transport === 'http' || config.transport === 'sse') {
+    if (config.url.includes('${')) {
+      input.diagnostics.push({
+        severity: 'warn',
+        message: `"mcpServers.${input.name}.url" does not support environment variable expansion; use templated "headers" for credentials instead`,
+      });
+      return undefined;
+    }
+    return config;
+  }
 
   let command = config.command;
+  if (command.includes('${')) {
+    input.diagnostics.push({
+      severity: 'warn',
+      message: `"mcpServers.${input.name}.command" does not support environment variable expansion; plugin paths must start with "./"`,
+    });
+    return undefined;
+  }
   if (command.startsWith('./')) {
     const resolvedCommand = await resolvePluginPathField({
       pluginRoot: input.pluginRoot,
@@ -501,6 +517,13 @@ async function normalizePluginMcpServer(input: {
 
   let cwd = config.cwd;
   if (cwd !== undefined) {
+    if (cwd.includes('${')) {
+      input.diagnostics.push({
+        severity: 'warn',
+        message: `"mcpServers.${input.name}.cwd" does not support environment variable expansion; plugin paths must start with "./"`,
+      });
+      return undefined;
+    }
     const resolvedCwd = await resolvePluginPathField({
       pluginRoot: input.pluginRoot,
       field: `mcpServers.${input.name}.cwd`,

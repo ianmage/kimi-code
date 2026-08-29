@@ -355,6 +355,7 @@ export class KimiCore implements PromisableMethods<CoreAPI> {
     const baseMcpConfig = await resolveSessionMcpConfig({
       cwd: workDir,
       homeDir: this.homeDir,
+      onWarn: (message) => log.warn(message),
     });
     const withCallerMcp = mergeCallerMcpServers(baseMcpConfig, options.mcpServers);
     const parentKaos = overrides.kaos ?? (await this.getKaos());
@@ -604,6 +605,7 @@ export class KimiCore implements PromisableMethods<CoreAPI> {
     const baseMcpConfig = await resolveSessionMcpConfig({
       cwd: summary.workDir,
       homeDir: this.homeDir,
+      onWarn: (message) => log.warn(message),
     });
     const withCallerMcp = mergeCallerMcpServers(baseMcpConfig, input.mcpServers);
     await this.pluginsReady;
