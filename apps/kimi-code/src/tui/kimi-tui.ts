@@ -40,6 +40,8 @@ import { copyTextToClipboard } from '#/utils/clipboard/clipboard-text';
 import { appendInputHistory, loadInputHistory } from '#/utils/history/input-history';
 import { openUrl } from '#/utils/open-url';
 import { getInputHistoryFile } from '#/utils/paths';
+import { applyRecommendedEffort } from '#/utils/recommended-effort';
+import { getRecommendedEffortConfig } from '#/utils/recommended-effort-config';
 import { detectFdPath, ensureFdPath } from '#/utils/process/fd-detect';
 import { quoteShellArg } from '#/utils/shell-quote';
 import { restoreTerminalModes } from '#/utils/terminal-restore';
@@ -155,7 +157,12 @@ import {
   type TUIStartupOptions,
   type TUIStartupState,
 } from './types';
-import { hasDispose, isExpandable } from './utils/component-capabilities';
+import {
+  hasDispose,
+  hasHiddenContent,
+  isExpandable,
+  isExpandedComponent,
+} from './utils/component-capabilities';
 import { isDeadTerminalError } from './utils/dead-terminal';
 import { formatErrorMessage } from './utils/event-payload';
 import { pickForegroundTasks } from './utils/foreground-task';
@@ -190,6 +197,7 @@ import {
 } from './utils/transcript-component-metadata';
 import { nextTranscriptId } from './utils/transcript-id';
 import {
+  expandCutoffIndex,
   TRANSCRIPT_EXPAND_TURNS,
   TRANSCRIPT_HYSTERESIS,
   TRANSCRIPT_KEEP_RECENT_ASSISTANT,
@@ -222,8 +230,6 @@ export interface KimiTUIStartupInput {
   readonly migrationPlan?: MigrationPlan | null;
   /** When true, run only the migration screen, then exit (the `kimi migrate` command). */
   readonly migrateOnly?: boolean;
-  /** agent-core-v2 engine; enables the startup workspace-trust prompt. */
-  readonly engineV2?: boolean;
   readonly telemetryDisabled?: boolean;
 }
 
@@ -361,8 +367,6 @@ export class KimiTUI {
   private readonly migrationPlan: MigrationPlan | null;
   private readonly migrateOnly: boolean;
   private readonly telemetryDisabled: boolean;
-  /** Whether the harness runs on the agent-core-v2 engine (lazy session creation). */
-  readonly engineV2: boolean;
   private startupNotice: string | undefined;
   private lastActivityMode: string | undefined;
   private currentLoadingTip: { kind: LoadingTipKind; tip: string | undefined } | undefined =
@@ -454,9 +458,9 @@ export class KimiTUI {
     this.migrationPlan = startupInput.migrationPlan ?? null;
     this.migrateOnly = startupInput.migrateOnly ?? false;
     this.telemetryDisabled = startupInput.telemetryDisabled ?? false;
-    this.engineV2 = startupInput.engineV2 ?? false;
     this.startupNotice = startupInput.startupNotice;
     this.state = createTUIState(tuiOptions);
+    this.state.footer.setExpandHintProvider(() => this.toolOutputExpandHint());
     this.uninstallRainbowDance = installRainbowDance(() => {
       this.state.ui.requestRender();
     });
@@ -497,10 +501,8 @@ export class KimiTUI {
   // =========================================================================
 
   private getSlashCommands(): readonly KimiSlashCommand[] {
-    const builtins = sortSlashCommands(BUILTIN_SLASH_COMMANDS).filter(
-      (command) =>
-        isExperimentalFlagEnabled(command.experimentalFlag) &&
-        (!command.requiresEngineV2 || this.engineV2),
+    const builtins = sortSlashCommands(BUILTIN_SLASH_COMMANDS).filter((command) =>
+      isExperimentalFlagEnabled(command.experimentalFlag),
     );
     return [...builtins, ...this.skillCommands, ...this.pluginCommands];
   }
@@ -542,6 +544,7 @@ export class KimiTUI {
   }
 
   refreshSlashCommandAutocomplete(): void {
+    this.sessionEventHandler.notifications.setEnabled(isExperimentalFlagEnabled('notify_user'));
     this.setupAutocomplete();
   }
 
@@ -550,18 +553,10 @@ export class KimiTUI {
       // v2 engine: skills live on the workspace handler, not the session, so
       // they are available before the first (lazy) session is created — the
       // workspace catalog is the same merged view a session would serve.
-      if (this.engineV2) {
-        try {
-          const skills = await this.harness.listWorkspaceSkills(this.state.appState.workDir);
-          this.applySkillCommands(skills);
-          return;
-        } catch {
-          return;
-        }
-      }
-      this.skillCommands = [];
-      this.skillCommandMap.clear();
-      this.setupAutocomplete();
+      try {
+        const skills = await this.harness.listWorkspaceSkills(this.state.appState.workDir);
+        this.applySkillCommands(skills);
+      } catch {}
       return;
     }
 
@@ -588,18 +583,10 @@ export class KimiTUI {
     if (session === undefined) {
       // v2 engine: the enabled plugin commands are an app-global live view,
       // available before the first (lazy) session is created.
-      if (this.engineV2) {
-        try {
-          const defs = await this.harness.listPluginCommands();
-          this.applyPluginCommands(defs);
-          return;
-        } catch {
-          return;
-        }
-      }
-      this.pluginCommands = [];
-      this.pluginCommandMap.clear();
-      this.setupAutocomplete();
+      try {
+        const defs = await this.harness.listPluginCommands();
+        this.applyPluginCommands(defs);
+      } catch {}
       return;
     }
 
@@ -751,6 +738,7 @@ export class KimiTUI {
     this.state.editorContainer.clear();
     this.state.editorContainer.addChild(this.state.editor);
     this.state.ui.setFocus(this.state.editor);
+    this.applyRecommendedEffortInBackground();
     return shouldReplayHistory;
   }
 
@@ -795,6 +783,22 @@ export class KimiTUI {
       .catch(() => {
         // Best-effort background bootstrap: autocomplete keeps using the filesystem fallback.
       });
+  }
+
+  private applyRecommendedEffortInBackground(): void {
+    void this.backgroundRefreshPromise?.then(async () => {
+      await applyRecommendedEffort({
+        fetchConfig: async () =>
+          getRecommendedEffortConfig({
+            accessToken: await this.harness.auth.getCachedAccessToken(),
+          }),
+        getConfig: () => this.harness.getConfig(),
+        setConfig: (patch) => this.harness.setConfig(patch),
+        track: (event, properties) => {
+          this.track(event, properties);
+        },
+      });
+    });
   }
 
   private async refreshProviderModelsInBackground(): Promise<void> {
@@ -870,6 +874,7 @@ export class KimiTUI {
 
   private async init(): Promise<boolean> {
     setExperimentalFeatures(await this.harness.getExperimentalFeatures());
+    this.sessionEventHandler.notifications.setEnabled(isExperimentalFlagEnabled('notify_user'));
     await this.authFlow.refreshAvailableModels();
     this.backgroundRefreshPromise = this.refreshProviderModelsInBackground();
 
@@ -947,7 +952,7 @@ export class KimiTUI {
             );
           }
         }
-      } else if (this.engineV2) {
+      } else {
         // Lazy session creation (v2 engine): start session-less and create the
         // session on the first message. Startup flags are carried in appState
         // and applied when that session is created; until then the footer
@@ -955,8 +960,6 @@ export class KimiTUI {
         // time (model, permission, plan mode, thinking effort, context cap).
         await this.hydrateLazyConfigDefaults();
         this.appendStartupNotice(SESSIONLESS_STARTUP_NOTICE);
-      } else {
-        session = await this.harness.createSession(createSessionOptions);
       }
       if (session !== undefined && shouldReplayHistory) {
         await this.applyStartupModesToResumedSession(session);
@@ -970,9 +973,6 @@ export class KimiTUI {
       return false;
     }
 
-    if (!this.engineV2 && session === undefined) {
-      throw new Error('Startup session was not initialized.');
-    }
     if (session !== undefined) {
       await this.setSession(session);
       await this.syncRuntimeState(session);
@@ -1127,6 +1127,7 @@ export class KimiTUI {
     ui.addChild(this.state.transcriptContainer);
     ui.addChild(this.state.activityContainer);
     ui.addChild(this.state.todoPanelContainer);
+    ui.addChild(this.state.notifyPanelContainer);
     ui.addChild(this.state.queueContainer);
     ui.addChild(this.state.btwPanelContainer);
     ui.addChild(this.state.surveyContainer);
@@ -1167,6 +1168,7 @@ export class KimiTUI {
     main.addChild(this.state.transcriptContainer);
     main.addChild(this.state.activityContainer);
     main.addChild(this.state.todoPanelContainer);
+    main.addChild(this.state.notifyPanelContainer);
     main.addChild(this.state.queueContainer);
     main.addChild(this.state.btwPanelContainer);
     main.addChild(this.state.surveyContainer);
@@ -1229,10 +1231,6 @@ export class KimiTUI {
   private async runShellCommandFromInput(command: string): Promise<void> {
     let session = this.session;
     if (session === undefined) {
-      if (!this.engineV2) {
-        this.showError('No active session for shell command.');
-        return;
-      }
       session = await this.ensureSession();
       if (session === undefined) return;
       // A concurrent first message may have started a prompt while this lazy
@@ -1432,11 +1430,6 @@ export class KimiTUI {
     }
     let session = this.session;
     if (session === undefined) {
-      if (!this.engineV2) {
-        this.showError(LLM_NOT_SET_MESSAGE);
-        this.staging.release(stagingLease);
-        return;
-      }
       session = await this.ensureSession();
       if (session === undefined) {
         this.staging.release(stagingLease);
@@ -2271,10 +2264,9 @@ export class KimiTUI {
     // creation / `/new` before the first session) on v2, pass only the
     // explicit CLI --plan intent — and only when the engine is not already
     // applying `defaultPlanMode` at create time (sessionLifecycleService),
-    // since re-entering an active plan mode throws. On v1 (which never
-    // pre-fills plan mode from config), keep the historical appState value.
+    // since re-entering an active plan mode throws.
     const explicitPlanMode =
-      this.session !== undefined || !this.engineV2
+      this.session !== undefined
         ? this.state.appState.planMode
         : this.options.startup.plan && this.state.appState.configDefaultPlanMode !== true;
     const options: MutableCreateSessionOptions = {
@@ -2615,6 +2607,7 @@ export class KimiTUI {
     this.btwPanelController.clear();
     this.state.footer.setBackgroundCounts({ bashTasks: 0, agentTasks: 0 });
     this.streamingUI.setTodoList([]);
+    this.sessionEventHandler.notifications.clear();
     this.streamingUI.setTurnId(undefined);
     this.setAppState({ mcpServersSummary: null });
     this.streamingUI.setStep(0);
@@ -2957,6 +2950,7 @@ export class KimiTUI {
     this.clearTerminalInlineImages();
     this.state.todoPanel.clear();
     this.state.todoPanelContainer.clear();
+    this.sessionEventHandler.notifications.clear();
     const stagingFileIds = this.imageStore.clear();
     this.staging.deleteStaged(stagingFileIds);
     this.renderWelcome();
@@ -3453,24 +3447,49 @@ export class KimiTUI {
     );
   }
 
-  toggleToolOutputExpansion(): void {
-    this.state.toolOutputExpanded = !this.state.toolOutputExpanded;
-    const children = this.state.transcriptContainer.children;
-
-    // A component is expandable only if it sits at or after the start of the
-    // (totalTurns - expandTurns)-th turn — i.e. it belongs to one of the most
-    // recent `expandTurns` turns. Position-based so it also covers streaming
-    // components that have no entry in the metadata map.
+  /**
+   * Index of the first transcript child ctrl+o may expand: a component is
+   * expandable only if it sits at or after the start of the
+   * (totalTurns - expandTurns)-th turn, i.e. it belongs to one of the most
+   * recent `expandTurns` turns. Position-based so it also covers streaming
+   * components that have no entry in the metadata map.
+   */
+  private expandCutoff(children: readonly Component[]): number {
     const boundaries: number[] = [];
     for (let i = 0; i < children.length; i++) {
       if (this.isTurnBoundaryComponent(children[i]!)) boundaries.push(i);
     }
-    const expandCutoff =
-      TRANSCRIPT_EXPAND_TURNS <= 0
-        ? children.length
-        : boundaries.length > TRANSCRIPT_EXPAND_TURNS
-          ? boundaries[boundaries.length - TRANSCRIPT_EXPAND_TURNS]!
-          : 0;
+    return expandCutoffIndex(children.length, boundaries, TRANSCRIPT_EXPAND_TURNS);
+  }
+
+  /**
+   * What the footer's ctrl+o hint should offer: `expand` while a card in the
+   * expandable window keeps content out of its collapsed form, `collapse`
+   * once the toggle shows it, `null` when ctrl+o would change nothing.
+   */
+  private toolOutputExpandHint(): 'expand' | 'collapse' | null {
+    const children = this.state.transcriptContainer.children;
+    if (this.state.toolOutputExpanded) {
+      // Toggling off collapses every expanded card, including one that slid
+      // out of the expansion window since it was expanded, so any expanded
+      // card with hidden content keeps the collapse hint on.
+      for (let i = children.length - 1; i >= 0; i--) {
+        const child = children[i];
+        if (isExpandedComponent(child) && hasHiddenContent(child)) return 'collapse';
+      }
+      return null;
+    }
+    const cutoff = this.expandCutoff(children);
+    for (let i = children.length - 1; i >= cutoff; i--) {
+      if (hasHiddenContent(children[i])) return 'expand';
+    }
+    return null;
+  }
+
+  toggleToolOutputExpansion(): void {
+    this.state.toolOutputExpanded = !this.state.toolOutputExpanded;
+    const children = this.state.transcriptContainer.children;
+    const expandCutoff = this.expandCutoff(children);
 
     for (let i = 0; i < children.length; i++) {
       const child = children[i]!;
@@ -3486,6 +3505,14 @@ export class KimiTUI {
   toggleTodoPanelExpansion(): void {
     this.state.todoPanel.toggleExpanded();
     this.state.ui.requestRender();
+  }
+
+  toggleNotifyPanelFocus(): boolean {
+    return this.sessionEventHandler.notifications.toggleFocus();
+  }
+
+  handleNotifyPanelKey(key: 'left' | 'right' | 'up' | 'down' | 'escape'): boolean {
+    return this.sessionEventHandler.notifications.handlePanelKey(key);
   }
 
   private async detachRunningShellCommand(): Promise<void> {
@@ -3518,7 +3545,7 @@ export class KimiTUI {
     stream.component.finishBackgrounded();
     stream.entry.content = 'Moved to background.';
     this.shellOutputStreams.delete(commandId);
-    // The backgrounded command's notification turn (started by agent-core via
+    // The backgrounded command's notification turn (started by the engine via
     // appendSystemReminderAndNotify) owns the streaming phase and drains the
     // queue when it completes, so we intentionally leave both untouched here.
     this.showDetachHint('Moved to background. /tasks to view.');
@@ -3809,7 +3836,6 @@ export class KimiTUI {
    * caller must not start it again).
    */
   private async maybeRunWorkspaceTrustPrompt(): Promise<boolean> {
-    if (!this.engineV2) return false;
     const workDir = this.state.appState.workDir;
     let info: WorkspaceTrustInfo;
     try {
