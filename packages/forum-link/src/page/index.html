@@ -1,0 +1,972 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Forum Link</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        background: #f5f6f8;
+        color: #1c2128;
+        overflow-x: hidden;
+        word-break: break-word;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      main {
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 12px 12px 24px;
+      }
+      .topbar {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 8px 0 14px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0;
+      }
+      h2 {
+        font-size: 16px;
+        margin: 8px 0 12px;
+        color: #4b5563;
+      }
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        line-height: 18px;
+        color: #fff;
+        background: #9ca3af;
+      }
+      .badge-running {
+        background: #16a34a;
+      }
+      .badge-waiting-question {
+        background: #d97706;
+      }
+      .badge-idle {
+        background: #6b7280;
+      }
+      .mono {
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 12px;
+        color: #6b7280;
+      }
+      .thread-card {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-bottom: 10px;
+        cursor: pointer;
+      }
+      .thread-card:active {
+        background: #f0f4ff;
+      }
+      .thread-card-title {
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      .thread-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        font-size: 13px;
+        color: #6b7280;
+      }
+      .empty {
+        text-align: center;
+        color: #9ca3af;
+        padding: 48px 0;
+      }
+      #btn-back {
+        margin-bottom: 10px;
+      }
+      .thread-title {
+        font-size: 17px;
+        font-weight: 600;
+        margin: 4px 0 6px;
+      }
+      #timeline {
+        list-style: none;
+        margin: 12px 0 96px;
+        padding: 0;
+      }
+      .tl-item {
+        margin: 10px 0;
+      }
+      .msg {
+        border-radius: 10px;
+        padding: 8px 12px;
+        max-width: 92%;
+      }
+      .msg-user {
+        background: #e8f0fe;
+      }
+      .msg-assistant {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+      }
+      .msg-role {
+        display: block;
+        font-size: 11px;
+        color: #6b7280;
+        margin-bottom: 4px;
+      }
+      .msg-text {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .msg-trunc {
+        display: block;
+        font-size: 11px;
+        color: #9ca3af;
+        margin-top: 4px;
+      }
+      .tl-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #6b7280;
+        padding: 2px 0;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #9ca3af;
+        flex: none;
+      }
+      .dot-running {
+        background: #16a34a;
+      }
+      .dot-waiting-question {
+        background: #d97706;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid #d3dbe5;
+        border-radius: 10px;
+        padding: 12px;
+      }
+      .card-kind {
+        font-size: 11px;
+        color: #2563eb;
+        font-weight: 600;
+        margin-bottom: 6px;
+        letter-spacing: 0.05em;
+      }
+      .card-q {
+        font-weight: 600;
+        margin-bottom: 8px;
+      }
+      .options {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .option {
+        min-height: 44px;
+        text-align: left;
+        padding: 8px 12px;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        background: #fff;
+        font-size: 15px;
+        cursor: pointer;
+      }
+      .option:hover:not(:disabled) {
+        border-color: #2563eb;
+      }
+      .option.chosen {
+        border-color: #2563eb;
+        background: #eef4ff;
+      }
+      .card-tool {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        margin-bottom: 8px;
+        flex-wrap: wrap;
+      }
+      .tool-name {
+        font-weight: 600;
+      }
+      .tool-action {
+        font-size: 13px;
+        color: #6b7280;
+      }
+      .card-summary {
+        margin: 0 0 10px;
+        padding: 8px 10px;
+        background: #f6f8fa;
+        border-radius: 8px;
+        font-size: 13px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-family: ui-monospace, Consolas, monospace;
+      }
+      .card-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .card-note {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #6b7280;
+      }
+      .btn {
+        min-height: 44px;
+        padding: 8px 16px;
+        border-radius: 8px;
+        border: 1px solid #cbd5e1;
+        background: #fff;
+        font-size: 15px;
+        cursor: pointer;
+      }
+      .btn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      .btn.primary {
+        background: #2563eb;
+        border-color: #2563eb;
+        color: #fff;
+      }
+      .btn.danger {
+        background: #dc2626;
+        border-color: #dc2626;
+        color: #fff;
+      }
+      #action-bar {
+        position: fixed;
+        left: 50%;
+        transform: translateX(-50%);
+        bottom: 0;
+        width: 100%;
+        max-width: 640px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+        background: #f5f6f8;
+        border-top: 1px solid #e5e7eb;
+      }
+      #msg-input {
+        flex: 1;
+        min-width: 0;
+        min-height: 44px;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 8px 12px;
+        font-size: 15px;
+        background: #fff;
+      }
+      .modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.45);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 20;
+        padding: 16px;
+      }
+      .modal-panel {
+        background: #fff;
+        border-radius: 12px;
+        padding: 20px;
+        width: 100%;
+        max-width: 340px;
+      }
+      .modal-panel form {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .modal-panel label {
+        font-size: 14px;
+        color: #374151;
+      }
+      .modal-panel input {
+        min-height: 44px;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 8px 12px;
+        font-size: 15px;
+      }
+      .modal-panel .row {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+      #gate-error {
+        color: #dc2626;
+        font-size: 13px;
+        margin: 0;
+      }
+      @media (max-width: 390px) {
+        main {
+          padding: 8px 8px 24px;
+        }
+        .card {
+          padding: 10px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main id="app">
+      <header class="topbar"><h1>Forum Link</h1></header>
+      <section id="view-list">
+        <h2>会话列表</h2>
+        <p id="list-notice" hidden></p>
+        <div id="thread-list"></div>
+      </section>
+      <section id="view-thread" hidden>
+        <button id="btn-back" class="btn" type="button">← 返回列表</button>
+        <header id="thread-head"></header>
+        <div id="conn-status" class="tl-status" hidden></div>
+        <ol id="timeline"></ol>
+      </section>
+    </main>
+    <footer id="action-bar" hidden>
+      <input id="msg-input" placeholder="输入消息…" autocomplete="off" />
+      <button id="btn-send" class="btn primary" type="button">发送</button>
+      <button id="btn-pause" class="btn" type="button">暂停</button>
+      <button id="btn-end" class="btn danger" type="button">结束会话</button>
+    </footer>
+    <div id="gate-modal" class="modal" hidden>
+      <div class="modal-panel">
+        <form id="gate-form">
+          <label for="gate-input">访问密码</label>
+          <input id="gate-input" type="password" autocomplete="off" />
+          <p id="gate-error" hidden></p>
+          <button class="btn primary" type="submit">进入</button>
+        </form>
+      </div>
+    </div>
+    <div id="confirm-modal" class="modal" hidden>
+      <div class="modal-panel">
+        <p id="confirm-text"></p>
+        <div class="row">
+          <button id="confirm-cancel" class="btn" type="button">取消</button>
+          <button id="confirm-ok" class="btn primary" type="button">确认</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      (() => {
+        'use strict';
+        const KEY_NAME = 'forum-link-key';
+        const LIST_POLL_MS = 5000;
+        const RECONNECT_MS = 3000;
+        const RESOLVE_RETRY_MS = 1000;
+        const RESOLVE_MAX_RETRIES = 8;
+        const STATUS_TEXT = { running: '运行中', idle: '空闲', 'waiting-question': '等待提问' };
+        const OUTCOME_TEXT = { answered: '已回答', approved: '已允许', rejected: '已拒绝', cancelled: '已取消' };
+
+        const $ = (id) => document.getElementById(id);
+        const state = {
+          threadId: null,
+          store: null,
+          es: null,
+          retryTimer: null,
+          listTimer: null,
+          pendingCards: new Set(),
+          pendingAnswers: new Map(),
+          sessionEnded: false,
+        };
+
+        const getKey = () => sessionStorage.getItem(KEY_NAME) || '';
+
+        const el = (tag, className, text) => {
+          const node = document.createElement(tag);
+          if (className) node.className = className;
+          if (text !== undefined && text !== null) node.textContent = text;
+          return node;
+        };
+
+        const showConnStatus = (text) => {
+          const node = $('conn-status');
+          node.textContent = text;
+          node.hidden = !text;
+        };
+
+        const hideConnStatus = () => {
+          $('conn-status').hidden = true;
+          $('conn-status').textContent = '';
+        };
+
+        const teardown = () => {
+          if (state.es) {
+            state.es.close();
+            state.es = null;
+          }
+          if (state.retryTimer) {
+            clearTimeout(state.retryTimer);
+            state.retryTimer = null;
+          }
+          if (state.listTimer) {
+            clearInterval(state.listTimer);
+            state.listTimer = null;
+          }
+          state.threadId = null;
+          state.store = null;
+        };
+
+        const showGate = (message) => {
+          teardown();
+          $('action-bar').hidden = true;
+          $('gate-error').textContent = message || '';
+          $('gate-error').hidden = !message;
+          $('gate-modal').hidden = false;
+          $('gate-input').focus();
+        };
+
+        const api = (path, options) =>
+          fetch(path, { ...options, headers: { 'content-type': 'application/json', authorization: `Bearer ${getKey()}` } }).then(
+            (res) => {
+              if (res.status === 401) {
+                showGate('密码错误，请重新输入');
+                throw new Error('unauthorized');
+              }
+              if (res.status === 429) {
+                showGate('尝试次数过多，请稍后再试');
+                throw new Error('rate-limited');
+              }
+              return res;
+            },
+          );
+
+        const createStore = () => ({
+          items: [],
+          cards: new Map(),
+          settled: new Map(),
+          descriptor: undefined,
+          lastSeq: 0,
+          onResync: null,
+        });
+
+        const fetchThreads = () =>
+          api('/api/threads')
+            .then((res) => res.json())
+            .then((body) => ({ threads: (body && body.threads) || [] }))
+            .catch(() => undefined);
+
+        const resolveThreadBySessionId = (sessionId, retryIntervalMs, maxRetries) => {
+          const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const poll = async (attempt) => {
+            const body = await fetchThreads();
+            const match = body && body.threads.find((thread) => thread.descriptor && thread.descriptor.sessionId === sessionId);
+            if (match) return match;
+            if (attempt >= maxRetries) return undefined;
+            await delay(retryIntervalMs);
+            return poll(attempt + 1);
+          };
+          return poll(0);
+        };
+
+        const registerCard = (store, cardId, kind) => {
+          const outcome = store.settled.get(cardId);
+          const existing = store.cards.get(cardId);
+          if (existing && existing.state !== 'open') return;
+          store.cards.set(cardId, { cardId, kind, state: outcome || 'open' });
+        };
+
+        const settleCard = (store, cardId, outcome) => {
+          store.settled.set(cardId, outcome);
+          state.pendingCards.delete(cardId);
+          state.pendingAnswers.delete(cardId);
+          const card = store.cards.get(cardId);
+          if (!card) return;
+          store.cards.set(cardId, { cardId, kind: card.kind, state: outcome });
+        };
+
+        const storeApplyEntry = (store, seq, entry) => {
+          if (seq <= store.lastSeq) return false;
+          if (seq > store.lastSeq + 1) {
+            if (store.onResync) store.onResync();
+            return false;
+          }
+          store.lastSeq = seq;
+          store.items.push({ seq, entry });
+          if (entry.kind === 'question-card') registerCard(store, entry.cardId, 'question');
+          else if (entry.kind === 'approval-card') registerCard(store, entry.cardId, 'approval');
+          else if (entry.kind === 'card-settled') settleCard(store, entry.cardId, entry.outcome);
+          return true;
+        };
+
+        const storeApplySnapshot = (store, snapshot) => {
+          store.items = [...snapshot.entries].sort((a, b) => a.seq - b.seq);
+          store.cards = new Map();
+          store.settled = new Map();
+          for (const card of snapshot.openCards) {
+            store.cards.set(card.cardId, { cardId: card.cardId, kind: card.kind, state: card.state });
+            if (card.state !== 'open') store.settled.set(card.cardId, card.state);
+          }
+          store.lastSeq = snapshot.maxSeq;
+          store.descriptor = snapshot.descriptor;
+        };
+
+        const storeApplyReset = (store, descriptor) => {
+          store.items = [];
+          store.cards = new Map();
+          store.settled = new Map();
+          store.lastSeq = 0;
+          store.descriptor = descriptor;
+          state.pendingCards.clear();
+          state.pendingAnswers.clear();
+        };
+
+        const cardActionable = (card, status) => card.state === 'open' && status !== 'idle';
+
+        const needsConfirm = (type) => type === 'approve' || type === 'end-session';
+
+        const postAction = (frame) =>
+          api('/api/action', { method: 'POST', body: JSON.stringify(frame) })
+            .then(() => undefined)
+            .catch(() => undefined);
+
+        let confirmResolve = null;
+        const confirmDialog = (text) => {
+          $('confirm-text').textContent = text;
+          $('confirm-modal').hidden = false;
+          return new Promise((resolve) => {
+            confirmResolve = resolve;
+          });
+        };
+        const closeConfirm = (result) => {
+          $('confirm-modal').hidden = true;
+          if (confirmResolve) {
+            confirmResolve(result);
+            confirmResolve = null;
+          }
+        };
+        $('confirm-ok').addEventListener('click', () => closeConfirm(true));
+        $('confirm-cancel').addEventListener('click', () => closeConfirm(false));
+
+        const renderAll = () => {
+          const store = state.store;
+          if (!store || !state.threadId) return;
+          const head = $('thread-head');
+          head.innerHTML = '';
+          const descriptor = store.descriptor;
+          if (descriptor) {
+            head.appendChild(el('div', 'thread-title', descriptor.title));
+            const meta = el('div', 'thread-meta');
+            meta.appendChild(el('span', `badge badge-${descriptor.status}`, STATUS_TEXT[descriptor.status] || descriptor.status));
+            meta.appendChild(el('span', null, descriptor.projectName));
+            meta.appendChild(el('span', null, descriptor.machineName));
+            meta.appendChild(el('span', 'mono', descriptor.sessionId.slice(0, 8)));
+            head.appendChild(meta);
+          }
+          const scroller = document.scrollingElement;
+          const nearBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120;
+          const list = $('timeline');
+          list.innerHTML = '';
+          for (const item of store.items) list.appendChild(renderItem(store, item));
+          if (nearBottom) scroller.scrollTop = scroller.scrollHeight;
+        };
+
+        const renderItem = (store, item) => {
+          const entry = item.entry;
+          if (entry.kind === 'message') return renderMessage(entry);
+          if (entry.kind === 'question-card') return renderQuestion(store, entry);
+          if (entry.kind === 'approval-card') return renderApproval(store, entry);
+          if (entry.kind === 'status-marker') return renderStatusMarker(entry);
+          return renderSettledMarker(entry);
+        };
+
+        const renderMessage = (entry) => {
+          const li = el('li', 'tl-item');
+          const bubble = el('div', `msg msg-${entry.role}`);
+          bubble.appendChild(el('span', 'msg-role', entry.role === 'user' ? '用户' : '助手'));
+          bubble.appendChild(el('div', 'msg-text', entry.text));
+          if (entry.truncated) bubble.appendChild(el('span', 'msg-trunc', '内容已截断'));
+          li.appendChild(bubble);
+          return li;
+        };
+
+        const renderStatusMarker = (entry) => {
+          const li = el('li', 'tl-item');
+          const line = el('div', 'tl-status');
+          line.appendChild(el('span', `dot dot-${entry.status}`));
+          line.appendChild(el('span', null, `状态切换为 ${STATUS_TEXT[entry.status] || entry.status}`));
+          li.appendChild(line);
+          return li;
+        };
+
+        const renderSettledMarker = (entry) => {
+          const li = el('li', 'tl-item');
+          const line = el('div', 'tl-status');
+          line.appendChild(el('span', 'dot'));
+          line.appendChild(el('span', null, `卡片已处理 · ${OUTCOME_TEXT[entry.outcome] || entry.outcome}`));
+          li.appendChild(line);
+          return li;
+        };
+
+        const renderQuestion = (store, entry) => {
+          const li = el('li', 'tl-item');
+          const card = el('div', 'card');
+          card.appendChild(el('div', 'card-kind', '问题卡片'));
+          card.appendChild(el('div', 'card-q', entry.question));
+          const cardState = store.cards.get(entry.cardId) || { state: 'open' };
+          const status = store.descriptor ? store.descriptor.status : 'running';
+          const pending = state.pendingCards.has(entry.cardId);
+          const actionable = cardActionable(cardState, status) && !pending;
+          const box = el('div', 'options');
+          for (const option of entry.options) {
+            const btn = el('button', 'option', option);
+            btn.type = 'button';
+            btn.disabled = !actionable;
+            if (actionable) btn.addEventListener('click', () => sendAnswer(entry.cardId, option));
+            if (pending && state.pendingAnswers.get(entry.cardId) === option) btn.classList.add('chosen');
+            box.appendChild(btn);
+          }
+          card.appendChild(box);
+          appendCardNote(card, cardState.state, status, pending);
+          li.appendChild(card);
+          return li;
+        };
+
+        const renderApproval = (store, entry) => {
+          const li = el('li', 'tl-item');
+          const card = el('div', 'card');
+          card.appendChild(el('div', 'card-kind', '审批卡片'));
+          const tool = el('div', 'card-tool');
+          tool.appendChild(el('span', 'tool-name', entry.toolName));
+          tool.appendChild(el('span', 'tool-action', entry.action));
+          card.appendChild(tool);
+          card.appendChild(el('pre', 'card-summary', entry.summary));
+          const cardState = store.cards.get(entry.cardId) || { state: 'open' };
+          const status = store.descriptor ? store.descriptor.status : 'running';
+          const pending = state.pendingCards.has(entry.cardId);
+          const actionable = cardActionable(cardState, status) && !pending;
+          const actions = el('div', 'card-actions');
+          const approveBtn = el('button', 'btn primary', '允许');
+          const denyBtn = el('button', 'btn danger', '拒绝');
+          approveBtn.type = 'button';
+          denyBtn.type = 'button';
+          approveBtn.disabled = !actionable;
+          denyBtn.disabled = !actionable;
+          if (actionable) {
+            approveBtn.addEventListener('click', () => sendCardAction('approve', entry.cardId));
+            denyBtn.addEventListener('click', () => sendCardAction('deny', entry.cardId));
+          }
+          actions.appendChild(approveBtn);
+          actions.appendChild(denyBtn);
+          card.appendChild(actions);
+          appendCardNote(card, cardState.state, status, pending);
+          li.appendChild(card);
+          return li;
+        };
+
+        const appendCardNote = (card, cardStateValue, status, pending) => {
+          if (pending) card.appendChild(el('div', 'card-note', '已发送'));
+          else if (cardStateValue !== 'open') card.appendChild(el('div', 'card-note', OUTCOME_TEXT[cardStateValue] || cardStateValue));
+          else if (status === 'idle') card.appendChild(el('div', 'card-note', '会话空闲，暂不可操作'));
+        };
+
+        const sendAnswer = (cardId, answer) => {
+          state.pendingCards.add(cardId);
+          state.pendingAnswers.set(cardId, answer);
+          renderAll();
+          postAction({ type: 'answer-question', target: state.threadId, cardId, answer });
+        };
+
+        const sendCardAction = (type, cardId) => {
+          const fire = () => {
+            state.pendingCards.add(cardId);
+            renderAll();
+            postAction({ type, target: state.threadId, cardId });
+          };
+          if (needsConfirm(type)) confirmDialog('确认允许此操作？').then((ok) => { if (ok) fire(); });
+          else fire();
+        };
+
+        const markSent = (buttonId, fallbackText) => {
+          const btn = $(buttonId);
+          btn.disabled = true;
+          btn.textContent = '已发送';
+          setTimeout(() => {
+            btn.disabled = false;
+            btn.textContent = fallbackText;
+          }, 1500);
+        };
+
+        const sendMessage = () => {
+          const input = $('msg-input');
+          const text = input.value.trim();
+          if (!text || !state.threadId) return;
+          input.value = '';
+          markSent('btn-send', '发送');
+          postAction({ type: 'send-message', target: state.threadId, text });
+        };
+
+        $('btn-send').addEventListener('click', sendMessage);
+        $('msg-input').addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') sendMessage();
+        });
+        $('btn-pause').addEventListener('click', () => {
+          if (!state.threadId) return;
+          markSent('btn-pause', '暂停');
+          postAction({ type: 'pause', target: state.threadId });
+        });
+        $('btn-end').addEventListener('click', () => {
+          if (!state.threadId || state.sessionEnded) return;
+          confirmDialog('确认结束会话？').then((ok) => {
+            if (!ok) return;
+            state.sessionEnded = true;
+            const btn = $('btn-end');
+            btn.disabled = true;
+            btn.textContent = '已发送';
+            postAction({ type: 'end-session', target: state.threadId });
+          });
+        });
+        $('btn-back').addEventListener('click', () => {
+          location.hash = '';
+        });
+
+        const renderThreads = (threads) => {
+          const list = $('thread-list');
+          list.innerHTML = '';
+          if (!threads.length) {
+            list.appendChild(el('div', 'empty', '没有已发布的会话'));
+            return;
+          }
+          for (const thread of threads) {
+            const descriptor = thread.descriptor || {};
+            const card = el('div', 'thread-card');
+            card.appendChild(el('div', 'thread-card-title', descriptor.title || thread.id));
+            const meta = el('div', 'thread-meta');
+            meta.appendChild(el('span', `badge badge-${descriptor.status}`, STATUS_TEXT[descriptor.status] || descriptor.status || ''));
+            meta.appendChild(el('span', null, descriptor.projectName || ''));
+            meta.appendChild(el('span', null, descriptor.machineName || ''));
+            meta.appendChild(el('span', 'mono', (descriptor.sessionId || '').slice(0, 8)));
+            card.appendChild(meta);
+            card.addEventListener('click', () => {
+              location.hash = `#thread/${thread.id}`;
+            });
+            list.appendChild(card);
+          }
+        };
+
+        const refreshThreads = () => {
+          api('/api/threads')
+            .then((res) => res.json())
+            .then((body) => renderThreads(body.threads || []))
+            .catch(() => undefined);
+        };
+
+        let listNotice = null;
+        let threadNotice = null;
+        const showListNotice = (text) => {
+          listNotice = text;
+        };
+
+        const showList = () => {
+          teardown();
+          state.sessionEnded = false;
+          state.pendingCards.clear();
+          state.pendingAnswers.clear();
+          $('view-thread').hidden = true;
+          $('action-bar').hidden = true;
+          $('view-list').hidden = false;
+          hideConnStatus();
+          const node = $('list-notice');
+          node.textContent = listNotice || '';
+          node.hidden = !listNotice;
+          listNotice = null;
+          refreshThreads();
+          state.listTimer = setInterval(refreshThreads, LIST_POLL_MS);
+        };
+
+        const loadSnapshot = (id, connect) => {
+          api(`/api/threads/${encodeURIComponent(id)}/snapshot`)
+            .then((res) => {
+              if (res.status === 404) {
+                if (connect) resolveThread(id);
+                else location.hash = '';
+                return null;
+              }
+              return res.json();
+            })
+            .then((snapshot) => {
+              if (!snapshot || state.threadId !== id) return;
+              if (!state.store) {
+                state.store = createStore();
+                state.store.onResync = () => loadSnapshot(id, false);
+              }
+              storeApplySnapshot(state.store, snapshot);
+              renderAll();
+              if (connect) connectStream(id);
+            })
+            .catch(() => undefined);
+        };
+
+        const connectStream = (id) => {
+          if (state.es) {
+            state.es.close();
+            state.es = null;
+          }
+          const es = new EventSource(`/api/stream/${encodeURIComponent(id)}?key=${encodeURIComponent(getKey())}`);
+          state.es = es;
+          es.onopen = () => {
+            if (state.threadId !== id) return;
+            hideConnStatus();
+          };
+          es.onmessage = (event) => {
+            if (state.threadId !== id || !state.store) return;
+            let data;
+            try {
+              data = JSON.parse(event.data);
+            } catch {
+              return;
+            }
+            if (data && typeof data.seq === 'number' && data.entry) {
+              if (storeApplyEntry(state.store, data.seq, data.entry)) {
+                hideConnStatus();
+                renderAll();
+              }
+              return;
+            }
+            if (data && data.reset && data.descriptor) {
+              storeApplyReset(state.store, data.descriptor);
+              renderAll();
+              return;
+            }
+            if (data && data.descriptor) {
+              state.store.descriptor = data.descriptor;
+              renderAll();
+            }
+          };
+          es.onerror = () => {
+            if (state.threadId !== id) return;
+            es.close();
+            if (state.es === es) state.es = null;
+            showConnStatus('重连中…');
+            scheduleReconnect(id);
+          };
+        };
+
+        const scheduleReconnect = (id) => {
+          if (state.retryTimer) return;
+          state.retryTimer = setTimeout(() => {
+            state.retryTimer = null;
+            if (state.threadId !== id) return;
+            api(`/api/threads/${encodeURIComponent(id)}/snapshot`)
+              .then((res) => {
+                if (state.threadId !== id) return undefined;
+                if (res.status === 404) {
+                  resolveThread(id);
+                  return undefined;
+                }
+                return res.json().then((snapshot) => {
+                  if (state.threadId !== id || !state.store) return;
+                  hideConnStatus();
+                  storeApplySnapshot(state.store, snapshot);
+                  renderAll();
+                  connectStream(id);
+                });
+              })
+              .catch(() => scheduleReconnect(id));
+          }, RECONNECT_MS);
+        };
+
+        const resolveThread = (id) => {
+          const sessionId = state.store && state.store.descriptor ? state.store.descriptor.sessionId : undefined;
+          if (!sessionId) {
+            location.hash = '';
+            return;
+          }
+          showConnStatus('重连中…');
+          resolveThreadBySessionId(sessionId, RESOLVE_RETRY_MS, RESOLVE_MAX_RETRIES).then((summary) => {
+            if (state.threadId !== id) return;
+            if (!summary) {
+              location.hash = '';
+              showListNotice('会话已离线');
+              return;
+            }
+            threadNotice = '已重连';
+            if (state.threadId === summary.id) {
+              openThread(summary.id);
+              return;
+            }
+            location.hash = `#thread/${encodeURIComponent(summary.id)}`;
+          });
+        };
+
+        const openThread = (id) => {
+          teardown();
+          state.sessionEnded = false;
+          state.pendingCards.clear();
+          state.pendingAnswers.clear();
+          state.threadId = id;
+          $('view-list').hidden = true;
+          $('view-thread').hidden = false;
+          $('action-bar').hidden = false;
+          $('thread-head').innerHTML = '';
+          showConnStatus(threadNotice || '');
+          threadNotice = null;
+          $('timeline').innerHTML = '';
+          loadSnapshot(id, true);
+        };
+
+        const route = () => {
+          const proceed = () => {
+            const match = /^#thread\/([^/]+)$/.exec(location.hash);
+            if (match) openThread(decodeURIComponent(match[1]));
+            else showList();
+          };
+          if (getKey()) {
+            proceed();
+            return;
+          }
+          fetch('/api/threads', { headers: { authorization: `Bearer ${getKey()}` } })
+            .then((res) => {
+              if (res.status === 200) proceed();
+              else showGate('');
+            })
+            .catch(() => showGate('无法连接服务'));
+        };
+
+        window.addEventListener('hashchange', route);
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState !== 'visible') return;
+          if (!state.threadId || !state.store) return;
+          loadSnapshot(state.threadId, false);
+        });
+
+        $('gate-form').addEventListener('submit', (event) => {
+          event.preventDefault();
+          const value = $('gate-input').value.trim();
+          if (!value) return;
+          sessionStorage.setItem(KEY_NAME, value);
+          $('gate-input').value = '';
+          $('gate-modal').hidden = true;
+          route();
+        });
+
+        route();
+      })();
+    </script>
+  </body>
+</html>
