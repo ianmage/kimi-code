@@ -93,6 +93,13 @@ export function getUpdateRolloutLogFile(): string {
 }
 
 /**
+ * Return the forum-link credential file: `<dataDir>/remote_key`.
+ */
+export function getRemoteKeyFile(): string {
+  return join(getDataDir(), 'remote_key');
+}
+
+/**
  * Return the plugin update notice state file: `<dataDir>/updates/plugin-notices.json`.
  */
 export function getPluginUpdateNoticeStateFile(): string {

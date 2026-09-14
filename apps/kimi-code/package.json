@@ -37,6 +37,7 @@
   "imports": {
     "#/tui/theme": "./src/tui/theme/index.ts",
     "#/tui/commands": "./src/tui/commands/index.ts",
+    "#/tui/controllers/forum-link": "./src/tui/controllers/forum-link/index.ts",
     "#/cli/sub/web": "./src/cli/sub/web/index.ts",
     "#/cli/sub/web/*": "./src/cli/sub/web/*.ts",
     "#/generated/vis-web-asset": [
@@ -84,6 +85,7 @@
   "devDependencies": {
     "@moonshot-ai/acp-server": "workspace:^",
     "@moonshot-ai/agent-core-v2": "workspace:^",
+    "@moonshot-ai/forum-link": "workspace:^",
     "@moonshot-ai/kap-server": "workspace:^",
     "@moonshot-ai/kimi-code-oauth": "workspace:^",
     "@moonshot-ai/kimi-code-sdk": "workspace:^",
