@@ -437,6 +437,13 @@ export const BUILTIN_SLASH_COMMANDS = [
     availability: 'always',
   },
   {
+    name: 'forum',
+    aliases: [],
+    description: 'Publish this session to the Forum Link hub for remote viewing and actions',
+    priority: 40,
+    availability: 'always',
+  },
+  {
     name: 'exit',
     aliases: ['quit', 'q'],
     description: 'Exit the application',
