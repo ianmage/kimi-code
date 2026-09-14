@@ -125,6 +125,11 @@ import { AuthFlowController } from './controllers/auth-flow';
 import { BtwPanelController } from './controllers/btw-panel';
 import { ClipboardImageHintController } from './controllers/clipboard-image-hint';
 import { EditorKeyboardController } from './controllers/editor-keyboard';
+import {
+  createForumLinkController,
+  ForumLinkController,
+  wrapUiHooksForForumLink,
+} from './controllers/forum-link';
 import { SessionEventHandler } from './controllers/session-event-handler';
 import { SessionReplayRenderer } from './controllers/session-replay';
 import { StagingLeaseTracker, type StagingLease } from './controllers/staging-leases';
@@ -388,6 +393,34 @@ export class KimiTUI {
   readonly tasksBrowserController: TasksBrowserController;
   readonly surveyController: SurveyController;
   readonly editorKeyboard: EditorKeyboardController;
+  // ForumLink observation target; lazily created by `ensureForumLink` on the
+  // first `/forum` publish — undefined until then, so every seam is a no-op.
+  private forumLinkField?: ForumLinkController;
+
+  /** Read-only forum-link access face for the slash-command layer. */
+  get forumLink(): ForumLinkController | undefined {
+    return this.forumLinkField;
+  }
+
+  /** Lazily create the forum-link controller on the first `/forum` publish. */
+  ensureForumLink(): ForumLinkController {
+    if (this.forumLinkField === undefined) {
+      this.forumLinkField = createForumLinkController({
+        appState: () => this.state.appState,
+        approvalController: this.approvalController,
+        questionController: this.questionController,
+        sendNormalUserInput: (text) => this.sendNormalUserInput(text),
+        createNewSession: () => this.createNewSession(),
+        showStatus: (message) => this.showStatus(message),
+        session: () => this.session,
+        workDir: () => this.state.appState.workDir,
+        sessionTitle: () => this.state.appState.sessionTitle,
+      });
+      const session = this.session;
+      if (session !== undefined) this.forumLinkField.onSessionChanged(session);
+    }
+    return this.forumLinkField;
+  }
 
   /** Timer that auto-clears the one-shot "moved to background" footer hint. */
   private detachHintClearTimer: ReturnType<typeof setTimeout> | undefined;
@@ -466,20 +499,27 @@ export class KimiTUI {
     });
 
     this.reverseRpcDisposers.push(
-      ...registerReverseRPCHandlers(this.approvalController, this.questionController, {
-        showApprovalPanel: (payload) => {
-          this.showApprovalPanel(payload);
-        },
-        hideApprovalPanel: () => {
-          this.hideApprovalPanel();
-        },
-        showQuestionDialog: (payload) => {
-          this.showQuestionDialog(payload);
-        },
-        hideQuestionDialog: () => {
-          this.hideQuestionDialog();
-        },
-      }),
+      ...registerReverseRPCHandlers(
+        this.approvalController,
+        this.questionController,
+        wrapUiHooksForForumLink(
+          {
+            showApprovalPanel: (payload) => {
+              this.showApprovalPanel(payload);
+            },
+            hideApprovalPanel: () => {
+              this.hideApprovalPanel();
+            },
+            showQuestionDialog: (payload) => {
+              this.showQuestionDialog(payload);
+            },
+            hideQuestionDialog: () => {
+              this.hideQuestionDialog();
+            },
+          },
+          () => this.forumLink,
+        ),
+      ),
     );
     this.streamingUI = new StreamingUIController(this);
     this.authFlow = new AuthFlowController(this);
@@ -1008,6 +1048,7 @@ export class KimiTUI {
     this.streamingUI.resetToolUi();
     this.disposeTranscriptChildren();
     this.editorKeyboard.dispose();
+    await this.forumLink?.stop();
     this.surveyController.dispose();
     this.state.footer.dispose();
     for (const dispose of this.reverseRpcDisposers) {
@@ -2381,6 +2422,7 @@ export class KimiTUI {
     // before the engine's intake can read it.
     if (previous !== undefined) this.staging.releaseAll();
     this.session = session;
+    this.forumLink?.onSessionChanged(session);
     this.harness.setTelemetryContext({ sessionId: session.id });
     this.registerSessionHandlers(session);
     this.syncAdditionalDirs(session);
@@ -2864,6 +2906,7 @@ export class KimiTUI {
   }
 
   appendTranscriptEntry(entry: TranscriptEntry): void {
+    this.forumLink?.onTranscriptEntry(entry);
     this.state.transcriptEntries.push(entry);
     const component = this.createTranscriptComponent(entry);
     if (component) {
