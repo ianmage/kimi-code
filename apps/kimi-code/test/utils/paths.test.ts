@@ -9,6 +9,7 @@ import {
   getDataDir,
   getInputHistoryFile,
   getLogDir,
+  getRemoteKeyFile,
   getUpdateInstallStateFile,
   getUpdateStateFile,
 } from '#/utils/paths';
@@ -82,6 +83,17 @@ describe('getUpdateInstallStateFile', () => {
   it('respects KIMI_CODE_HOME', () => {
     process.env['KIMI_CODE_HOME'] = '/updates-home';
     expect(getUpdateInstallStateFile()).toBe(join('/updates-home', 'updates', 'install.json'));
+  });
+});
+
+describe('getRemoteKeyFile', () => {
+  it('returns <dataDir>/remote_key', () => {
+    expect(getRemoteKeyFile()).toBe(join(homedir(), '.kimi-code', 'remote_key'));
+  });
+
+  it('respects KIMI_CODE_HOME', () => {
+    process.env['KIMI_CODE_HOME'] = '/remote-key-home';
+    expect(getRemoteKeyFile()).toBe(join('/remote-key-home', 'remote_key'));
   });
 });
 
