@@ -21,6 +21,7 @@ import {
   matchSingleMediaPathTag,
 } from './mediaRef';
 import { ISessionMediaStore } from './sessionMediaStore';
+import { readDaemonMediaBytes } from './mediaBytes';
 import { IAgentMediaResolverService } from './mediaResolver';
 import { createVideoUploader } from './registerMediaTools';
 import {
@@ -135,7 +136,7 @@ export class AgentMediaResolverService implements IAgentMediaResolverService {
 
     let source: { readonly bytes: Buffer; readonly filename: string };
     try {
-      source = await this.readMedia(ref, signal);
+      source = await readDaemonMediaBytes(ref, this.files, this.mediaStore, signal);
     } catch {
       signal?.throwIfAborted();
       this.telemetry.track2('media_resolve_fallback', {
@@ -242,7 +243,7 @@ export class AgentMediaResolverService implements IAgentMediaResolverService {
 
     let source: { readonly bytes: Buffer; readonly filename: string };
     try {
-      source = await this.readMedia(ref, signal);
+      source = await readDaemonMediaBytes(ref, this.files, this.mediaStore, signal);
     } catch {
       signal?.throwIfAborted();
       return { part: videoTag(tagPath), memoize: true };
@@ -298,23 +299,6 @@ export class AgentMediaResolverService implements IAgentMediaResolverService {
     }
   }
 
-  private async readMedia(
-    ref: DaemonFileRef,
-    signal: AbortSignal | undefined,
-  ): Promise<{ readonly bytes: Buffer; readonly filename: string }> {
-    try {
-      signal?.throwIfAborted();
-      const file = await this.files.get(ref.fileId);
-      const bytes = await readStream(file.stream(), signal);
-      return { bytes, filename: file.meta.name };
-    } catch {
-      signal?.throwIfAborted();
-      const canonical = await this.mediaStore.read(ref.fileId);
-      if (canonical === undefined) throw new Error(`media ${ref.fileId} is unavailable`);
-      return { bytes: Buffer.from(canonical.data), filename: canonical.name };
-    }
-  }
-
   private async readCachedUpload(cacheKey: string): Promise<string | undefined> {
     const data = await this.blobs.get(CACHE_SCOPE, blobKey(cacheKey)).catch(() => undefined);
     if (data === undefined) return undefined;
@@ -358,25 +342,6 @@ function msFileIdFromUrl(url: string): string | undefined {
 
 function blobKey(cacheKey: string): string {
   return createHash('sha256').update(cacheKey).digest('hex');
-}
-
-async function readStream(stream: NodeJS.ReadableStream, signal?: AbortSignal): Promise<Buffer> {
-  const onAbort = (): void => {
-    const reason = signal?.reason instanceof Error ? signal.reason : undefined;
-    (stream as NodeJS.ReadableStream & { destroy?(error?: Error): void }).destroy?.(reason);
-  };
-  signal?.addEventListener('abort', onAbort, { once: true });
-  const chunks: Buffer[] = [];
-  try {
-    signal?.throwIfAborted();
-    for await (const chunk of stream) {
-      signal?.throwIfAborted();
-      chunks.push(Buffer.from(chunk as string | Uint8Array));
-    }
-    return Buffer.concat(chunks);
-  } finally {
-    signal?.removeEventListener('abort', onAbort);
-  }
 }
 
 registerScopedService(
