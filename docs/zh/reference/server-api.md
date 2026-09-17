@@ -302,6 +302,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `background` | object | 后台任务运行参数 |
 | `subagent` | object | subagent 配置 |
 | `secondary_model` | object | subagent 的次级模型池 |
+| `cap_route` | object | 图像能力路由（`[cap_route]`；`image_route` 指向视觉模型别名） |
 | `experimental` | object | 实验开关 id → 是否启用 |
 | `telemetry` | boolean | 是否启用匿名遥测 |
 | `raw` | object | 原始解析的 `config.toml` 内容，包含未建模字段 |
@@ -334,6 +335,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `background` | body | object | 后台任务运行参数 |
 | `subagent` | body | object | subagent 配置 |
 | `secondary_model` | body | object | subagent 的次级模型池 |
+| `cap_route` | body | object | 图像能力路由（`[cap_route]`；`image_route` 指向视觉模型别名） |
 | `experimental` | body | object | 实验开关 id → 是否启用 |
 | `telemetry` | body | boolean | 是否启用匿名遥测 |
 

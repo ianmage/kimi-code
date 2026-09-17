@@ -302,6 +302,7 @@ On success, `data` is the config object; its fields mirror the top-level domains
 | `background` | object | Background task runtime parameters |
 | `subagent` | object | Subagent configuration |
 | `secondary_model` | object | Secondary model pool for subagents |
+| `cap_route` | object | Image capability routing (`[cap_route]`; `image_route` names a vision model alias) |
 | `experimental` | object | Experimental flag id → enabled |
 | `telemetry` | boolean | Whether anonymous telemetry is enabled |
 | `raw` | object | Raw parsed `config.toml` content, unmodeled fields included |
@@ -334,6 +335,7 @@ The body is a partial config object — any subset of the response domains above
 | `background` | body | object | Background task runtime parameters |
 | `subagent` | body | object | Subagent configuration |
 | `secondary_model` | body | object | Secondary model pool for subagents |
+| `cap_route` | body | object | Image capability routing (`[cap_route]`; `image_route` names a vision model alias) |
 | `experimental` | body | object | Experimental flag id → enabled |
 | `telemetry` | body | boolean | Whether anonymous telemetry is enabled |
 

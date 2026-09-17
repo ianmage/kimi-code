@@ -295,6 +295,32 @@ Configuration errors fail loudly instead of falling back silently. Session creat
 - `force` is set without `default_model`, or combined with a `models` table.
 :::
 
+## `cap_route`
+
+When the main model cannot see images (its [`[models]`](#models) entry lacks the `image_in` capability), images in a request are normally degraded to a path placeholder. The `[cap_route]` section offers an alternative: `image_route` points at a vision model that describes each image in text, and the descriptions replace the images in-place, so the main model can still answer based on image content.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `image_route` | `string` | — | Vision model used to describe images: the alias of a [`[models]`](#models) entry with the `image_in` capability. Same reference semantics as `default_model` — the alias may dangle; a missing or non-vision alias is treated as unconfigured (with a warning log), and startup never fails |
+
+```toml
+[cap_route]
+image_route = "my-vision-model"
+```
+
+Routing engages only when all of the following hold:
+
+- the main model's capabilities lack `image_in`;
+- the request contains image parts (uploaded images and direct `image_url` parts alike);
+- the request is a turn — compaction and other internal operations are never routed;
+- `image_route` is configured and resolves to a vision model.
+
+The same image is described only once per vision model: descriptions are cached persistently and reused across turns and agents. When the bypass call fails, images fall back to the existing degradation (the path placeholder text), and the main request is still sent. Tokens spent on the vision model are counted in the session usage under the configured alias.
+
+::: warning Note
+Configuring `image_route` authorizes sending image content and a truncated summary of your question to that vision model's endpoint — including third-party or public cloud vision services. There is no runtime confirmation mechanism; the config file is the only control point.
+:::
+
 ## `thinking`
 
 `thinking` sets the global default behavior for Thinking mode.
