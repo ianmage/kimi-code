@@ -1,3 +1,5 @@
+import { Readable } from 'node:stream';
+
 import { createControlledPromise } from '@antfu/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -5,6 +7,9 @@ import { SyncDescriptor } from '#/_base/di/descriptors';
 import { DisposableStore, toDisposable } from '#/_base/di/lifecycle';
 import { TestInstantiationService } from '#/_base/di/test';
 import type { AgentContext } from '#/agent/agentContext/agentContext';
+import { CAP_ROUTE_SECTION } from '#/agent/capRoute/configSection';
+import { IAgentImageRouteService } from '#/agent/capRoute/imageRoute';
+import { AgentImageRouteService } from '#/agent/capRoute/imageRouteService';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage } from '#/agent/contextMemory/types';
 import {
@@ -35,6 +40,9 @@ import { AgentStateService } from '#/agent/state/agentStateService';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentToolSelectService } from '#/agent/toolSelect/toolSelect';
 import { IAgentMediaResolverService } from '#/agent/media/mediaResolver';
+import { ISessionMediaStore } from '#/agent/media/sessionMediaStore';
+import { IFileService, type GetResult } from '#/app/file/fileService';
+import { IBlobStore } from '#/persistence/interface/blobStore';
 import { ISessionUsageService } from '#/session/usage/sessionUsage';
 import { IConfigService } from '#/app/config/config';
 import type { Event2 } from '#/app/event/event2';
@@ -47,9 +55,10 @@ import {
   APIProviderRateLimitError,
   APIRequestTooLargeError,
   APIStatusError,
+  APITimeoutError,
 } from '#/llm-adapter/contract/errors';
 import { emptyUsage, type TokenUsage } from '#human/llm/usage';
-import { type Message } from '#/llm-adapter/contract/message';
+import { type Message, type ContentPart } from '#/llm-adapter/contract/message';
 import { isToolCall, type StreamedMessagePart, type ToolCall } from '#human/llm/message';
 import type { ThinkingEffort } from '#human/llm/thinking';
 import type { ModelCapability } from '#/llm-adapter/contract/capability';
@@ -60,6 +69,7 @@ import {
   type ModelRequestInput,
   type ModelRequester,
 } from '#/llm-adapter/model/model-requester';
+import type { AgentLLMRequestSource } from '#/agent/llmRequester/llmRequester';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import { ILogService } from '#/_base/log/log';
 import { Error2, ErrorCodes } from '#/errors';
@@ -191,6 +201,95 @@ function createRequester(
   };
 }
 
+function createVisionRequester(options: {
+  readonly events?: readonly ModelRequestEvent[];
+  readonly error?: Error;
+} = {}): { requester: ModelRequester; calls: ModelRequestInput[] } {
+  const calls: ModelRequestInput[] = [];
+  const model: Model = {
+    id: 'vision',
+    name: 'vision-stub',
+    aliases: [],
+    protocol: 'openai',
+    baseUrl: 'https://example.test',
+    headers: {},
+    capabilities: { ...capabilities, image_in: true },
+    maxContextSize: 1000,
+    alwaysThinking: false,
+    providerName: 'p',
+    providerType: 'kimi',
+  };
+  const requester: ModelRequester = {
+    model,
+    request: (input) => {
+      calls.push(input);
+      async function* respond(): AsyncGenerator<ModelRequestEvent> {
+        if (options.error !== undefined) throw options.error;
+        for (const event of options.events ?? []) yield event;
+      }
+      return respond();
+    },
+  };
+  return { requester, calls };
+}
+
+function routeBlobStore(): IBlobStore {
+  const data = new Map<string, Uint8Array>();
+  return {
+    _serviceBrand: undefined,
+    put: async (scope, key, bytes) => {
+      data.set(`${scope}/${key}`, bytes);
+    },
+    putStream: async () => {},
+    get: async (scope, key) => data.get(`${scope}/${key}`),
+    getStream: async function* () {},
+    has: async (scope, key) => data.has(`${scope}/${key}`),
+    delete: async (scope, key) => {
+      data.delete(`${scope}/${key}`);
+    },
+    list: async () => [],
+  };
+}
+
+function routeMediaStore(): ISessionMediaStore {
+  return {
+    _serviceBrand: undefined,
+    pathFor: () => undefined,
+    resolveDisplayPath: async () => undefined,
+    read: async () => undefined,
+    open: async () => undefined,
+    materialize: async () => undefined,
+  };
+}
+
+function routeFileService(
+  files: Map<string, { name: string; bytes: Buffer }>,
+  onGet: () => void,
+): IFileService {
+  return {
+    _serviceBrand: undefined,
+    save: async () => {
+      throw new Error('unused');
+    },
+    delete: async () => {},
+    get: async (fileId): Promise<GetResult> => {
+      onGet();
+      const file = files.get(fileId);
+      if (file === undefined) throw new Error(`file not found: ${fileId}`);
+      return {
+        meta: {
+          id: fileId,
+          name: file.name,
+          media_type: 'image/png',
+          size: file.bytes.length,
+          created_at: new Date(0).toISOString(),
+        },
+        stream: () => Readable.from([file.bytes]),
+      };
+    },
+  };
+}
+
 let disposables: DisposableStore;
 
 beforeEach(() => {
@@ -210,6 +309,12 @@ function createService(
     readonly mediaResolver?: Partial<IAgentMediaResolverService>;
     readonly contextMessages?: Message[];
     readonly env?: Record<string, string>;
+    readonly imageRoute?: {
+      readonly sections?: Record<string, unknown>;
+      readonly resolveAlias?: (alias: string) => ModelRequester;
+      readonly files?: Map<string, { name: string; bytes: Buffer }>;
+      readonly stub?: IAgentImageRouteService['route'];
+    };
   } = {},
 ) {
   const ix = disposables.add(new TestInstantiationService());
@@ -254,10 +359,11 @@ function createService(
     get: () => options.contextMessages ?? history,
   };
   const tools = { list: () => [] };
+  const route = options.imageRoute;
   const config: Partial<IConfigService> = {
-    get: (() => undefined) as IConfigService['get'],
+    get: ((domain: string) => route?.sections?.[domain]) as IConfigService['get'],
   };
-  const log = { info: () => undefined, warn: () => undefined };
+  const log = { info: () => undefined, warn: () => undefined, debug: () => undefined };
   const telemetryRecords: TelemetryRecord[] = [];
   const telemetry = recordingTelemetry(telemetryRecords);
   const toolSelect: Partial<IAgentToolSelectService> = {
@@ -272,6 +378,10 @@ function createService(
     publish: (event) => events.push(event),
     subscribe: () => toDisposable(() => {}),
   };
+  let routeByteReads = 0;
+  const routeFiles = routeFileService(route?.files ?? new Map(), () => {
+    routeByteReads += 1;
+  });
 
   ix.stub(IAgentContextMemoryService, context);
   ix.stub(IAgentToolSelectService, toolSelect);
@@ -297,12 +407,26 @@ function createService(
   ix.stub(IModelCatalog, {
     _serviceBrand: undefined,
     get: () => requester.model,
-    getRequester: () => requester,
+    getRequester: (alias: string) => {
+      if (route?.resolveAlias !== undefined && alias !== 'm') return route.resolveAlias(alias);
+      return requester;
+    },
     findByName: () => [],
   });
   ix.stub(IModelService, {
     get: () => undefined,
   });
+  if (route?.stub !== undefined) {
+    ix.stub(IAgentImageRouteService, {
+      _serviceBrand: undefined,
+      route: route.stub,
+    });
+  } else {
+    ix.stub(IBlobStore, routeBlobStore());
+    ix.stub(ISessionMediaStore, routeMediaStore());
+    ix.stub(IFileService, routeFiles);
+    ix.set(IAgentImageRouteService, new SyncDescriptor(AgentImageRouteService));
+  }
   const records: WireRecord[] = [];
   registerTestAgentWire(ix, 'wire/llm-requester', {
     log: recordingWireLog(records),
@@ -320,6 +444,7 @@ function createService(
     telemetry,
     telemetryRecords,
     measuredCalls,
+    routeByteReads: () => routeByteReads,
   };
 }
 
@@ -1235,5 +1360,176 @@ describe('turn machine stream state across service-internal retries', () => {
 
     expect(doneEntries).toHaveLength(1);
     expect(doneEntries[0]?.message.toolCalls.map((toolCall) => toolCall.id)).toEqual(['call_b']);
+  });
+});
+
+describe('AgentLLMRequesterService image route wiring', () => {
+  const ALIAS = 'vision';
+  const FILE_ID = 'file_route';
+  const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+  const DATA_A = 'data:image/png;base64,QUJD';
+  const DATA_B = 'data:image/png;base64,QkJD';
+  const TURN: AgentLLMRequestSource = { type: 'turn', turnId: 1, step: 1 };
+  const BODY_TOO_LARGE_413 = new APIRequestTooLargeError(413, 'Request Entity Too Large');
+
+  function imageMessage(...parts: ContentPart[]): Message {
+    return { role: 'user', content: [...parts], toolCalls: [] };
+  }
+
+  function daemonPart(fileId: string): ContentPart {
+    return { type: 'image_url', imageUrl: { url: `kimi-file://${fileId}` } };
+  }
+
+  function directPart(url: string): ContentPart {
+    return { type: 'image_url', imageUrl: { url } };
+  }
+
+  function textPartOf(text: string): ContentPart {
+    return { type: 'text', text };
+  }
+
+  it('passes the projector output reference through to the resolver when unconfigured', async () => {
+    const projected: Message[] = [
+      imageMessage(textPartOf('look'), daemonPart(FILE_ID), directPart(DATA_A)),
+    ];
+    const projector = {
+      project: () => projected,
+    };
+    const resolve = vi.fn(async (messages: readonly Message[]) => messages);
+    const { service } = createService(createRequester({ value: 0 }, null), projector, {
+      mediaResolver: { resolve },
+      imageRoute: { sections: { [CAP_ROUTE_SECTION]: {} } },
+    });
+
+    await service.request({ messages: projected, source: TURN });
+
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(resolve.mock.calls[0]![0]).toBe(projected);
+  });
+
+  it('reruns the route inside the retry closure while cache hits skip vision and byte reads', async () => {
+    const vision = createVisionRequester({
+      events: [{ type: 'part', part: { type: 'text', text: '<image-1>a red square</image-1>' } }],
+    });
+    const calls = { value: 0 };
+    const capturedInputs: ModelRequestInput[] = [];
+    const resolve = vi.fn(async (messages: readonly Message[]) => messages);
+    const { service, routeByteReads } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413, [], capturedInputs),
+      undefined,
+      {
+        mediaResolver: { resolve },
+        contextMessages: [imageMessage(daemonPart(FILE_ID))],
+        imageRoute: {
+          sections: { [CAP_ROUTE_SECTION]: { imageRoute: ALIAS } },
+          resolveAlias: () => vision.requester,
+          files: new Map([[FILE_ID, { name: 'pic.png', bytes: PNG_BYTES }]]),
+        },
+      },
+    );
+
+    await service.request({ source: TURN });
+
+    expect(calls.value).toBe(2);
+    expect(vision.calls).toHaveLength(1);
+    expect(routeByteReads()).toBe(1);
+    expect(capturedInputs[0]!.messages[0]!.content[0]!.type).toBe('text');
+    expect(capturedInputs[1]!.messages[0]!.content[0]!.type).toBe('text');
+  });
+
+  it('keeps the resolver input identical to the unwired shape when the route returns the original reference', async () => {
+    const projected: Message[] = [imageMessage(textPartOf('hi'), directPart(DATA_A))];
+    const resolve = vi.fn(async (messages: readonly Message[]) => messages);
+    const { service } = createService(createRequester({ value: 0 }, null), { project: () => projected }, {
+      mediaResolver: { resolve },
+      imageRoute: {
+        stub: async (messages) => messages,
+      },
+    });
+
+    await service.request({ messages: projected, source: TURN });
+
+    expect(resolve.mock.calls[0]![0]).toBe(projected);
+  });
+
+  it('replaces image parts with described text parts for a configured alias', async () => {
+    const vision = createVisionRequester({
+      events: [{ type: 'part', part: { type: 'text', text: '<image-1>a cat photo</image-1><image-2>a red square</image-2>' } }],
+    });
+    const capturedInputs: ModelRequestInput[] = [];
+    const { service } = createService(
+      createRequester({ value: 0 }, null, [], capturedInputs),
+      undefined,
+      {
+        contextMessages: [imageMessage(daemonPart(FILE_ID), directPart(DATA_A))],
+        imageRoute: {
+          sections: { [CAP_ROUTE_SECTION]: { imageRoute: ALIAS } },
+          resolveAlias: () => vision.requester,
+          files: new Map([[FILE_ID, { name: 'pic.png', bytes: PNG_BYTES }]]),
+        },
+      },
+    );
+
+    await service.request({ source: TURN });
+
+    expect(vision.calls).toHaveLength(1);
+    expect(capturedInputs[0]!.messages).toHaveLength(1);
+    const parts = capturedInputs[0]!.messages[0]!.content;
+    expect(parts).toHaveLength(2);
+    expect(parts[0]!.type).toBe('text');
+    expect((parts[0] as { type: 'text'; text: string }).text).toContain('a cat photo');
+    expect(parts[1]!.type).toBe('text');
+    expect((parts[1] as { type: 'text'; text: string }).text).toContain('a red square');
+  });
+
+  it('falls back to the unconfigured wire shape when the vision call fails non-penetratingly', async () => {
+    const vision = createVisionRequester({ error: new APITimeoutError('too slow') });
+    const capturedInputs: ModelRequestInput[] = [];
+    const daemon = daemonPart(FILE_ID);
+    const direct = directPart(DATA_A);
+    const { service } = createService(
+      createRequester({ value: 0 }, null, [], capturedInputs),
+      undefined,
+      {
+        contextMessages: [imageMessage(daemon, direct)],
+        imageRoute: {
+          sections: { [CAP_ROUTE_SECTION]: { imageRoute: ALIAS } },
+          resolveAlias: () => vision.requester,
+          files: new Map([[FILE_ID, { name: 'pic.png', bytes: PNG_BYTES }]]),
+        },
+      },
+    );
+
+    const result = await service.request({ source: TURN });
+
+    expect(result.message.content).toEqual([{ type: 'text', text: 'ok' }]);
+    expect(capturedInputs[0]!.messages[0]!.content).toEqual([daemon, direct]);
+  });
+
+  it('keeps the original part for an image whose slot is missing or blank', async () => {
+    const vision = createVisionRequester({
+      events: [{ type: 'part', part: { type: 'text', text: '<image-1>a red square</image-1><image-2>   </image-2>' } }],
+    });
+    const capturedInputs: ModelRequestInput[] = [];
+    const direct = directPart(DATA_B);
+    const { service } = createService(
+      createRequester({ value: 0 }, null, [], capturedInputs),
+      undefined,
+      {
+        contextMessages: [imageMessage(daemonPart(FILE_ID), direct)],
+        imageRoute: {
+          sections: { [CAP_ROUTE_SECTION]: { imageRoute: ALIAS } },
+          resolveAlias: () => vision.requester,
+          files: new Map([[FILE_ID, { name: 'pic.png', bytes: PNG_BYTES }]]),
+        },
+      },
+    );
+
+    await service.request({ source: TURN });
+
+    const parts = capturedInputs[0]!.messages[0]!.content;
+    expect(parts[0]!.type).toBe('text');
+    expect((parts[0] as { type: 'text'; text: string }).text).toContain('a red square');
+    expect(parts[1]).toBe(direct);
   });
 });

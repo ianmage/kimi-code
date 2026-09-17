@@ -454,6 +454,22 @@ export interface ImageCropEvent {
   duration_ms: number;
 }
 
+export interface ImageRouteOutcomeEvent {
+  vision_model: string;
+  outcome:
+    | 'gate_bypassed'
+    | 'all_cached'
+    | 'derive_failed'
+    | 'call_failed'
+    | 'partial_described'
+    | 'all_described';
+  image_count: number;
+  cache_hit_count: number;
+  described_count: number;
+  derive_failed_count: number;
+  duration_ms: number;
+}
+
 export interface VideoUploadEvent {
   model?: string;
   provider_type?: string;
@@ -1099,6 +1115,19 @@ export const telemetryEventDefinitions = {
       region_area_ratio: 'Cropped region area relative to the original',
       final_bytes: 'Output size in bytes',
       duration_ms: 'Crop wall-clock time in milliseconds',
+    },
+  }),
+  image_route_outcome: defineAgentTelemetryEvent<ImageRouteOutcomeEvent>({
+    owner: 'kimi-code',
+    comment: 'An image capability route run reaches a terminal outcome.',
+    properties: {
+      vision_model: 'Configured vision model alias the route targeted',
+      outcome: 'Route outcome',
+      image_count: 'Number of distinct image identities in the hit set or the call set',
+      cache_hit_count: 'Number of distinct image identities served from cache',
+      described_count: 'Number of distinct image identities newly described in this run',
+      derive_failed_count: 'Number of distinct image identities whose derivation failed',
+      duration_ms: 'Route run wall-clock time in milliseconds',
     },
   }),
   video_upload: defineAgentTelemetryEvent<VideoUploadEvent>({

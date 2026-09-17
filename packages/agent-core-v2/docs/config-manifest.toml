@@ -8,9 +8,10 @@
 # commented "# field: type" lines describe the remaining schema fields.
 # Values resolve as: default -> config.toml -> env overlay -> memory.
 
-# Index (28 sections · 2 overlay(s))
+# Index (29 sections · 2 overlay(s))
 #   background               src/agent/task/configSection.ts
 #   builtinProductSkills     src/features/skill/catalog/configSection.ts
+#   capRoute                 src/agent/capRoute/configSection.ts
 #   cron                     src/features/cron/configSection.ts
 #   database                 src/persistence/configSection.ts
 #   defaultPermissionMode    src/agent/permissionMode/configSection.ts
@@ -74,6 +75,15 @@
 # ##########################################################################
 
 builtin_product_skills = true
+
+# ##########################################################################
+# capRoute (config.toml: cap_route)
+#   owner: src/agent/capRoute/configSection.ts
+#   scope: core
+# ##########################################################################
+
+[cap_route]
+# image_route: string
 
 # ##########################################################################
 # cron

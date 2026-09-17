@@ -14,6 +14,7 @@ import { IAgentStateService } from '#/agent/state/agentState';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentToolSelectService } from '#/agent/toolSelect/toolSelect';
 import { IAgentMediaResolverService } from '#/agent/media/mediaResolver';
+import { IAgentImageRouteService } from '#/agent/capRoute/imageRoute';
 import { ISessionUsageService } from '#/session/usage/sessionUsage';
 import { IConfigService } from '#/app/config/config';
 import {
@@ -161,6 +162,7 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     @IAgentToolRegistryService private readonly tools: IAgentToolRegistryService,
     @IAgentToolSelectService private readonly toolSelect: IAgentToolSelectService,
     @IAgentMediaResolverService private readonly mediaResolver: IAgentMediaResolverService,
+    @IAgentImageRouteService private readonly imageRoute: IAgentImageRouteService,
     @IAgentProfileService private readonly profile: IAgentProfileService,
     @ISessionUsageService private readonly usage: ISessionUsageService,
     @IConfigService private readonly config: IConfigService,
@@ -363,7 +365,12 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
         systemPrompt: request.systemPrompt,
         tools: request.tools,
         messages: await this.mediaResolver.resolve(
-          this.projector.project(shaped, policy),
+          await this.imageRoute.route(
+            this.projector.project(shaped, policy),
+            request.requester,
+            request.source,
+            signal,
+          ),
           request.requester,
           signal,
         ),
