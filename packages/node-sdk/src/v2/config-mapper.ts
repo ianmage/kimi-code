@@ -20,7 +20,7 @@ import type { ConfigDiagnostics, KimiConfig } from '#/types';
  * implementation detail with no v2 counterpart). Each entry is both the v1
  * field name and the v2 config domain name.
  */
-const KIMI_CONFIG_DOMAINS = [
+export const KIMI_CONFIG_DOMAINS = [
   'providers',
   'defaultProvider',
   'defaultModel',
@@ -41,6 +41,7 @@ const KIMI_CONFIG_DOMAINS = [
   'secondaryModel',
   'mcp',
   'image',
+  'capRoute',
   'modelCatalog',
   'experimental',
   'telemetry',

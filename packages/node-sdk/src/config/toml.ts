@@ -14,6 +14,7 @@ import {
   formatConfigValidationError,
   getDefaultConfig,
   type BackgroundConfig,
+  type CapRouteConfig,
   type ExperimentalConfig,
   type HookDefConfig,
   type ImageConfig,
@@ -277,6 +278,8 @@ export function transformTomlData(data: Record<string, unknown>): Record<string,
       result[targetKey] = transformPlainObject(value);
     } else if (targetKey === 'image' && isPlainObject(value)) {
       result[targetKey] = transformPlainObject(value);
+    } else if (targetKey === 'capRoute' && isPlainObject(value)) {
+      result[targetKey] = transformPlainObject(value);
     } else if (targetKey === 'experimental' && isPlainObject(value)) {
       result[targetKey] = cloneRecord(value);
     } else if (targetKey === 'subagent' && isPlainObject(value)) {
@@ -456,6 +459,7 @@ export function configToTomlData(config: KimiConfig): Record<string, unknown> {
   setSection(out, 'secondary_model', config.secondaryModel, secondaryModelToToml);
   setSection(out, 'mcp', config.mcp, mcpToToml);
   setSection(out, 'image', config.image, imageToToml);
+  setSection(out, 'cap_route', config.capRoute, capRouteToToml);
   setSection(out, 'experimental', config.experimental, experimentalToToml);
   setSection(out, 'permission', config.permission, permissionToToml);
   setHooks(out, config.hooks);
@@ -671,6 +675,14 @@ function mcpToToml(mcp: McpConfig, rawMcp: unknown): Record<string, unknown> {
 function imageToToml(image: ImageConfig, rawImage: unknown): Record<string, unknown> {
   const out = cloneRecord(rawImage);
   for (const [key, value] of Object.entries(image)) {
+    setDefined(out, camelToSnake(key), value);
+  }
+  return out;
+}
+
+function capRouteToToml(capRoute: CapRouteConfig, rawCapRoute: unknown): Record<string, unknown> {
+  const out = cloneRecord(rawCapRoute);
+  for (const [key, value] of Object.entries(capRoute)) {
     setDefined(out, camelToSnake(key), value);
   }
   return out;

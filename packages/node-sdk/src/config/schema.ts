@@ -179,6 +179,12 @@ export const ImageConfigSchema = z.object({
 
 export type ImageConfig = z.infer<typeof ImageConfigSchema>;
 
+export const CapRouteConfigSchema = z.object({
+  imageRoute: z.string().min(1).optional(),
+});
+
+export type CapRouteConfig = z.infer<typeof CapRouteConfigSchema>;
+
 export const ModelCatalogConfigSchema = z.object({
   refreshIntervalMs: z.number().int().min(0).optional(),
   refreshOnStart: z.boolean().optional(),
@@ -300,6 +306,7 @@ export const KimiConfigSchema = z.object({
   secondaryModel: SecondaryModelConfigSchema.optional(),
   mcp: McpConfigSchema.optional(),
   image: ImageConfigSchema.optional(),
+  capRoute: CapRouteConfigSchema.optional(),
   modelCatalog: ModelCatalogConfigSchema.optional(),
   experimental: ExperimentalConfigSchema.optional(),
   telemetry: z.boolean().optional(),
@@ -318,6 +325,7 @@ const SubagentConfigPatchSchema = SubagentConfigSchema.partial();
 const SecondaryModelConfigPatchSchema = SecondaryModelConfigSchema.partial();
 const McpConfigPatchSchema = McpConfigSchema.partial();
 const ImageConfigPatchSchema = ImageConfigSchema.partial();
+const CapRouteConfigPatchSchema = CapRouteConfigSchema.partial();
 const ModelCatalogConfigPatchSchema = ModelCatalogConfigSchema.partial();
 const ExperimentalConfigPatchSchema = ExperimentalConfigSchema;
 const MoonshotServiceConfigPatchSchema = MoonshotServiceConfigSchema.partial();
@@ -349,6 +357,7 @@ export const KimiConfigPatchSchema = z
     secondaryModel: SecondaryModelConfigPatchSchema.optional(),
     mcp: McpConfigPatchSchema.optional(),
     image: ImageConfigPatchSchema.optional(),
+    capRoute: CapRouteConfigPatchSchema.optional(),
     modelCatalog: ModelCatalogConfigPatchSchema.optional(),
     experimental: ExperimentalConfigPatchSchema.optional(),
     telemetry: z.boolean().optional(),
