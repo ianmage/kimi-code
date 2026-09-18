@@ -530,7 +530,7 @@ On success, `data` is `{ providers, models_imported }` — an array of provider 
 
 Browses the models.dev directory, proxied by the server with a 10-minute in-memory cache and a built-in snapshot fallback. Items keep the upstream directory order. Entries the server cannot import carry `rejected: true` with a machine-readable `reject_reason`; entries with `needs_base_url: true` require a base URL at import time.
 
-On success, `data.items` is an array of `{ id, name, wire_type, guessed, needs_base_url, rejected, reject_reason, env_key, models }`: `wire_type` is the resolved protocol (nullable, same enum as a provider `type`), `guessed` marks a heuristic resolution, `env_key` is the upstream's conventional API-key environment variable (nullable), and `models` is an array of `{ id, name?, max_context_size, capabilities?, reasoning }`.
+On success, `data.items` is an array of `{ id, name, wire_type, base_url, guessed, needs_base_url, rejected, reject_reason, env_key, models }`: `wire_type` is the resolved protocol (nullable, same enum as a provider `type`), `base_url` is the resolved endpoint (nullable; `null` for entries that need a base URL or were rejected), `guessed` marks a heuristic resolution, `env_key` is the upstream's conventional API-key environment variable (nullable), and `models` is an array of `{ id, name?, max_context_size, capabilities?, reasoning }`.
 
 - `50004`: the directory is unavailable (both the live fetch and the built-in snapshot failed)
 
@@ -1369,7 +1369,7 @@ On success, `data` is `{ restarting: true }`.
 
 ### Capabilities and plugins
 
-Capabilities are built-in features with layered readiness — detection steps plus a background install; the current build registers `kimi-cu` (Kimi Computer Use) and `kimi-webbridge` (Kimi WebBridge). Plugins are installed packages of skills, MCP servers, hooks, and commands. These endpoints report capability status and drive capability installs, and manage the plugin lifecycle from marketplace listing to removal.
+Capabilities are built-in features with layered readiness — detection steps plus a background install; the current build registers `kimi-cu` (Kimi Computer Use) and `kimi-webbridge` (Kimi Browser Extension). Plugins are installed packages of skills, MCP servers, hooks, and commands. These endpoints report capability status and drive capability installs, and manage the plugin lifecycle from marketplace listing to removal.
 
 | Method and path | Description |
 | --- | --- |

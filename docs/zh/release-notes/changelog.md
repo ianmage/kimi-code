@@ -6,6 +6,40 @@ outline: 2
 
 本页记录 Kimi Code CLI 每个版本的变更内容。
 
+## 2.0.0（2026-09-17）
+
+### 新功能
+
+- 新增 `/desktop` 斜杠命令（别名 `/install-desktop`）与 `kimi install-app` 子命令。
+- Mermaid 代码块现在会在终端中渲染为图表；可在 `/settings` → Mermaid diagrams 中关闭，或在 tui.toml 的 `[markdown]` 配置段中设置 `mermaid = "off"`。
+
+### 优化
+
+- 内置浏览器插件更名为 "Kimi Browser Extension"，插件面板、插件市场与文档中的名称同步更新。
+
+### 修复
+
+- 修复了一些已知问题，并做了若干细节优化。更详细的变更记录见 [GitHub](https://github.com/MoonshotAI/kimi-code/blob/main/apps/kimi-code/CHANGELOG.md)。
+
+## 0.43.1（2026-09-15）
+
+### 新功能
+
+- Linux X11 环境新增原生剪贴板支持，从终端界面复制内容不再依赖终端的 OSC 52 能力。
+
+### 优化
+
+- 减少同时运行大量 subagent 的会话中的事件循环卡顿与 GC 开销。
+
+### 修复
+
+- 修复在 subagent 运行时按 `Ctrl-C` 会直接退出整个 CLI 的问题，现在只会中断正在运行的 subagent。
+- 修复大型 agent swarm 运行时渲染逐轮变慢的问题。
+- 修复 subagent 运行结束后内存未释放的问题。
+- 修复 tower 模式将新生成的 agent 误识别为历史会话 roster 条目的问题。
+- 修复全局搜索在索引更新前仍会返回已删除会话的问题。
+- 修复折行 markdown 表格中的链接颜色错误，以及 `@` 文件补全的排序问题。
+
 ## 0.43.0（2026-09-14）
 
 ### 新功能
