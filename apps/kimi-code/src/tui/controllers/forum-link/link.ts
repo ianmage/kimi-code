@@ -132,7 +132,7 @@ type StreamOutcome = 'lost' | 'superseded';
 export class Link {
   private currentState: LinkState = 'detached';
   private credential: LinkCredential | undefined;
-  private registerDescriptor: Descriptor | undefined;
+  private registerSource: (() => Descriptor) | undefined;
   private currentThreadId: string | undefined;
   private attempt = 0;
   private generation = 0;
@@ -174,10 +174,10 @@ export class Link {
    * resolves it, so a caller awaiting "published" is served by both the
    * direct connect and the reconnect path.
    */
-  async connect(credential: LinkCredential, register: Descriptor): Promise<void> {
+  async connect(credential: LinkCredential, registerSource: () => Descriptor): Promise<void> {
     if (this.currentState !== 'detached') throw new Error('link is not detached');
     this.credential = credential;
-    this.registerDescriptor = register;
+    this.registerSource = registerSource;
     this.generation += 1;
     const generation = this.generation;
     return new Promise<void>((resolve, reject) => {
@@ -217,9 +217,9 @@ export class Link {
       if (this.generation !== generation) return;
       this.setState('connecting');
       const credential = this.credential;
-      const register = this.registerDescriptor;
-      if (credential === undefined || register === undefined) return;
-      const cycle = await this.runCycle(credential, register, generation);
+      const registerSource = this.registerSource;
+      if (credential === undefined || registerSource === undefined) return;
+      const cycle = await this.runCycle(credential, registerSource(), generation);
       if (this.generation !== generation) return;
       if (cycle.kind === 'superseded') return;
       if (cycle.kind === 'fatal') {
@@ -442,7 +442,7 @@ export class Link {
     this.backoffResolve?.();
     this.backoffResolve = undefined;
     this.credential = undefined;
-    this.registerDescriptor = undefined;
+    this.registerSource = undefined;
     this.currentThreadId = undefined;
     this.attempt = 0;
     this.setState('detached');

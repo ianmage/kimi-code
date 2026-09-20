@@ -263,12 +263,11 @@ describe('KimiTUI — ensureForumLink / buildForumDescriptor wiring', () => {
       machineName: string;
       projectName: string;
       title: string;
-      status: string;
     };
     expect(result.sessionId).toBe('ses-42');
     expect(result.projectName).toBe('forum-demo');
     expect(result.title).toBe('我的调试会话');
-    expect(result.status).toBe('idle');
+    expect(result).not.toHaveProperty('status');
     expect(typeof result.machineName).toBe('string');
     expect(result.machineName.length).toBeGreaterThan(0);
   });

@@ -71,13 +71,12 @@ function questionPayload(id: string): QuestionPanelData {
   };
 }
 
-function makeDescriptor(sessionId: string): Descriptor {
+function makeDescriptor(sessionId: string): Omit<Descriptor, 'status'> {
   return {
     sessionId,
     machineName: 'machine-1',
     projectName: 'forum-link',
     title: 'test title',
-    status: 'idle',
   };
 }
 
@@ -403,7 +402,10 @@ describe('Controller 编排 — 会话切换原地更新（M-2 A1/A2）', () => 
       type: 'entry',
       entry: { kind: 'card-settled', cardId: 'c2', outcome: 'cancelled' },
     });
-    expect(fixture.frames).toContainEqual({ type: 'register', descriptor: makeDescriptor('s2') });
+    expect(fixture.frames).toContainEqual({
+      type: 'register',
+      descriptor: { ...makeDescriptor('s2'), status: 'idle' },
+    });
     expect(fixture.controller.openCards).toEqual([]);
     expect(fixture.controller.session).toBe(next.session);
   });
@@ -436,7 +438,10 @@ describe('Controller 编排 — 会话切换原地更新（M-2 A1/A2）', () => 
       (frame) => frame.type === 'entry' && frame.entry.kind === 'card-settled',
     );
     expect(settled).toEqual([]);
-    expect(fixture.frames).toContainEqual({ type: 'register', descriptor: makeDescriptor('s2') });
+    expect(fixture.frames).toContainEqual({
+      type: 'register',
+      descriptor: { ...makeDescriptor('s2'), status: 'idle' },
+    });
   });
 
   it('已发布切换重挂 Projector：旧会话去订阅、新会话事件被投影', () => {
@@ -488,11 +493,17 @@ interface FakeLinkFixture {
 }
 
 class FakeLink {
-  readonly connect = vi.fn(async () => {});
+  readonly connect = vi.fn(async (_credential: unknown, _registerSource: () => Descriptor) => {});
   readonly send = vi.fn();
   readonly close = vi.fn();
   onStateChange: ((state: Link['state']) => void) | undefined;
   onAction: ((frame: ActionFrame) => void) | undefined;
+
+  registerDescriptor(): Descriptor {
+    const source = this.connect.mock.calls[0]?.[1];
+    if (source === undefined) throw new Error('connect was not called');
+    return source();
+  }
 }
 
 function makeStartFixture(options: { isCompacting?: boolean } = {}): FakeLinkFixture {
@@ -539,15 +550,16 @@ function makeStartFixture(options: { isCompacting?: boolean } = {}): FakeLinkFix
 }
 
 describe('Controller — start() 发布编排（M-1）', () => {
-  it('start 接线 Link：connect 收到 credential 与 descriptor，projector 挂当前会话', async () => {
+  it('start 接线 Link：connect 收到 credential 与 descriptor 源函数，projector 挂当前会话', async () => {
     const fixture = makeStartFixture();
     await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: 'secret' });
 
     expect(fixture.fakeLink.connect).toHaveBeenCalledTimes(1);
     expect(fixture.fakeLink.connect).toHaveBeenCalledWith(
       { url: 'http://127.0.0.1:8787', password: 'secret' },
-      makeDescriptor('s1'),
+      expect.any(Function),
     );
+    expect(fixture.fakeLink.registerDescriptor()).toEqual({ ...makeDescriptor('s1'), status: 'idle' });
     expect(fixture.buildDescriptor).toHaveBeenCalledWith(fixture.session);
     expect(fixture.hasListener()).toBe(true);
   });
@@ -571,7 +583,7 @@ describe('Controller — start() 发布编排（M-1）', () => {
     fixture.emit({ type: 'assistant.delta', turnId: 1, delta: '发布后内容', agentId: 'main', sessionId: 's1' });
     fixture.emit({ type: 'turn.ended', turnId: 1, reason: 'completed', agentId: 'main', sessionId: 's1' });
 
-    expect(fixture.fakeLink.send).toHaveBeenCalledTimes(3);
+    expect(fixture.fakeLink.send).toHaveBeenCalledTimes(5);
     const sentText = fixture.fakeLink.send.mock.calls
       .map((call) => call[0] as UplinkFrame)
       .find((frame) => frame.type === 'entry' && frame.entry.kind === 'message');
@@ -648,5 +660,147 @@ describe('Controller — start() 发布编排（M-1）', () => {
 
     expect(fixture.controller.state).toBe('detached');
     expect(fixture.statuses).toEqual(['Forum Link: connecting...', 'Forum Link: unpublished']);
+  });
+});
+
+describe('Controller — descriptor 组合与状态迁移（M1 / D3）', () => {
+  function turnStartedEvent(sessionId = 's1'): Event {
+    return { type: 'turn.started', turnId: 1, origin: { kind: 'user' }, agentId: 'main', sessionId };
+  }
+
+  function turnEndedEvent(sessionId = 's1'): Event {
+    return { type: 'turn.ended', turnId: 1, reason: 'completed', agentId: 'main', sessionId };
+  }
+
+  it('M1 帧序：published 后状态迁移经 observers 观察 descriptor 帧，身份逐字段对齐 buildDescriptor', async () => {
+    const fixture = makeStartFixture();
+    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
+    fixture.fakeLink.onStateChange?.('published');
+
+    fixture.emit(turnStartedEvent());
+    let descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
+    expect(descriptorFrames).toEqual([
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
+    ]);
+
+    fixture.controller.onCardOpened('question', 'up-1', questionPayload('up-1'));
+    descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
+    expect(descriptorFrames).toEqual([
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'waiting-question' } },
+    ]);
+
+    fixture.controller.onCardClosed('question', 'up-1');
+    descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
+    expect(descriptorFrames).toEqual([
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'waiting-question' } },
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
+    ]);
+
+    fixture.emit(turnEndedEvent());
+    descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
+    expect(descriptorFrames).toEqual([
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'waiting-question' } },
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'idle' } },
+    ]);
+  });
+
+  it('发布中途 running：start 时 projector 已 running，connect 源函数求值为 running', async () => {
+    const fixture = makeStartFixture();
+    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
+    fixture.fakeLink.onStateChange?.('published');
+    fixture.emit(turnStartedEvent());
+
+    const source = fixture.fakeLink.connect.mock.calls[0]?.[1];
+    expect(source).toBeTypeOf('function');
+    expect(source?.()).toEqual({ ...makeDescriptor('s1'), status: 'running' });
+  });
+
+  it('重连注册源活读当前会话：backoff 中切换 s2 后再求值，身份为新会话', async () => {
+    const fixture = makeStartFixture();
+    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
+    fixture.fakeLink.onStateChange?.('backoff');
+    fixture.controller.onSessionChanged(makeSession('s2').session);
+
+    expect(fixture.fakeLink.registerDescriptor()).toEqual({ ...makeDescriptor('s2'), status: 'idle' });
+  });
+
+  it('重连注册源活读当前会话：切换 s2 并迁移后求值，status 为 running', async () => {
+    const fixture = makeStartFixture();
+    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
+    fixture.fakeLink.onStateChange?.('published');
+
+    const next = makeSession('s2');
+    fixture.controller.onSessionChanged(next.session);
+    next.emit(turnStartedEvent('s2'));
+
+    expect(fixture.fakeLink.registerDescriptor()).toEqual({ ...makeDescriptor('s2'), status: 'running' });
+  });
+
+  it('门控丢弃：connecting/backoff 状态下迁移不进 link.send，observers 仍收到 descriptor 帧', async () => {
+    const fixture = makeStartFixture();
+    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
+    fixture.fakeLink.onStateChange?.('connecting');
+
+    fixture.emit(turnStartedEvent());
+
+    expect(fixture.fakeLink.send).not.toHaveBeenCalled();
+    expect(fixture.frames).toContainEqual({
+      type: 'descriptor',
+      descriptor: { ...makeDescriptor('s1'), status: 'running' },
+    });
+
+    fixture.fakeLink.onStateChange?.('backoff');
+    fixture.emit(turnEndedEvent());
+
+    expect(fixture.fakeLink.send).not.toHaveBeenCalled();
+    expect(fixture.frames).toContainEqual({
+      type: 'descriptor',
+      descriptor: { ...makeDescriptor('s1'), status: 'idle' },
+    });
+  });
+
+  it('会话切换组合：register 帧身份为新会话、status idle，旧会话 open 卡以 cancelled 结算在前', () => {
+    const fixture = makeStartFixture();
+    fixture.controller.setLinkState('published');
+    fixture.controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
+
+    const next = makeSession('s2');
+    fixture.controller.onSessionChanged(next.session);
+
+    const registerFrames = fixture.frames.filter((frame) => frame.type === 'register');
+    expect(registerFrames).toEqual([
+      { type: 'register', descriptor: { ...makeDescriptor('s2'), status: 'idle' } },
+    ]);
+    const settledIndex = fixture.frames.findIndex(
+      (frame) => frame.type === 'entry' && frame.entry.kind === 'card-settled',
+    );
+    expect(settledIndex).toBeGreaterThanOrEqual(0);
+    expect(fixture.frames[settledIndex]).toEqual({
+      type: 'entry',
+      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'cancelled' },
+    });
+    for (let i = 0; i < settledIndex; i += 1) {
+      expect(fixture.frames[i]?.type).not.toBe('register');
+    }
+  });
+
+  it('切换后迁移：descriptor 帧身份为新会话、status 为迁移后值，无旧会话残留', async () => {
+    const fixture = makeStartFixture();
+    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
+    fixture.fakeLink.onStateChange?.('published');
+
+    const next = makeSession('s2');
+    fixture.controller.onSessionChanged(next.session);
+
+    next.emit(turnStartedEvent('s2'));
+
+    const descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
+    expect(descriptorFrames).toEqual([
+      { type: 'descriptor', descriptor: { ...makeDescriptor('s2'), status: 'running' } },
+    ]);
   });
 });

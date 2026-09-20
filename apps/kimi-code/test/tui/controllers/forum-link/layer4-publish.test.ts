@@ -6,13 +6,17 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { Descriptor, Entry, UplinkFrame } from '@moonshot-ai/forum-link';
+import type { ActionFrame, Descriptor, Entry, UplinkFrame } from '@moonshot-ai/forum-link';
 import type { Event, Session, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
 
 import type { SlashCommandHost } from '#/tui/commands/dispatch';
 import { handleForumCommand } from '#/tui/commands/forum';
-import { ForumLinkController } from '#/tui/controllers/forum-link';
+import { ForumLinkController, wrapUiHooksForForumLink } from '#/tui/controllers/forum-link';
 import { Link } from '#/tui/controllers/forum-link/link';
+import { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
+import type { ReverseRPCUIHooks } from '#/tui/reverse-rpc/index';
+import { QuestionController } from '#/tui/reverse-rpc/question/controller';
+import type { ApprovalPanelData, QuestionPanelData } from '#/tui/reverse-rpc/types';
 import type { AppState } from '#/tui/types';
 
 const HUB_MJS = fileURLToPath(new URL('../../../../../../packages/forum-link/dist/hub.mjs', import.meta.url));
@@ -141,6 +145,16 @@ async function getSnapshot(baseUrl: string, threadId: string): Promise<SnapshotJ
   return getJson<SnapshotJson>(baseUrl, `/api/threads/${threadId}/snapshot`);
 }
 
+async function postAction(baseUrl: string, frame: ActionFrame): Promise<void> {
+  const res = await fetch(`${baseUrl}/api/action`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${PASSWORD}`, 'content-type': 'application/json' },
+    body: JSON.stringify(frame),
+  });
+  expect(res.status).toBe(200);
+  await res.json();
+}
+
 async function until(predicate: () => Promise<boolean> | boolean, timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -205,7 +219,7 @@ function turnEnded(reason: 'completed' | 'cancelled' = 'completed'): Event {
   return { type: 'turn.ended', turnId: 1, reason, agentId: 'main', sessionId: SESSION_ID };
 }
 
-function approvalPayload(id: string) {
+function approvalPayload(id: string): ApprovalPanelData {
   return {
     id,
     tool_call_id: `tc-${id}`,
@@ -217,10 +231,22 @@ function approvalPayload(id: string) {
   };
 }
 
+function questionPayload(id: string): QuestionPanelData {
+  return {
+    id,
+    tool_call_id: `tc-${id}`,
+    questions: [
+      { question: '选择哪个方案？', multi_select: false, options: [{ label: '选项A' }, { label: '选项B' }] },
+    ],
+  };
+}
+
 type ForumLinkState = ForumLinkController['state'];
 
 interface ControllerFixture {
   controller: ForumLinkController;
+  approvalController: ApprovalController;
+  questionController: QuestionController;
   frames: UplinkFrame[];
   statuses: string[];
   states: ForumLinkState[];
@@ -232,6 +258,9 @@ function makeController(): ControllerFixture {
   const statuses: string[] = [];
   const states: ForumLinkState[] = [];
   const sessionFixture = makeSession();
+  const approvalController = new ApprovalController();
+  const questionController = new QuestionController();
+  const sendNormalUserInput = vi.fn(async () => {});
   const controller = new ForumLinkController({
     onProjectorFrame: (frame) => {
       frames.push(frame);
@@ -240,13 +269,16 @@ function makeController(): ControllerFixture {
       statuses.push(message);
     },
     getAppState: () => ({ isCompacting: false }) as AppState,
-    buildDescriptor: (session: Session): Descriptor => ({
+    buildDescriptor: (session: Session): Omit<Descriptor, 'status'> => ({
       sessionId: session.id,
       machineName: 'layer4-machine',
       projectName: 'layer4-project',
       title: 'layer4 title',
-      status: 'idle',
     }),
+    approvalController,
+    questionController,
+    sendNormalUserInput,
+    createNewSession: vi.fn(async () => {}),
     createLink: (handlers) =>
       new Link({
         ...handlers,
@@ -257,8 +289,23 @@ function makeController(): ControllerFixture {
         },
       }),
   });
+  const original: ReverseRPCUIHooks = {
+    showApprovalPanel: vi.fn(),
+    hideApprovalPanel: vi.fn(),
+    showQuestionDialog: vi.fn(),
+    hideQuestionDialog: vi.fn(),
+  };
+  const wrapped = wrapUiHooksForForumLink(original, controller);
+  approvalController.setUIHooks({
+    showPanel: wrapped.showApprovalPanel,
+    hidePanel: wrapped.hideApprovalPanel,
+  });
+  questionController.setUIHooks({
+    showPanel: wrapped.showQuestionDialog,
+    hidePanel: wrapped.hideQuestionDialog,
+  });
   controller.onSessionChanged(sessionFixture.session);
-  return { controller, frames, statuses, states, session: sessionFixture };
+  return { controller, approvalController, questionController, frames, statuses, states, session: sessionFixture };
 }
 
 describe('Layer4 真发布 — 发布出现与 toggle 消失（CP5 / M-1 IV1 A1 A2）', () => {
@@ -400,6 +447,187 @@ function makeCommandHost(): SlashCommandHost & {
   };
 }
 
+describe('Layer4 真发布 — Web 卡片可操作（CP5 / A1 A2）', () => {
+  it.skipIf(!HUB_BUILT)(
+    'A1 问题卡全链路：远程作答经 hub SSE 送达，show promise resolve，card-settled answered 入快照',
+    { timeout: 30000 },
+    async () => {
+      const hub = await startHub();
+      const fixture = makeController();
+      try {
+        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
+        fixture.session.emit(turnStarted());
+        const shown = fixture.questionController.show(questionPayload('q-1'));
+        expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'question', upstreamId: 'q-1' }]);
+
+        await until(async () => {
+          const threads = await getThreads(hub.baseUrl);
+          return threads[0] !== undefined && threads[0].descriptor.status === 'waiting-question';
+        });
+        const threadId = (await getThreads(hub.baseUrl))[0]!.id;
+
+        await postAction(hub.baseUrl, { type: 'answer-question', target: threadId, cardId: 'c1', answer: '选项A' });
+
+        await vi.waitFor(async () => {
+          await expect(shown).resolves.toEqual({ answers: ['选项A'] });
+        });
+        expect(fixture.controller.openCards).toEqual([]);
+
+        let snapshot = await getSnapshot(hub.baseUrl, threadId);
+        await until(async () => {
+          snapshot = await getSnapshot(hub.baseUrl, threadId);
+          return snapshot.entries.some(
+            (snapshotEntry) =>
+              snapshotEntry.entry.kind === 'card-settled' &&
+              snapshotEntry.entry.cardId === 'c1' &&
+              snapshotEntry.entry.outcome === 'answered',
+          );
+        });
+      } finally {
+        await fixture.controller.stop().catch(() => {});
+        await hub.kill();
+      }
+    },
+  );
+
+  it.skipIf(!HUB_BUILT)(
+    'A2 审批卡全链路：远程批准经 hub SSE 送达，show promise resolve，card-settled approved 入快照',
+    { timeout: 30000 },
+    async () => {
+      const hub = await startHub();
+      const fixture = makeController();
+      try {
+        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
+        fixture.session.emit(turnStarted());
+        const shown = fixture.approvalController.show(approvalPayload('a-1'));
+        expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'approval', upstreamId: 'a-1' }]);
+
+        await until(async () => {
+          const threads = await getThreads(hub.baseUrl);
+          return threads[0] !== undefined && threads[0].descriptor.status === 'running';
+        });
+        const threadId = (await getThreads(hub.baseUrl))[0]!.id;
+
+        await postAction(hub.baseUrl, { type: 'approve', target: threadId, cardId: 'c1' });
+
+        await vi.waitFor(async () => {
+          await expect(shown).resolves.toEqual({ decision: 'approved' });
+        });
+        expect(fixture.controller.openCards).toEqual([]);
+
+        let snapshot = await getSnapshot(hub.baseUrl, threadId);
+        await until(async () => {
+          snapshot = await getSnapshot(hub.baseUrl, threadId);
+          return snapshot.entries.some(
+            (snapshotEntry) =>
+              snapshotEntry.entry.kind === 'card-settled' &&
+              snapshotEntry.entry.cardId === 'c1' &&
+              snapshotEntry.entry.outcome === 'approved',
+          );
+        });
+      } finally {
+        await fixture.controller.stop().catch(() => {});
+        await hub.kill();
+      }
+    },
+  );
+});
+
+describe('Layer4 真发布 — 断连期间卡片存活与重连收敛（CP5 / A4 X1）', () => {
+  it.skipIf(!HUB_BUILT)(
+    'A4 断连重连：backoff 期间卡片保持 open，重注册新线程后远程动作仍可操作',
+    { timeout: 30000 },
+    async () => {
+      const hub = await startHub();
+      const fixture = makeController();
+      try {
+        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
+        fixture.session.emit(turnStarted());
+        const shown = fixture.questionController.show(questionPayload('q-1'));
+
+        await until(async () => {
+          const threads = await getThreads(hub.baseUrl);
+          return threads[0] !== undefined && threads[0].descriptor.status === 'waiting-question';
+        });
+
+        await hub.kill();
+        await until(() => fixture.controller.state === 'backoff');
+        expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'question', upstreamId: 'q-1' }]);
+
+        const hub2 = await startHubOnPort(hub.port);
+        try {
+          await until(() => fixture.controller.state === 'published');
+          const threads = await getThreads(hub2.baseUrl);
+          expect(threads).toHaveLength(1);
+          const threadId = threads[0]!.id;
+          expect(threads[0]!.descriptor.status).toBe('waiting-question');
+
+          await postAction(hub2.baseUrl, {
+            type: 'answer-question',
+            target: threadId,
+            cardId: 'c1',
+            answer: '选项B',
+          });
+
+          await vi.waitFor(async () => {
+            await expect(shown).resolves.toEqual({ answers: ['选项B'] });
+          });
+          expect(fixture.controller.openCards).toEqual([]);
+        } finally {
+          await hub2.kill();
+        }
+      } finally {
+        await fixture.controller.stop().catch(() => {});
+        await hub.kill();
+      }
+    },
+  );
+
+  it.skipIf(!HUB_BUILT)(
+    'X1 backoff 丢帧重注册覆盖：断连期间本地作答，重注册帧天然携带迁移后状态',
+    { timeout: 30000 },
+    async () => {
+      const hub = await startHub();
+      const fixture = makeController();
+      try {
+        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
+        fixture.session.emit(turnStarted());
+        const shown = fixture.questionController.show(questionPayload('q-1'));
+
+        await until(async () => {
+          const threads = await getThreads(hub.baseUrl);
+          return threads[0] !== undefined && threads[0].descriptor.status === 'waiting-question';
+        });
+
+        await hub.kill();
+        await until(() => fixture.controller.state === 'backoff');
+
+        fixture.questionController.respond({ answers: ['选项A'] });
+        await expect(shown).resolves.toEqual({ answers: ['选项A'] });
+        expect(fixture.controller.openCards).toEqual([]);
+        expect(fixture.frames).toContainEqual({
+          type: 'entry',
+          entry: { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
+        });
+        expect(fixture.frames).toContainEqual({ type: 'entry', entry: { kind: 'status-marker', status: 'running' } });
+
+        const hub2 = await startHubOnPort(hub.port);
+        try {
+          await until(() => fixture.controller.state === 'published');
+          const threads = await getThreads(hub2.baseUrl);
+          expect(threads).toHaveLength(1);
+          expect(threads[0]!.descriptor.status).toBe('running');
+        } finally {
+          await hub2.kill();
+        }
+      } finally {
+        await fixture.controller.stop().catch(() => {});
+        await hub.kill();
+      }
+    },
+  );
+});
+
 describe('Layer4 真发布 — 断链恢复（CP5 / V-3 Checkpoint / A10 部分）', () => {
   it.skipIf(!HUB_BUILT)(
     'hub 进程死亡进入 backoff，同端口重启后恢复 published 并重注册新线程',
@@ -413,6 +641,12 @@ describe('Layer4 真发布 — 断链恢复（CP5 / V-3 Checkpoint / A10 部分�
         const firstThreads = await getThreads(hub.baseUrl);
         expect(firstThreads).toHaveLength(1);
         const firstThreadId = firstThreads[0]!.id;
+
+        fixture.session.emit(turnStarted());
+        await until(async () => {
+          const threads = await getThreads(hub.baseUrl);
+          return threads[0] !== undefined && threads[0].descriptor.status === 'running';
+        });
 
         await hub.kill();
         await until(() => fixture.controller.state === 'backoff');
@@ -430,6 +664,7 @@ describe('Layer4 真发布 — 断链恢复（CP5 / V-3 Checkpoint / A10 部分�
           const recoveredThreads = await getThreads(hub2.baseUrl);
           expect(recoveredThreads).toHaveLength(1);
           expect(recoveredThreads[0]!.descriptor.sessionId).toBe(SESSION_ID);
+          expect(recoveredThreads[0]!.descriptor.status).toBe('running');
           expect(recoveredThreads[0]!.id).not.toBe(firstThreadId);
 
           fixture.session.emit(promptSubmitted('after recovery'));
@@ -442,6 +677,56 @@ describe('Layer4 真发布 — 断链恢复（CP5 / V-3 Checkpoint / A10 部分�
             return messageTexts(snapshot, 'user').includes('after recovery');
           });
           expect(messageTexts(snapshot, 'user')).toEqual(['after recovery']);
+        } finally {
+          await hub2.kill();
+        }
+      } finally {
+        await fixture.controller.stop().catch(() => {});
+        await hub.kill();
+      }
+    },
+  );
+});
+
+describe('Layer4 真发布 — 断线重连身份收敛（CP5 / A2）', () => {
+  it.skipIf(!HUB_BUILT)(
+    'A2 重连身份收敛：发布 s1 → 切换 s2 原地更新 → 断线重连，新线程 sessionId 为 s2',
+    { timeout: 30000 },
+    async () => {
+      const hub = await startHub();
+      const fixture = makeController();
+      try {
+        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
+        await until(async () => {
+          const threads = await getThreads(hub.baseUrl);
+          return threads[0] !== undefined;
+        });
+        const firstThreads = await getThreads(hub.baseUrl);
+        expect(firstThreads).toHaveLength(1);
+        const firstThreadId = firstThreads[0]!.id;
+        expect(firstThreads[0]!.descriptor.sessionId).toBe(SESSION_ID);
+
+        const next = makeSession('layer4-session-2');
+        fixture.controller.onSessionChanged(next.session);
+        await until(async () => {
+          const threads = await getThreads(hub.baseUrl);
+          return threads[0] !== undefined && threads[0].descriptor.sessionId === 'layer4-session-2';
+        });
+        const switchedThreads = await getThreads(hub.baseUrl);
+        expect(switchedThreads).toHaveLength(1);
+        expect(switchedThreads[0]!.id).toBe(firstThreadId);
+        expect(switchedThreads[0]!.descriptor.sessionId).toBe('layer4-session-2');
+
+        await hub.kill();
+        await until(() => fixture.controller.state === 'backoff');
+
+        const hub2 = await startHubOnPort(hub.port);
+        try {
+          await until(() => fixture.controller.state === 'published');
+          const recoveredThreads = await getThreads(hub2.baseUrl);
+          expect(recoveredThreads).toHaveLength(1);
+          expect(recoveredThreads[0]!.descriptor.sessionId).toBe('layer4-session-2');
+          expect(recoveredThreads[0]!.id).not.toBe(firstThreadId);
         } finally {
           await hub2.kill();
         }
