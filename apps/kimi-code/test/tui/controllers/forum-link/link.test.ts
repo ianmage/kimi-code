@@ -262,7 +262,7 @@ describe('Link over a stub hub', () => {
       onStateChange: transitions.onStateChange,
     });
     activeLinks.push(link);
-    await link.connect({ url: stub.baseUrl, password: 'pw' }, DESCRIPTOR);
+    await link.connect({ url: stub.baseUrl, password: 'pw' }, () => DESCRIPTOR);
     expect(link.state).toBe('published');
     expect(link.threadId).toBe('t-9');
     link.send(entryFrame('first'));
@@ -291,6 +291,60 @@ describe('Link over a stub hub', () => {
     expect(gaps[3]).toBeLessThanOrEqual(60);
   });
 
+  it('evaluates the register source once per cycle and the register body is byte-for-byte the evaluated descriptor', async () => {
+    const stub = await startStubHub();
+    activeStubs.push(stub);
+    stub.setRegisterPlan([{ kind: 'ok', id: 't-src-1' }, { kind: 'ok', id: 't-src-2' }, { kind: 'ok', id: 't-src-3' }], {
+      kind: 'ok',
+      id: 't-src-4',
+    });
+    let status: Descriptor['status'] = 'idle';
+    let calls = 0;
+    const seen: Descriptor['status'][] = [];
+    const registerSource = (): Descriptor => {
+      calls += 1;
+      return { ...DESCRIPTOR, status };
+    };
+    const link = new Link({
+      timing: { backoffBaseMs: 20, backoffCapMs: 100, heartbeatIntervalMs: 5000, heartbeatTimeoutMs: 5000 },
+    });
+    activeLinks.push(link);
+    await link.connect({ url: stub.baseUrl, password: 'pw' }, registerSource);
+    seen.push(JSON.parse(stub.registerBodies[0]!).status);
+    status = 'running';
+    stub.destroySse();
+    await until(() => link.state === 'published' && link.threadId === 't-src-2');
+    seen.push(JSON.parse(stub.registerBodies[1]!).status);
+    status = 'waiting-question';
+    stub.destroySse();
+    await until(() => link.state === 'published' && link.threadId === 't-src-3');
+    seen.push(JSON.parse(stub.registerBodies[2]!).status);
+    expect(calls).toBe(3);
+    expect(seen).toEqual(['idle', 'running', 'waiting-question']);
+    expect(stub.registerBodies[0]).toBe(JSON.stringify({ ...DESCRIPTOR, status: 'idle' }));
+    expect(stub.registerBodies[1]).toBe(JSON.stringify({ ...DESCRIPTOR, status: 'running' }));
+    expect(stub.registerBodies[2]).toBe(JSON.stringify({ ...DESCRIPTOR, status: 'waiting-question' }));
+  });
+
+  it('uses a freshly evaluated descriptor after a reconnect', async () => {
+    const stub = await startStubHub();
+    activeStubs.push(stub);
+    stub.setRegisterPlan([{ kind: 'ok', id: 't-9' }, { kind: 'ok', id: 't-10' }], { kind: 'ok', id: 't-11' });
+    let current: Descriptor = DESCRIPTOR;
+    const link = new Link({
+      timing: { backoffBaseMs: 20, backoffCapMs: 100, heartbeatIntervalMs: 5000, heartbeatTimeoutMs: 5000 },
+    });
+    activeLinks.push(link);
+    await link.connect({ url: stub.baseUrl, password: 'pw' }, () => current);
+    expect(link.threadId).toBe('t-9');
+    const changed: Descriptor = { ...DESCRIPTOR, status: 'waiting-question' };
+    current = changed;
+    stub.destroySse();
+    await until(() => link.state === 'published' && link.threadId === 't-10');
+    expect(stub.registerBodies[1]).toBe(JSON.stringify(changed));
+    expect(JSON.parse(stub.registerBodies[1]!).status).toBe('waiting-question');
+  });
+
   it('treats a 401 register response as fatal and stops retrying', async () => {
     const stub = await startStubHub();
     activeStubs.push(stub);
@@ -301,7 +355,7 @@ describe('Link over a stub hub', () => {
       onStateChange: transitions.onStateChange,
     });
     activeLinks.push(link);
-    await expect(link.connect({ url: stub.baseUrl, password: 'wrong' }, DESCRIPTOR)).rejects.toThrow('unauthorized');
+    await expect(link.connect({ url: stub.baseUrl, password: 'wrong' }, () => DESCRIPTOR)).rejects.toThrow('unauthorized');
     expect(link.state).toBe('detached');
     expect(transitions.states).toEqual(['connecting', 'detached']);
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -317,7 +371,7 @@ describe('Link over a stub hub', () => {
       timing: { backoffBaseMs: 20, backoffCapMs: 50, heartbeatIntervalMs: 5000, heartbeatTimeoutMs: 5000 },
     });
     activeLinks.push(link);
-    const connectPromise = link.connect({ url: stub.baseUrl, password: 'pw' }, DESCRIPTOR);
+    const connectPromise = link.connect({ url: stub.baseUrl, password: 'pw' }, () => DESCRIPTOR);
     await until(() => link.state === 'backoff');
     link.send(entryFrame('dropped-1'));
     link.send(entryFrame('dropped-2'));
@@ -339,7 +393,7 @@ describe('Link over a stub hub', () => {
       timing: { backoffBaseMs: 200, backoffCapMs: 400, heartbeatIntervalMs: 5000, heartbeatTimeoutMs: 5000 },
     });
     activeLinks.push(link);
-    const connectPromise = link.connect({ url: stub.baseUrl, password: 'pw' }, DESCRIPTOR);
+    const connectPromise = link.connect({ url: stub.baseUrl, password: 'pw' }, () => DESCRIPTOR);
     await until(() => link.state === 'backoff');
     for (let i = 0; i < 50; i += 1) {
       link.send(entryFrame(`during-backoff-${i}`));
@@ -365,7 +419,7 @@ describe('Link over a stub hub', () => {
       onStateChange: transitions.onStateChange,
     });
     activeLinks.push(link);
-    await link.connect({ url: stub.baseUrl, password: 'pw' }, DESCRIPTOR);
+    await link.connect({ url: stub.baseUrl, password: 'pw' }, () => DESCRIPTOR);
     const publishedAt = transitions.times[transitions.states.indexOf('published')]!;
     await until(() => link.state === 'backoff', 500);
     const backoffAt = transitions.times[transitions.states.indexOf('backoff')]!;
@@ -386,7 +440,7 @@ describe('Link over a stub hub', () => {
       onAction: (frame) => actions.push(frame),
     });
     activeLinks.push(link);
-    await link.connect({ url: stub.baseUrl, password: 'pw' }, DESCRIPTOR);
+    await link.connect({ url: stub.baseUrl, password: 'pw' }, () => DESCRIPTOR);
     stub.writeSse('data: {"action":{"type":"pause","target":"t1"}}\n\n');
     await until(() => actions.length === 1);
     expect(actions[0]).toEqual({ type: 'pause', target: 't1' });
@@ -407,7 +461,7 @@ describe('Link over a stub hub', () => {
       timing: { backoffBaseMs: 20, backoffCapMs: 100, heartbeatIntervalMs: 30, heartbeatTimeoutMs: 5000 },
     });
     activeLinks.push(link);
-    await link.connect({ url: stub.baseUrl, password: 'pw' }, DESCRIPTOR);
+    await link.connect({ url: stub.baseUrl, password: 'pw' }, () => DESCRIPTOR);
     await until(() => stub.heartbeatCount >= 2);
     expect(stub.sseOpened).toBe(1);
     link.close('user request');
@@ -473,7 +527,7 @@ describe('Link against a real hub process', () => {
       onAction: (frame) => actions.push(frame),
     });
     try {
-      await link.connect({ url: baseUrl, password: 'secret' }, DESCRIPTOR);
+      await link.connect({ url: baseUrl, password: 'secret' }, () => DESCRIPTOR);
       expect(link.state).toBe('published');
       expect(typeof link.threadId).toBe('string');
       const threadId = link.threadId!;

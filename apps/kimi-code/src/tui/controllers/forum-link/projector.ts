@@ -24,6 +24,7 @@ export interface ProjectorOptions {
   limits?: ProjectorLimits;
   /** Defaults to MAIN_AGENT_ID; injectable for tests. */
   mainAgentId?: string;
+  onStatusChange?: (status: ProjectorStatus) => void;
 }
 
 const DEFAULT_MAX_TEXT_CHARS = 4000;
@@ -67,6 +68,7 @@ export class Projector {
   private readonly emit: (frame: UplinkFrame) => void;
   private readonly limits: Required<ProjectorLimits>;
   private readonly mainAgentId: string;
+  private readonly onStatusChange: ((status: ProjectorStatus) => void) | undefined;
   private readonly debugStats: Map<string, ProjectorEventStats> | undefined;
 
   private statusValue: ProjectorStatus = 'idle';
@@ -80,6 +82,7 @@ export class Projector {
       maxTextChars: options.limits?.maxTextChars ?? DEFAULT_MAX_TEXT_CHARS,
     };
     this.mainAgentId = options.mainAgentId ?? MAIN_AGENT_ID;
+    this.onStatusChange = options.onStatusChange;
     this.debugStats = DEBUG_ON_VALUES.has(process.env[DEBUG_ENV_VAR] ?? '')
       ? new Map<string, ProjectorEventStats>()
       : undefined;
@@ -246,6 +249,7 @@ export class Projector {
     if (this.statusValue === next) return;
     this.statusValue = next;
     this.emitEntry({ kind: 'status-marker', status: next });
+    this.onStatusChange?.(next);
   }
 
   private emitEntry(entry: Entry): void {

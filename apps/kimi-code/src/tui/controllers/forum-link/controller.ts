@@ -57,7 +57,6 @@ export function createForumLinkController(host: ForumLinkHostFace): ForumLinkCon
       machineName: hostname(),
       projectName: basename(host.workDir()),
       title: host.sessionTitle() ?? '',
-      status: 'idle',
     }),
   });
 }
@@ -88,8 +87,12 @@ export interface ForumLinkControllerDeps {
   createNewSession?: () => Promise<void>;
   /** Notified when a downlink card action no longer matches an open card. */
   onDroppedAction?: (frame: ActionFrame) => void;
-  /** Assembles the thread descriptor; the publish command injects the real one. */
-  buildDescriptor?: (session: Session) => Descriptor;
+  /**
+   * Assembles the thread descriptor identity; the controller composes the
+   * projector's live status on top at send time. The publish command injects
+   * the real one.
+   */
+  buildDescriptor?: (session: Session) => Omit<Descriptor, 'status'>;
   /** Bounded idle wait before end-session gives up; sub-second in tests. */
   endSessionTiming?: { idleWaitTimeoutMs?: number };
   /** Link factory; injectable for tests, defaults to the real Link. */
@@ -152,6 +155,13 @@ export class ForumLinkController {
       emit: (frame) => {
         this.handleProjectorFrame(frame);
       },
+      onStatusChange: () => {
+        const session = this.currentSession;
+        if (session === undefined) return;
+        const descriptor = this.composeDescriptor(session);
+        if (descriptor === undefined) return;
+        this.handleProjectorFrame({ type: 'descriptor', descriptor });
+      },
     });
     if (
       deps.getAppState === undefined ||
@@ -190,11 +200,6 @@ export class ForumLinkController {
     return this.currentSession;
   }
 
-  /** Projector's current derived status, mirrored into descriptors. */
-  get projectorStatus(): Projector['status'] {
-    return this.projector.status;
-  }
-
   /** Downlink entry — forwards a validated action frame to the injector. */
   dispatchAction(frame: ActionFrame): void {
     this.injector?.dispatch(frame);
@@ -224,7 +229,7 @@ export class ForumLinkController {
     if (this.linkState === 'detached') return;
     this.projector.detach();
     this.projector.attach(session);
-    const descriptor = this.deps.buildDescriptor?.(session);
+    const descriptor = this.composeDescriptor(session);
     if (descriptor === undefined) return;
     this.projector.emitRegister(descriptor);
   }
@@ -263,8 +268,7 @@ export class ForumLinkController {
     if (this.linkState !== 'detached') return { ok: false, reason: 'already-active' };
     const session = this.currentSession;
     if (session === undefined) return { ok: false, reason: 'no-session' };
-    const descriptor = this.deps.buildDescriptor?.(session);
-    if (descriptor === undefined) return { ok: false, reason: 'no-descriptor' };
+    if (this.deps.buildDescriptor?.(session) === undefined) return { ok: false, reason: 'no-descriptor' };
     if (this.link === undefined) {
       const handlers: LinkHandlers = {
         onStateChange: (state) => {
@@ -278,7 +282,7 @@ export class ForumLinkController {
     }
     this.projector.attach(session);
     try {
-      await this.link.connect(credential, descriptor);
+      await this.link.connect(credential, () => this.composeDescriptor(this.currentSession)!);
     } catch (error) {
       return { ok: false, reason: 'connect-failed', error };
     }
@@ -338,6 +342,17 @@ export class ForumLinkController {
     this.projector.detach();
     this.openCardsList.length = 0;
     this.setLinkState('detached');
+  }
+
+  /**
+   * The single composition point of the descriptor: identity from
+   * `deps.buildDescriptor`, status from the projector, evaluated at send time
+   * with no caching. Returns undefined when no identity dep is wired.
+   */
+  private composeDescriptor(session: Session): Descriptor | undefined {
+    const identity = this.deps.buildDescriptor?.(session);
+    if (identity === undefined) return undefined;
+    return { ...identity, status: this.projector.status };
   }
 
   /**

@@ -11,7 +11,9 @@ import {
 import type { ApprovalPanelData, QuestionPanelData } from '#/tui/reverse-rpc/types';
 import type { TranscriptEntry } from '#/tui/types';
 
-function makeProjector(overrides: Pick<ProjectorOptions, 'limits' | 'mainAgentId'> = {}) {
+function makeProjector(
+  overrides: Pick<ProjectorOptions, 'limits' | 'mainAgentId' | 'onStatusChange'> = {},
+) {
   const frames: UplinkFrame[] = [];
   const projector = new Projector({
     emit: (frame) => {
@@ -19,6 +21,7 @@ function makeProjector(overrides: Pick<ProjectorOptions, 'limits' | 'mainAgentId
     },
     limits: overrides.limits,
     mainAgentId: overrides.mainAgentId,
+    onStatusChange: overrides.onStatusChange,
   });
   return { frames, projector };
 }
@@ -397,6 +400,84 @@ describe('Projector — attach / detach', () => {
     projector.attach(session);
     expect(projector.subscriptionCount).toBe(1);
     expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Projector — onStatusChange seam', () => {
+  function runFullTransitionSequence(projector: Projector) {
+    projector.handleEvent(turnStarted());
+    projector.onCardOpened('question', 'c1', questionPayload('qp-1'));
+    projector.onCardClosed('question', 'c1', 'answered');
+    projector.handleEvent(turnEnded('completed'));
+  }
+
+  it('状态实际迁移时回调恰一次，重复事件短路不回调', () => {
+    const onStatusChange = vi.fn();
+    const { projector } = makeProjector({ onStatusChange });
+    projector.handleEvent(turnStarted());
+    expect(onStatusChange).toHaveBeenCalledTimes(1);
+    expect(onStatusChange).toHaveBeenLastCalledWith('running');
+    projector.handleEvent(turnStarted());
+    expect(onStatusChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('全迁移序列回调参数为 [running, waiting-question, running, idle]', () => {
+    const statuses: string[] = [];
+    const { projector } = makeProjector({
+      onStatusChange: (status) => {
+        statuses.push(status);
+      },
+    });
+    runFullTransitionSequence(projector);
+    expect(statuses).toEqual(['running', 'waiting-question', 'running', 'idle']);
+  });
+
+  it('detach 复位 idle 静默：零回调、零新帧', () => {
+    const onStatusChange = vi.fn();
+    const { frames, projector } = makeProjector({ onStatusChange });
+    projector.handleEvent(turnStarted());
+    onStatusChange.mockClear();
+    const frameCountBefore = frames.length;
+    projector.detach();
+    expect(projector.status).toBe('idle');
+    expect(onStatusChange).not.toHaveBeenCalled();
+    expect(frames.length).toBe(frameCountBefore);
+  });
+
+  it('注入回调不改变 entry 帧流：与不注入时逐项相等', () => {
+    const bare = makeProjector();
+    runFullTransitionSequence(bare.projector);
+
+    const withCallback = makeProjector({ onStatusChange: () => {} });
+    runFullTransitionSequence(withCallback.projector);
+
+    expect(entries(withCallback.frames)).toEqual(entries(bare.frames));
+    expect(withCallback.projector.status).toBe(bare.projector.status);
+    expect(entries(bare.frames)).toEqual([
+      { kind: 'status-marker', status: 'running' },
+      { kind: 'question-card', cardId: 'c1', question: '选哪个?', options: ['A', 'B'] },
+      { kind: 'status-marker', status: 'waiting-question' },
+      { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
+      { kind: 'status-marker', status: 'running' },
+      { kind: 'status-marker', status: 'idle' },
+    ]);
+  });
+
+  it('缺省回调零行为差：未注入时帧流与终态与注入时一致', () => {
+    const withCallbackStatuses: string[] = [];
+    const withCallback = makeProjector({
+      onStatusChange: (status) => {
+        withCallbackStatuses.push(status);
+      },
+    });
+    runFullTransitionSequence(withCallback.projector);
+
+    const bare = makeProjector();
+    runFullTransitionSequence(bare.projector);
+
+    expect(entries(bare.frames)).toEqual(entries(withCallback.frames));
+    expect(bare.projector.status).toBe(withCallback.projector.status);
+    expect(withCallbackStatuses).toEqual(['running', 'waiting-question', 'running', 'idle']);
   });
 });
 
