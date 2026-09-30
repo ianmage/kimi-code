@@ -1,4 +1,5 @@
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path/posix';
+import * as win32Path from 'node:path/win32';
 import { Readable, Writable } from 'node:stream';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -10,10 +11,12 @@ import {
 } from '#/_base/di/scope';
 import { createScopedTestHost, stubPair } from '#/_base/di/test';
 import { IGitService } from '#/app/git/git';
-import { ErrorCodes, Error2 } from '#/errors';
+import { ILogService } from '#/_base/log/log';
+import { ErrorCodes, Error2, unwrapErrorCause } from '#/errors';
 import { type HostDirEntry, IHostFileSystem } from '#/os/interface/hostFileSystem';
+import { HostFsError, toHostFsError } from '#/os/interface/hostFsErrors';
 import { IHostProcessService, type IHostProcess } from '#/os/interface/hostProcess';
-import { IWorkspaceFsService } from '#/workspace/workspaceFs/fs';
+import { type FsListRequest, IWorkspaceFsService } from '#/workspace/workspaceFs/fs';
 import { WorkspaceFsService } from '#/workspace/workspaceFs/fsService';
 import { IHostEnvironment } from '#/os/interface/hostEnvironment';
 import { IRuntimeResolver } from '#/workspace/workspaceInstance/workspaceInstanceManager';
@@ -22,6 +25,9 @@ import { ITelemetryService, type TelemetryProperties } from '#/app/telemetry/tel
 import { IWorkspaceContext } from '#/workspace/workspaceContext/workspaceContext';
 import { IWorkspaceDirs } from '#/workspace/workspaceDirs/workspaceDirs';
 import { IWorkspaceGitService } from '#/workspace/workspaceGit/workspaceGit';
+import { stubLog } from '../../_base/log/stubs';
+import { loadProjectIgnore, type ProjectIgnoreOptions } from '#/_base/utils/projectIgnore';
+import { join as patheJoin, normalize as patheNormalize } from 'pathe';
 
 const WORK_DIR = '/repo';
 
@@ -58,13 +64,26 @@ function workspaceGitStub(git: IGitService): IWorkspaceGitService {
   };
 }
 
+interface FakeFsHandle {
+  readonly readTextCalls: Map<string, number>;
+  readonly readdirCalls: Map<string, number>;
+  readonly setFile: (relOrAbs: string, content: string | Buffer) => void;
+  readonly removeFile: (relOrAbs: string) => void;
+  readonly failReadText: (relOrAbs: string, error: Error) => void;
+}
+
 function fakeFs(
   files: Record<string, string | Buffer>,
   symlinks: readonly string[] = [],
   symlinkTargets: Record<string, string> = {},
-): IHostFileSystem {
+): IHostFileSystem & FakeFsHandle {
   const fileMap = new Map<string, string | Buffer>();
   const dirSet = new Set<string>([WORK_DIR]);
+  const readTextCalls = new Map<string, number>();
+  const readdirCalls = new Map<string, number>();
+  const readTextFailures = new Map<string, Error>();
+  const toAbs = (relOrAbs: string): string =>
+    relOrAbs.startsWith('/') ? relOrAbs : join(WORK_DIR, relOrAbs);
   const addAncestors = (rel: string): void => {
     const parts = rel.split('/');
     for (let i = 1; i < parts.length; i++) {
@@ -78,14 +97,34 @@ function fakeFs(
       dir = dir.slice(0, dir.lastIndexOf('/'));
     }
   };
-  for (const [rel, content] of Object.entries(files)) {
-    if (rel.startsWith('/')) {
-      fileMap.set(rel, content);
-      addAbsAncestors(rel);
+  const setFile = (relOrAbs: string, content: string | Buffer): void => {
+    if (relOrAbs.startsWith('/')) {
+      fileMap.set(relOrAbs, content);
+      addAbsAncestors(relOrAbs);
     } else {
-      fileMap.set(join(WORK_DIR, rel), content);
-      addAncestors(rel);
+      fileMap.set(join(WORK_DIR, relOrAbs), content);
+      addAncestors(relOrAbs);
     }
+  };
+  const removeFile = (relOrAbs: string): void => {
+    fileMap.delete(toAbs(relOrAbs));
+  };
+  const failReadText = (relOrAbs: string, error: Error): void => {
+    readTextFailures.set(toAbs(relOrAbs), error);
+  };
+  const count = (calls: Map<string, number>, p: string): void => {
+    calls.set(p, (calls.get(p) ?? 0) + 1);
+  };
+  const recordReadText = async (p: string): Promise<string> => {
+    count(readTextCalls, p);
+    const injected = readTextFailures.get(p);
+    if (injected !== undefined) throw injected;
+    const c = fileMap.get(p);
+    if (c === undefined) throw toHostFsError(enoent(p), { path: p, op: 'read' });
+    return typeof c === 'string' ? c : c.toString('utf8');
+  };
+  for (const [rel, content] of Object.entries(files)) {
+    setFile(rel, content);
   }
   const symlinkSet = new Set<string>();
   for (const rel of symlinks) {
@@ -126,11 +165,7 @@ function fakeFs(
   };
   return {
     _serviceBrand: undefined,
-    readText: async (p) => {
-      const c = fileMap.get(p);
-      if (c === undefined) throw enoent(p);
-      return typeof c === 'string' ? c : c.toString('utf8');
-    },
+    readText: recordReadText,
     writeText: async () => {},
     appendText: async () => {},
     readBytes: async (p, n) => {
@@ -154,6 +189,7 @@ function fakeFs(
       return lstatImpl(cur);
     },
     readdir: async (p) => {
+      count(readdirCalls, p);
       if (!isDir(p)) throw enoent(p);
       const prefix = `${p}/`;
       const children = new Map<string, HostDirEntry>();
@@ -238,6 +274,11 @@ function fakeFs(
       }
       return current;
     },
+    readTextCalls,
+    readdirCalls,
+    setFile,
+    removeFile,
+    failReadText,
   };
 }
 
@@ -360,6 +401,17 @@ function defaultGitStub(): IGitService {
   };
 }
 
+function recordingLog(warns: Array<{ message: string; payload: unknown }>): ILogService {
+  const log: ILogService = {
+    ...stubLog(),
+    warn: (message, payload) => {
+      warns.push({ message, payload });
+    },
+    child: () => log,
+  };
+  return log;
+}
+
 function makeSession(
   files: Record<string, string | Buffer>,
   handler: RunHandler,
@@ -370,6 +422,8 @@ function makeSession(
   symlinkTargets: Record<string, string> = {},
   additionalDirs: readonly string[] = [],
   pathClass: 'posix' | 'win32' = 'posix',
+  log: ILogService = stubLog(),
+  fs?: IHostFileSystem & FakeFsHandle,
 ): IWorkspaceFsService {
   host = createScopedTestHost([
     stubPair(IHostEnvironment, {
@@ -383,6 +437,7 @@ function makeSession(
       homeDir: '/home/test',
       ready: Promise.resolve(),
     }),
+    stubPair(ILogService, log),
   ]);
   const runtime = new FakeRuntime({ workspaceId: 'w', runtimeId: 'local', generation: 'test' }, { capabilities: ['process'], pathClass });
   Object.defineProperty(runtime, 'process', { value: runner ?? fakeRunner(handler) });
@@ -394,7 +449,7 @@ function makeSession(
   const workspace = host.child('program', 'w1', [
     stubPair(IWorkspaceContext, stubWorkspaceContext()),
     stubPair(IWorkspaceDirs, stubWorkspaceDirs(additionalDirs)),
-    stubPair(IHostFileSystem, fakeFs(files, symlinks, symlinkTargets)),
+    stubPair(IHostFileSystem, fs ?? fakeFs(files, symlinks, symlinkTargets)),
     stubPair(IHostProcessService, runner ?? fakeRunner(handler)),
     stubPair(ITelemetryService, telemetryStub(events)),
     stubPair(IWorkspaceGitService, workspaceGitStub(git)),
@@ -403,6 +458,44 @@ function makeSession(
 }
 
 const emptyHandler: RunHandler = () => ({ stdout: '', exitCode: 0 });
+
+function rgLinesHandler(lines: readonly string[], captured?: string[][]): RunHandler {
+  return (args) => {
+    captured?.push([...args]);
+    if (args[0] === 'rg' && args[1] === '--version') {
+      return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
+    }
+    if (args[0] === 'rg' && args.includes('--files')) {
+      return { stdout: lines.map((l) => `${l}\n`).join(''), exitCode: 0 };
+    }
+    return { stdout: '', exitCode: 0 };
+  };
+}
+
+function rgMultiRootHandler(perRoot: Record<string, readonly string[]>, captured?: string[][]): RunHandler {
+  return (args) => {
+    captured?.push([...args]);
+    if (args[0] === 'rg' && args[1] === '--version') {
+      return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
+    }
+    if (args[0] === 'rg' && args.includes('--files')) {
+      const lines: string[] = [];
+      for (const arg of args) {
+        const rootLines = perRoot[arg];
+        if (rootLines !== undefined) {
+          for (const line of rootLines) lines.push(`${arg === '/' ? '' : arg}/${line}`);
+        }
+      }
+      return { stdout: lines.map((l) => `${l}\n`).join(''), exitCode: 0 };
+    }
+    return { stdout: '', exitCode: 0 };
+  };
+}
+
+function rgMissingHandler(args: readonly string[]): { stdout: string; exitCode: number } {
+  if (args[0] === 'rg' && args[1] === '--version') return { stdout: '', exitCode: 1 };
+  return { stdout: '', exitCode: 0 };
+}
 
 describe('WorkspaceFsService.gitStatus', () => {
   it('delegates to IWorkspaceGitService with the handler root and a confined filter', async () => {
@@ -547,44 +640,6 @@ describe('WorkspaceFsService.search', () => {
 });
 
 describe('WorkspaceFsService.suggest', () => {
-  function rgLinesHandler(lines: readonly string[], captured?: string[][]): RunHandler {
-    return (args) => {
-      captured?.push([...args]);
-      if (args[0] === 'rg' && args[1] === '--version') {
-        return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
-      }
-      if (args[0] === 'rg' && args.includes('--files')) {
-        return { stdout: lines.map((l) => `${l}\n`).join(''), exitCode: 0 };
-      }
-      return { stdout: '', exitCode: 0 };
-    };
-  }
-
-  function rgMissingHandler(args: readonly string[]): { stdout: string; exitCode: number } {
-    if (args[0] === 'rg' && args[1] === '--version') return { stdout: '', exitCode: 1 };
-    return { stdout: '', exitCode: 0 };
-  }
-
-  function rgMultiRootHandler(perRoot: Record<string, readonly string[]>, captured?: string[][]): RunHandler {
-    return (args) => {
-      captured?.push([...args]);
-      if (args[0] === 'rg' && args[1] === '--version') {
-        return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
-      }
-      if (args[0] === 'rg' && args.includes('--files')) {
-        const lines: string[] = [];
-        for (const arg of args) {
-          const rootLines = perRoot[arg];
-          if (rootLines !== undefined) {
-            for (const line of rootLines) lines.push(`${arg === '/' ? '' : arg}/${line}`);
-          }
-        }
-        return { stdout: lines.map((l) => `${l}\n`).join(''), exitCode: 0 };
-      }
-      return { stdout: '', exitCode: 0 };
-    };
-  }
-
   it('matches path segments in order and ranks the matched directory first', async () => {
     const fs = makeSession(
       {},
@@ -1006,12 +1061,14 @@ describe('WorkspaceFsService.suggest', () => {
   });
 
   it('parses multi-root rg output joined with the windows path separator', async () => {
+    const primaryRoot = win32Path.resolve(WORK_DIR);
+    const extraRoot = win32Path.resolve('/extra');
     const fs = makeSession(
       { 'src/a.ts': '', '/extra/lib/util.ts': '' },
       (args) => {
         if (args[0] === 'rg' && args[1] === '--version') return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
         if (args[0] === 'rg' && args.includes('--files')) {
-          return { stdout: '/repo\\src\\a.ts\n/extra\\lib\\util.ts\n', exitCode: 0 };
+          return { stdout: `${primaryRoot}\\src\\a.ts\n${extraRoot}\\lib\\util.ts\n`, exitCode: 0 };
         }
         return { stdout: '', exitCode: 0 };
       },
@@ -1026,7 +1083,7 @@ describe('WorkspaceFsService.suggest', () => {
     const primary = await fs.suggest({ query: 'a.ts', limit: 50, follow_gitignore: true, show_hidden: false });
     expect(primary.items.map((i) => i.path)).toContain('src/a.ts');
     const extra = await fs.suggest({ query: 'util', limit: 50, follow_gitignore: true, show_hidden: false });
-    expect(extra.items.map((i) => i.path)).toContain('/extra/lib/util.ts');
+    expect(extra.items.map((i) => i.path)).toContain(`${extraRoot.split('\\').join('/')}/lib/util.ts`);
   });
 
   it('parses single-root rg output joined with the windows path separator', async () => {
@@ -1373,6 +1430,261 @@ describe('WorkspaceFsService.list', () => {
   });
 });
 
+describe('fakeFs and makeSession infrastructure', () => {
+  it('counts readText and readdir calls per path', async () => {
+    const fsHandle = fakeFs({ 'src/a.ts': 'one', '.gitignore': 'b.ts\n', 'b.ts': '' });
+    const fs = makeSession({}, rgMissingHandler, [], defaultGitStub(), [], undefined, {}, [], 'posix', stubLog(), fsHandle);
+    await fs.search({ query: 'a', limit: 50, follow_gitignore: true });
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.gitignore'))).toBe(1);
+    expect(fsHandle.readdirCalls.get(WORK_DIR)).toBe(1);
+    expect(fsHandle.readdirCalls.get(join(WORK_DIR, 'src'))).toBe(1);
+    await fs.search({ query: 'a', limit: 50, follow_gitignore: true });
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.gitignore'))).toBe(1);
+    expect(fsHandle.readdirCalls.get(WORK_DIR)).toBe(2);
+  });
+
+  it('applies mid-test file rewrites and removals immediately', async () => {
+    const fsHandle = fakeFs({ 'a.ts': '', 'b.ts': '' });
+    const fs = makeSession({}, rgMissingHandler, [], defaultGitStub(), [], undefined, {}, [], 'posix', stubLog(), fsHandle);
+    const first = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(first.items.map((i) => i.path)).toEqual(['a.ts', 'b.ts']);
+    fsHandle.setFile('c.ts', '');
+    fsHandle.removeFile('a.ts');
+    const second = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(second.items.map((i) => i.path)).toEqual(['b.ts', 'c.ts']);
+  });
+
+  it('captures warn calls through the recording log stub injected via makeSession', async () => {
+    const warns: Array<{ message: string; payload: unknown }> = [];
+    const log = recordingLog(warns);
+    const fs = makeSession({}, emptyHandler, [], defaultGitStub(), [], undefined, {}, [], 'posix', log);
+    expect(host?.app.accessor.get(ILogService)).toBe(log);
+    log.warn('project ignore rule file unreadable', { path: `${WORK_DIR}/.kimi-code/ignore` });
+    expect(warns).toEqual([
+      {
+        message: 'project ignore rule file unreadable',
+        payload: { path: `${WORK_DIR}/.kimi-code/ignore` },
+      },
+    ]);
+    log.child({ scope: 'x' }).warn('nested warn');
+    expect(warns).toHaveLength(2);
+    expect(typeof fs.search).toBe('function');
+  });
+
+  it('injects a non-ENOENT readText error that propagates and is distinguishable from ENOENT', async () => {
+    const fsHandle = fakeFs({ 'a.ts': 'keep', 'secret.ts': 'x' });
+    const eacces = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+    eacces.code = 'EACCES';
+    const permissionError = toHostFsError(eacces, { path: join(WORK_DIR, 'secret.ts'), op: 'read' });
+    fsHandle.failReadText('secret.ts', permissionError);
+    await expect(fsHandle.readText(join(WORK_DIR, 'secret.ts'))).rejects.toThrow(permissionError);
+    const missing = await fsHandle.readText(join(WORK_DIR, 'missing.ts')).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(missing).toBeInstanceOf(HostFsError);
+    expect((missing as HostFsError).code).toBe('os.fs.not_found');
+    const unwrappedInjected = unwrapErrorCause(permissionError);
+    expect((unwrappedInjected as NodeJS.ErrnoException).code).toBe('EACCES');
+    const unwrappedMissing = unwrapErrorCause(missing);
+    expect((unwrappedMissing as NodeJS.ErrnoException).code).toBe('ENOENT');
+  });
+});
+
+describe('projectIgnore loading', () => {
+  function rulePath(root: string): string {
+    return patheJoin(root, '.kimi-code', 'ignore');
+  }
+
+  function load(
+    fs: IHostFileSystem & FakeFsHandle,
+    roots: readonly string[],
+    pathClass: 'posix' | 'win32' = 'posix',
+    log: Pick<ILogService, 'warn'> = stubLog(),
+  ) {
+    const options: ProjectIgnoreOptions = {
+      roots,
+      pathClass,
+      fs: { readText: (p) => fs.readText(p) },
+      log,
+    };
+    return loadProjectIgnore(options);
+  }
+
+  it('returns a non-hiding snapshot without warnings when rule files are missing', async () => {
+    const warns: Array<{ message: string; payload: unknown }> = [];
+    const fsHandle = fakeFs({ 'a.ts': '' });
+    const snapshot = await load(fsHandle, [WORK_DIR, '/extra'], 'posix', recordingLog(warns));
+    expect(snapshot.hidden(join(WORK_DIR, 'a.ts'))).toBe(false);
+    expect(snapshot.hidden(`${WORK_DIR}/vendor/x`)).toBe(false);
+    expect(warns).toHaveLength(0);
+  });
+
+  it('returns a non-hiding snapshot without warnings when the rule path is inside a file (ENOTDIR)', async () => {
+    const warns: Array<{ message: string; payload: unknown }> = [];
+    const fsHandle = fakeFs({ '.kimi-code': 'not a dir' });
+    const snapshot = await load(fsHandle, [WORK_DIR], 'posix', recordingLog(warns));
+    expect(snapshot.hidden(join(WORK_DIR, 'a.ts'))).toBe(false);
+    expect(warns).toHaveLength(0);
+  });
+
+  it('empties the failing root, warns exactly once, and keeps other roots working without rejecting', async () => {
+    const warns: Array<{ message: string; payload: unknown }> = [];
+    const fsHandle = fakeFs({ '/extra/.kimi-code/ignore': 'vendor/\n' });
+    const eacces = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+    eacces.code = 'EACCES';
+    fsHandle.failReadText('.kimi-code/ignore', toHostFsError(eacces, { path: rulePath(WORK_DIR), op: 'read' }));
+    const snapshot = await load(fsHandle, [WORK_DIR, '/extra'], 'posix', recordingLog(warns));
+    expect(snapshot.hidden(join(WORK_DIR, 'vendor/x'))).toBe(false);
+    expect(snapshot.hidden('/extra/vendor/x')).toBe(true);
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.payload).toMatchObject({
+      path: rulePath(WORK_DIR),
+      error: expect.anything(),
+    });
+  });
+
+  it('reads each deduplicated root exactly once', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n' });
+    const snapshot = await load(fsHandle, [
+      WORK_DIR,
+      `${WORK_DIR}/`,
+      patheNormalize(`${WORK_DIR}/sub/..`),
+      '/extra',
+    ]);
+    expect(snapshot.hidden(join(WORK_DIR, 'vendor/x'))).toBe(true);
+    expect(fsHandle.readTextCalls.get(rulePath(WORK_DIR))).toBe(1);
+    expect(fsHandle.readTextCalls.get(rulePath('/extra'))).toBe(1);
+  });
+
+  it('does not hide anything for empty, comment-only, or negation-only rule files', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': '',
+      '/empty2/.kimi-code/ignore': '# only a comment\n',
+      '/empty3/.kimi-code/ignore': '!keep\n',
+      'vendor/x': '',
+    });
+    const snapshot = await load(fsHandle, [WORK_DIR, '/empty2', '/empty3']);
+    expect(snapshot.hidden(join(WORK_DIR, 'vendor/x'))).toBe(false);
+    expect(snapshot.hidden('/empty2/vendor/x')).toBe(false);
+    expect(snapshot.hidden('/empty3/keep/x')).toBe(false);
+  });
+
+  it('ignores .gitignore content in the same root', async () => {
+    const plain = fakeFs({ 'vendor/x': '' });
+    const withGitignore = fakeFs({ '.gitignore': 'vendor/\n', 'vendor/x': '' });
+    const plainSnapshot = await load(plain, [WORK_DIR]);
+    const gitSnapshot = await load(withGitignore, [WORK_DIR]);
+    expect(gitSnapshot.hidden(join(WORK_DIR, 'vendor/x'))).toBe(plainSnapshot.hidden(join(WORK_DIR, 'vendor/x')));
+    expect(gitSnapshot.hidden(join(WORK_DIR, 'vendor/x'))).toBe(false);
+  });
+
+  it('reflects rule file rewrites on a second load', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n' });
+    const first = await load(fsHandle, [WORK_DIR]);
+    expect(first.hidden(join(WORK_DIR, 'vendor/x'))).toBe(true);
+    fsHandle.setFile('.kimi-code/ignore', 'dist/\n');
+    const second = await load(fsHandle, [WORK_DIR]);
+    expect(second.hidden(join(WORK_DIR, 'vendor/x'))).toBe(false);
+    expect(second.hidden(join(WORK_DIR, 'dist/x'))).toBe(true);
+    expect(first.hidden(join(WORK_DIR, 'vendor/x'))).toBe(true);
+  });
+
+  it('reads each rule file from pathe.join(root, .kimi-code, ignore)', async () => {
+    const fsHandle = fakeFs({ '/extra/.kimi-code/ignore': '' });
+    await load(fsHandle, [WORK_DIR, '/extra']);
+    expect([...fsHandle.readTextCalls.keys()]).toEqual([rulePath(WORK_DIR), rulePath('/extra')]);
+  });
+});
+
+describe('projectIgnore predicates', () => {
+  function load(
+    fs: IHostFileSystem & FakeFsHandle,
+    roots: readonly string[],
+    pathClass: 'posix' | 'win32' = 'posix',
+  ) {
+    return loadProjectIgnore({
+      roots,
+      pathClass,
+      fs: { readText: (p) => fs.readText(p) },
+      log: stubLog(),
+    });
+  }
+
+  it('hides directory-rule descendants and nested matches but not a same-named file', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n' });
+    const snapshot = await load(fsHandle, [WORK_DIR]);
+    expect(snapshot.hidden(join(WORK_DIR, 'vendor/v.txt'))).toBe(true);
+    expect(snapshot.hidden(join(WORK_DIR, 'sub/vendor/x'))).toBe(true);
+    expect(snapshot.hidden(join(WORK_DIR, 'vendor'))).toBe(false);
+  });
+
+  it('anchors root-level rules to the owning root', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': '/data/\n' });
+    const snapshot = await load(fsHandle, [WORK_DIR]);
+    expect(snapshot.hidden(join(WORK_DIR, 'data/a'))).toBe(true);
+    expect(snapshot.hidden(join(WORK_DIR, 'sub/data/a'))).toBe(false);
+  });
+
+  it('assigns nested roots to their own rules only', async () => {
+    const r1 = WORK_DIR;
+    const r2 = `${WORK_DIR}/libs/x`;
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'libs/\n' });
+    const snapshot = await load(fsHandle, [r1, r2]);
+    expect(snapshot.hidden(`${r2}/b.ts`)).toBe(false);
+    expect(snapshot.hidden(join(WORK_DIR, 'libs/y/z'))).toBe(true);
+    const nestedHandle = fakeFs({ '.kimi-code/ignore': 'libs/\n', 'libs/x/.kimi-code/ignore': 'secret/\n' });
+    const nestedSnapshot = await load(nestedHandle, [r1, r2]);
+    expect(nestedSnapshot.hidden(join(WORK_DIR, 'secret/f'))).toBe(false);
+    expect(nestedSnapshot.hidden(`${r2}/secret/f`)).toBe(true);
+  });
+
+  it('never hides out-of-root paths or the root itself, even with a wildcard rule', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': '*\n' });
+    const snapshot = await load(fsHandle, [WORK_DIR]);
+    expect(snapshot.hidden('/elsewhere/a.ts')).toBe(false);
+    expect(snapshot.hidden(WORK_DIR)).toBe(false);
+    expect(snapshot.hidden(join(WORK_DIR, 'a.ts'))).toBe(true);
+    expect(snapshot.hidden(join(WORK_DIR, 'sub/a.ts'))).toBe(true);
+  });
+
+  it('matches win32 roots case-insensitively across separators and posix roots case-sensitively', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n' });
+    const winSnapshot = await load(fsHandle, [WORK_DIR], 'win32');
+    expect(winSnapshot.hidden(`${WORK_DIR.replace('/repo', '/REPO')}\\vendor\\x`)).toBe(true);
+    const posixSnapshot = await load(fsHandle, [WORK_DIR], 'posix');
+    expect(posixSnapshot.hidden('/REPO/vendor/x')).toBe(false);
+  });
+
+  it('denies pruning when a root lies strictly inside the directory', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'libs/\n' });
+    const withNested = await load(fsHandle, [WORK_DIR, `${WORK_DIR}/libs/x`]);
+    expect(withNested.canPrune(join(WORK_DIR, 'libs'))).toBe(false);
+    const withoutNested = await load(fsHandle, [WORK_DIR]);
+    expect(withoutNested.canPrune(join(WORK_DIR, 'libs'))).toBe(true);
+  });
+
+  it('returns false without throwing for invalid relative forms', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n' });
+    const snapshot = await load(fsHandle, [WORK_DIR]);
+    expect(snapshot.hidden(join(WORK_DIR, '...'))).toBe(false);
+    expect(snapshot.hidden(join(WORK_DIR, '.../x'))).toBe(false);
+    expect(snapshot.hidden(join(WORK_DIR, '...'), true)).toBe(false);
+  });
+
+  it('never throws for arbitrary inputs', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n' });
+    const snapshot = await load(fsHandle, [WORK_DIR, `${WORK_DIR}/libs/x`]);
+    expect(() => snapshot.hidden('')).not.toThrow();
+    expect(snapshot.hidden('')).toBe(false);
+    expect(() => snapshot.hidden('/abs/path')).not.toThrow();
+    expect(() => snapshot.hidden('relative/path')).not.toThrow();
+    expect(() => snapshot.canPrune('')).not.toThrow();
+    expect(() => snapshot.canPrune(join(WORK_DIR, 'libs'))).not.toThrow();
+    expect(() => snapshot.canPrune('C:\\')).not.toThrow();
+  });
+});
+
 describe('WorkspaceFsService.read', () => {
   it('reads utf-8 content with metadata', async () => {
     const fs = makeSession({ 'src/a.ts': 'hello\nworld\n' }, emptyHandler);
@@ -1659,5 +1971,860 @@ describe('WorkspaceFsService symlink confinement', () => {
     const fs = makeSession({ 'src/a.ts': 'content' }, emptyHandler);
     const res = await fs.read({ path: 'src/a.ts', offset: 0, length: 1024, encoding: 'utf-8' });
     expect(res.content).toBe('content');
+  });
+});
+
+describe('WorkspaceFsService project ignore (rg replay)', () => {
+  function rgJsonHandler(records: readonly object[]): RunHandler {
+    return (args) => {
+      if (args[0] === 'rg' && args[1] === '--version') {
+        return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
+      }
+      if (args[0] === 'rg' && args.includes('--json')) {
+        return { stdout: `${records.map((r) => JSON.stringify(r)).join('\n')}\n`, exitCode: 0 };
+      }
+      return { stdout: '', exitCode: 0 };
+    };
+  }
+
+  function replaySession(
+    handler: RunHandler,
+    fsHandle: IHostFileSystem & FakeFsHandle,
+    additionalDirs: readonly string[] = [],
+  ): IWorkspaceFsService {
+    return makeSession({}, handler, [], defaultGitStub(), [], undefined, {}, additionalDirs, 'posix', stubLog(), fsHandle);
+  }
+
+  function suggestRequest(query: string, followGitignore: boolean) {
+    return {
+      query,
+      limit: 50,
+      follow_gitignore: followGitignore,
+      show_hidden: false,
+    };
+  }
+
+  function grepRequest() {
+    return {
+      pattern: 'hello',
+      regex: false,
+      case_sensitive: true,
+      follow_gitignore: true,
+      max_files: 200,
+      max_matches_per_file: 50,
+      max_total_matches: 5000,
+      context_lines: 0,
+    };
+  }
+
+  function grepRecords(paths: readonly string[]): object[] {
+    const records: object[] = [];
+    for (const p of paths) {
+      records.push({ type: 'begin', data: { path: { text: p } } });
+      records.push({
+        type: 'match',
+        data: {
+          path: { text: p } as never,
+          lines: { text: 'hello\n' },
+          line_number: 1,
+          submatches: [{ start: 0, end: 5 }],
+        },
+      });
+      records.push({ type: 'end', data: { path: { text: p } } });
+    }
+    return records;
+  }
+
+  it('A1: suggest filters vendor files and vendor directory candidates for a vendor/ rule', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n', 'src/a.ts': '' });
+    const fs = replaySession(
+      rgLinesHandler(['src/a.ts', 'vendor/lib.js', 'vendor/sub/v.js']),
+      fsHandle,
+    );
+    const on = await fs.suggest(suggestRequest('vendor', true));
+    const onPaths = on.items.map((i) => i.path);
+    expect(onPaths).not.toContain('vendor');
+    expect(onPaths).not.toContain('vendor/lib.js');
+    expect(onPaths).not.toContain('vendor/sub');
+    expect(onPaths).not.toContain('vendor/sub/v.js');
+
+    const off = await fs.suggest(suggestRequest('vendor', false));
+    const offPaths = off.items.map((i) => i.path);
+    expect(offPaths).not.toContain('vendor');
+    expect(offPaths).not.toContain('vendor/lib.js');
+    expect(offPaths).not.toContain('vendor/sub/v.js');
+
+    const files = await fs.suggest(suggestRequest('ts', true));
+    expect(files.items.map((i) => i.path)).toContain('src/a.ts');
+  });
+
+  it('A2: grep filters vendor hits and does not count vendor files in files_scanned', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n', 'src/a.ts': 'hello\n' });
+    const fs = replaySession(
+      rgJsonHandler(grepRecords(['src/a.ts', 'vendor/v.ts'])),
+      fsHandle,
+    );
+    const result = await fs.grep(grepRequest());
+    expect(result.files.map((f) => f.path)).toEqual(['src/a.ts']);
+    expect(result.files_scanned).toBe(1);
+    expect(result.files[0]?.matches[0]?.text).toBe('hello');
+  });
+
+  it('A3: nested additional dir under a libs/ rule stays visible while siblings are hidden', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/b.ts': '',
+      'libs/y/c.ts': '',
+      'src/a.ts': '',
+    });
+    const fs = replaySession(
+      rgLinesHandler(['libs/x/b.ts', 'libs/y/c.ts', 'src/a.ts']),
+      fsHandle,
+      ['/repo/libs/x'],
+    );
+    const byName = await fs.suggest(suggestRequest('b', true));
+    const namePaths = byName.items.map((i) => i.path);
+    expect(namePaths).toContain('libs/x/b.ts');
+    expect(namePaths).not.toContain('libs/y/c.ts');
+    expect(namePaths).not.toContain('libs');
+    expect(namePaths).not.toContain('libs/y');
+    const byPath = await fs.suggest(suggestRequest('ts', true));
+    const tsPaths = byPath.items.map((i) => i.path);
+    expect(tsPaths).toContain('libs/x/b.ts');
+    expect(tsPaths).toContain('src/a.ts');
+    expect(tsPaths).not.toContain('libs/y/c.ts');
+    const dirOnly = await fs.suggest(suggestRequest('libs', true));
+    expect(dirOnly.items.map((i) => i.path)).toEqual([]);
+  });
+
+  it('A3: a non-nested additional dir is not affected by the primary root rule', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': '',
+      '/extra/libs/z.ts': '',
+    });
+    const fs = replaySession(
+      rgMultiRootHandler({
+        '/repo': ['libs/y/c.ts'],
+        '/extra': ['libs/z.ts'],
+      }),
+      fsHandle,
+      ['/extra'],
+    );
+    const result = await fs.suggest(suggestRequest('ts', true));
+    const paths = result.items.map((i) => i.path);
+    expect(paths).toContain('/extra/libs/z.ts');
+    expect(paths).not.toContain('libs/y/c.ts');
+    expect(paths).not.toContain('libs/y');
+  });
+
+  it('A4: a gitignore negation does not unhide entries blocked by the rule file', async () => {
+    const fsHandle = fakeFs({
+      '.gitignore': '!keep/\n',
+      '.kimi-code/ignore': 'keep/\n',
+      'keep/k.ts': '',
+      'src/a.ts': '',
+    });
+    const fs = replaySession(rgLinesHandler(['keep/k.ts', 'src/a.ts']), fsHandle);
+    const kept = await fs.suggest(suggestRequest('keep', true));
+    expect(kept.items.map((i) => i.path)).toEqual([]);
+    const files = await fs.suggest(suggestRequest('ts', true));
+    expect(files.items.map((i) => i.path)).toEqual(['src/a.ts']);
+  });
+
+  it('A5: a *.log rule still returns directory candidates containing only blocked files', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': '*.log\n', 'logs/a.log': '', 'logs/keep.ts': '' });
+    const fs = replaySession(
+      rgLinesHandler(['logs/a.log', 'logs/keep.ts', 'src/b.ts']),
+      fsHandle,
+    );
+    const byName = await fs.suggest(suggestRequest('keep', true));
+    expect(byName.items.map((i) => i.path)).toEqual(['logs/keep.ts']);
+    const byPath = await fs.suggest(suggestRequest('logs/', true));
+    const paths = byPath.items.map((i) => i.path);
+    expect(paths).toContain('logs');
+    expect(paths).toContain('logs/keep.ts');
+    expect(paths).not.toContain('logs/a.log');
+  });
+
+  it('A6: without a rule file the rg output is unchanged', async () => {
+    const fsHandle = fakeFs({ 'vendor/v.ts': '', 'src/a.ts': '' });
+    const fs = replaySession(rgLinesHandler(['vendor/v.ts', 'src/a.ts']), fsHandle);
+    const byName = await fs.suggest(suggestRequest('vendor', true));
+    expect(byName.items.map((i) => i.path)).toContain('vendor');
+    const byPath = await fs.suggest(suggestRequest('vendor/', true));
+    const paths = byPath.items.map((i) => i.path);
+    expect(paths).toContain('vendor');
+    expect(paths).toContain('vendor/v.ts');
+    const files = await fs.suggest(suggestRequest('ts', true));
+    expect(files.items.map((i) => i.path)).toContain('src/a.ts');
+  });
+
+  it('A7: suggest reads each root rule file exactly once per call', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n', 'src/foo.ts': '' });
+    const fs = replaySession(rgLinesHandler(['src/foo.ts']), fsHandle);
+    await fs.suggest(suggestRequest('foo', true));
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.kimi-code', 'ignore'))).toBe(1);
+    await fs.suggest(suggestRequest('foo', true));
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.kimi-code', 'ignore'))).toBe(2);
+  });
+
+  it('A7: grep reads each root rule file exactly once per call', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n', 'src/a.ts': 'hello\n' });
+    const fs = replaySession(rgJsonHandler(grepRecords(['src/a.ts'])), fsHandle);
+    await fs.grep(grepRequest());
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.kimi-code', 'ignore'))).toBe(1);
+    await fs.grep(grepRequest());
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.kimi-code', 'ignore'))).toBe(2);
+  });
+
+  it('A7: both roots are read exactly once for a multi-root call', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'vendor/\n',
+      '/extra/.kimi-code/ignore': '',
+      'src/foo.ts': '',
+      '/extra/bar.ts': '',
+    });
+    const fs = replaySession(
+      rgMultiRootHandler({ '/repo': ['src/foo.ts'], '/extra': ['bar.ts'] }),
+      fsHandle,
+      ['/extra'],
+    );
+    await fs.suggest(suggestRequest('foo', true));
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.kimi-code', 'ignore'))).toBe(1);
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(1);
+  });
+
+  it('A7: a suggest call falling back to the node walk still loads the snapshot once per root', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'vendor/\n', 'src/foo.ts': '' });
+    const fs = replaySession(rgMissingHandler, fsHandle);
+    const result = await fs.suggest(suggestRequest('foo', true));
+    expect(result.items.map((i) => i.path)).toContain('src/foo.ts');
+    expect(fsHandle.readTextCalls.get(join(WORK_DIR, '.kimi-code', 'ignore'))).toBe(1);
+  });
+
+  it('cross-carrier: nested root under a main-root libs/ rule keeps libs/x visible and libs/y hidden (suggest)', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/b.ts': '',
+      'libs/y/c.ts': '',
+    });
+    const fs = replaySession(
+      rgLinesHandler(['libs/x/b.ts', 'libs/y/c.ts']),
+      fsHandle,
+      ['/repo/libs/x'],
+    );
+    const result = await fs.suggest(suggestRequest('ts', true));
+    expect(result.items.map((i) => i.path)).toEqual(['libs/x/b.ts']);
+  });
+
+  it('cross-carrier: nested root under a main-root libs/ rule keeps libs/x visible and libs/y hidden (grep)', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/b.ts': 'hello\n',
+      'libs/y/c.ts': 'hello\n',
+    });
+    const fs = replaySession(
+      rgJsonHandler(grepRecords(['libs/x/b.ts', 'libs/y/c.ts'])),
+      fsHandle,
+      ['/repo/libs/x'],
+    );
+    const result = await fs.grep(grepRequest());
+    expect(result.files.map((f) => f.path)).toEqual(['libs/x/b.ts']);
+    expect(result.files_scanned).toBe(1);
+  });
+
+  it('A7: a grep call falling back to the node walk still loads the snapshot once per root', async () => {
+    const fsHandle = fakeFs({ '/extra/.kimi-code/ignore': 'vendor/\n', 'src/a.ts': 'hello\n' });
+    const fs = replaySession(rgMissingHandler, fsHandle, ['/extra']);
+    const result = await fs.grep(grepRequest());
+    expect(result.files.map((f) => f.path)).toContain('src/a.ts');
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(1);
+  });
+
+  it('A3: a non-ENOENT rule read warns exactly once with the rule path and returns the no-rule result', async () => {
+    const warns: Array<{ message: string; payload: unknown }> = [];
+    const ruleFile = join(WORK_DIR, '.kimi-code', 'ignore');
+    const files = { 'vendor/v.ts': '', 'src/a.ts': '' };
+    const failingHandle = fakeFs(files);
+    const eacces = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+    eacces.code = 'EACCES';
+    failingHandle.failReadText('.kimi-code/ignore', toHostFsError(eacces, { path: ruleFile, op: 'read' }));
+    const failing = makeSession(
+      {},
+      rgLinesHandler(['vendor/v.ts', 'src/a.ts']),
+      [],
+      defaultGitStub(),
+      [],
+      undefined,
+      {},
+      [],
+      'posix',
+      recordingLog(warns),
+      failingHandle,
+    );
+    const plain = makeSession(
+      {},
+      rgLinesHandler(['vendor/v.ts', 'src/a.ts']),
+      [],
+      defaultGitStub(),
+      [],
+      undefined,
+      {},
+      [],
+      'posix',
+      recordingLog([]),
+      fakeFs(files),
+    );
+
+    const failingResult = await failing.suggest(suggestRequest('ts', false));
+    const plainResult = await plain.suggest(suggestRequest('ts', false));
+
+    expect(failingResult.items.map((i) => i.path)).toEqual(plainResult.items.map((i) => i.path));
+    expect(failingResult.items.map((i) => i.path)).toContain('vendor/v.ts');
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.message).toBe('project ignore rule file unreadable');
+    const payload = warns[0]?.payload as { path: string; error: unknown };
+    expect(payload.path).toBe(ruleFile);
+    expect((unwrapErrorCause(payload.error) as NodeJS.ErrnoException).code).toBe('EACCES');
+  });
+});
+
+describe('WorkspaceFsService project ignore (JS paths and lifecycle)', () => {
+  const RULE_FILE = `${WORK_DIR}/.kimi-code/ignore`;
+
+  function listRequest(partial: Partial<FsListRequest> = {}): FsListRequest {
+    return {
+      path: '.',
+      depth: 1,
+      limit: 200,
+      show_hidden: false,
+      follow_gitignore: false,
+      sort: 'name_asc',
+      include_git_status: false,
+      ...partial,
+    };
+  }
+
+  function jsSession(
+    fsHandle: IHostFileSystem & FakeFsHandle,
+    additionalDirs: readonly string[] = [],
+  ): IWorkspaceFsService {
+    return makeSession({}, rgMissingHandler, [], defaultGitStub(), [], undefined, {}, additionalDirs, 'posix', stubLog(), fsHandle);
+  }
+
+  it('A1: nested root under a main-root libs/ rule stays visible in search, suggest, and grep', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/b.ts': 'hello\n',
+      'libs/y/c.ts': 'hello\n',
+      'src/a.ts': 'hello\n',
+    });
+    const fs = jsSession(fsHandle, [`${WORK_DIR}/libs/x`]);
+
+    const searched = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    const searchPaths = searched.items.map((i) => i.path);
+    expect(searchPaths).toContain('libs/x/b.ts');
+    expect(searchPaths).toContain('src/a.ts');
+    expect(searchPaths).not.toContain('libs');
+    expect(searchPaths).not.toContain('libs/y');
+    expect(searchPaths).not.toContain('libs/y/c.ts');
+
+    const suggested = await fs.suggest({
+      query: 'ts',
+      limit: 50,
+      follow_gitignore: false,
+      show_hidden: false,
+    });
+    const suggestPaths = suggested.items.map((i) => i.path);
+    expect(suggestPaths).toContain('libs/x/b.ts');
+    expect(suggestPaths).toContain('src/a.ts');
+    expect(suggestPaths).not.toContain('libs');
+    expect(suggestPaths).not.toContain('libs/y');
+    expect(suggestPaths).not.toContain('libs/y/c.ts');
+
+    const grepped = await fs.grep({
+      pattern: 'hello',
+      regex: false,
+      case_sensitive: true,
+      follow_gitignore: false,
+      max_files: 200,
+      max_matches_per_file: 50,
+      max_total_matches: 5000,
+      context_lines: 0,
+    });
+    expect(grepped.files.map((f) => f.path)).toEqual(['libs/x/b.ts', 'src/a.ts']);
+  });
+
+  it('A1: without a nested root the walk never readdirs a prunable libs directory', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': '',
+      'src/a.ts': '',
+    });
+    const fs = jsSession(fsHandle);
+    const result = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(result.items.map((i) => i.path)).toEqual(['src/a.ts']);
+    expect(fsHandle.readdirCalls.get(`${WORK_DIR}/libs`)).toBeUndefined();
+
+    const suggested = await fs.suggest({
+      query: 'ts',
+      limit: 50,
+      follow_gitignore: false,
+      show_hidden: false,
+    });
+    expect(suggested.items.map((i) => i.path)).toEqual(['src/a.ts']);
+    expect(fsHandle.readdirCalls.get(`${WORK_DIR}/libs`)).toBeUndefined();
+  });
+
+  it('A2: list omits hidden entries, counts limit and truncated over visible entries only', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': '',
+      'a.ts': '',
+      'b.ts': '',
+      'z.ts': '',
+    });
+    const fs = jsSession(fsHandle);
+    const result = await fs.list(listRequest({ limit: 3 }));
+    expect(result.items.map((i) => i.path)).toEqual(['a.ts', 'b.ts', 'z.ts']);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('A2: a wildcard rule empties the root listing without failing', async () => {
+    const fsHandle = fakeFs({ '.kimi-code/ignore': '*\n', 'a.ts': '', 'src/b.ts': '' });
+    const fs = jsSession(fsHandle);
+    const result = await fs.list(listRequest());
+    expect(result.items).toEqual([]);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('A3: the empty-query suggest top level omits hidden entries', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': '',
+      'src/a.ts': '',
+      'README.md': '',
+    });
+    const fs = jsSession(fsHandle);
+    const result = await fs.suggest({
+      query: '',
+      limit: 50,
+      follow_gitignore: false,
+      show_hidden: false,
+    });
+    const paths = result.items.map((i) => i.path);
+    expect(paths).toContain('src');
+    expect(paths).toContain('README.md');
+    expect(paths).not.toContain('libs');
+  });
+
+  it('A4: a hidden unprunable dir matched by exclude_globs is not descended into', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/b.ts': '',
+      'libs/y/c.ts': '',
+      'src/a.ts': '',
+    });
+    const fs = jsSession(fsHandle, [`${WORK_DIR}/libs/x`]);
+    const result = await fs.list(listRequest({ depth: 2, exclude_globs: ['libs'] }));
+    expect(result.items.map((i) => i.path)).toEqual(['src']);
+    expect(result.children_by_path?.['libs']).toBeUndefined();
+    expect(fsHandle.readdirCalls.get(`${WORK_DIR}/libs`)).toBeUndefined();
+  });
+
+  it('A4: a hidden unprunable dir matched by gitignore is not descended into', async () => {
+    const fsHandle = fakeFs({
+      '.gitignore': 'libs/\n',
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/b.ts': '',
+      'libs/y/c.ts': '',
+    });
+    const fs = jsSession(fsHandle, [`${WORK_DIR}/libs/x`]);
+    const result = await fs.search({ query: 'ts', limit: 50, follow_gitignore: true });
+    expect(result.items).toEqual([]);
+    const suggested = await fs.suggest({
+      query: 'ts',
+      limit: 50,
+      follow_gitignore: true,
+      show_hidden: false,
+    });
+    expect(suggested.items.map((i) => i.path)).toEqual([]);
+    expect(fsHandle.readdirCalls.get(`${WORK_DIR}/libs`)).toBeUndefined();
+  });
+
+  it('A5: hidden entries stay hidden with follow_gitignore false and show_hidden true', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': '',
+      'src/a.ts': '',
+    });
+    const fs = jsSession(fsHandle);
+    const searched = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(searched.items.map((i) => i.path)).toEqual(['src/a.ts']);
+    const suggested = await fs.suggest({
+      query: 'ts',
+      limit: 50,
+      follow_gitignore: false,
+      show_hidden: true,
+    });
+    expect(suggested.items.map((i) => i.path)).toEqual(['src/a.ts']);
+    const listed = await fs.list(listRequest({ show_hidden: true }));
+    expect(listed.items.map((i) => i.path)).toEqual(['.kimi-code', 'src']);
+  });
+
+  it('A6: list, listMany, search, suggest, and grep each load the snapshot once per root', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': 'hello\n',
+      'src/a.ts': 'hello\n',
+      '/extra/.kimi-code/ignore': '',
+      '/extra/e.ts': '',
+    });
+    const fs = jsSession(fsHandle, ['/extra']);
+
+    await fs.list(listRequest());
+    expect(fsHandle.readTextCalls.get(RULE_FILE)).toBe(1);
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(1);
+
+    await fs.listMany({
+      paths: ['.', 'src', 'src'],
+      depth: 1,
+      limit: 200,
+      show_hidden: false,
+      follow_gitignore: false,
+      sort: 'name_asc',
+      include_git_status: false,
+    });
+    expect(fsHandle.readTextCalls.get(RULE_FILE)).toBe(2);
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(2);
+
+    await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(fsHandle.readTextCalls.get(RULE_FILE)).toBe(3);
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(3);
+
+    await fs.suggest({
+      query: 'ts',
+      limit: 50,
+      follow_gitignore: false,
+      show_hidden: false,
+    });
+    expect(fsHandle.readTextCalls.get(RULE_FILE)).toBe(4);
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(4);
+
+    await fs.grep({
+      pattern: 'hello',
+      regex: false,
+      case_sensitive: true,
+      follow_gitignore: false,
+      max_files: 200,
+      max_matches_per_file: 50,
+      max_total_matches: 5000,
+      context_lines: 0,
+    });
+    expect(fsHandle.readTextCalls.get(RULE_FILE)).toBe(6);
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(5);
+  });
+
+  it('A6: search with an empty query shares the snapshot between list calls', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': '',
+      'a.ts': '',
+      '/extra/.kimi-code/ignore': '',
+      '/extra/e.ts': '',
+    });
+    const fs = jsSession(fsHandle, ['/extra']);
+    const listed = await fs.search({ query: '', limit: 50, follow_gitignore: false });
+    expect(listed.items.map((i) => i.path)).toEqual(['a.ts']);
+    expect(fsHandle.readTextCalls.get(RULE_FILE)).toBe(1);
+    expect(fsHandle.readTextCalls.get('/extra/.kimi-code/ignore')).toBe(1);
+  });
+
+  it('A6: a suggest falling back from rg to node reuses the same snapshot', async () => {
+    const events: Array<{ event: string; properties: Record<string, unknown> }> = [];
+    const fsHandle = fakeFs({ '.kimi-code/ignore': 'libs/\n', 'libs/y/c.ts': '', 'src/foo.ts': '' });
+    let spawnCount = 0;
+    const runner: IHostProcessService = {
+      _serviceBrand: undefined,
+      spawn: async (command, args) => {
+        const all = [command, ...(args ?? [])];
+        if (all[0] === 'rg' && all[1] === '--version') {
+          spawnCount += 1;
+          return fakeProcess('ripgrep 15.0.0', '', 0);
+        }
+        return fakeProcess('', 'spawn failure', 2);
+      },
+    };
+    const fs = makeSession({}, emptyHandler, events, defaultGitStub(), [], runner, {}, [], 'posix', stubLog(), fsHandle);
+    const result = await fs.suggest({
+      query: 'foo',
+      limit: 50,
+      follow_gitignore: true,
+      show_hidden: false,
+    });
+    expect(result.items.map((i) => i.path)).toContain('src/foo.ts');
+    expect(result.items.map((i) => i.path)).not.toContain('libs/y/c.ts');
+    expect(events).toContainEqual({
+      event: 'fs_suggest_node_fallback',
+      properties: { reason: 'rg_error' },
+    });
+    expect(spawnCount).toBe(1);
+    expect(fsHandle.readTextCalls.get(RULE_FILE)).toBe(1);
+  });
+
+  it('A7: rule rewrites between calls take effect on both rg and JS paths', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/y/c.ts': 'hello\n',
+      'dist/d.ts': 'hello\n',
+      'src/a.ts': 'hello\n',
+    });
+    const fs = jsSession(fsHandle);
+    const first = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(first.items.map((i) => i.path)).toEqual(['dist/d.ts', 'src/a.ts']);
+    fsHandle.setFile('.kimi-code/ignore', 'dist/\n');
+    const second = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(second.items.map((i) => i.path)).toEqual(['libs/y/c.ts', 'src/a.ts']);
+    fsHandle.removeFile('.kimi-code/ignore');
+    const third = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(third.items.map((i) => i.path)).toEqual(['dist/d.ts', 'libs/y/c.ts', 'src/a.ts']);
+  });
+
+  it('A8: rg replay and the JS walk return the same path sets for suggest and grep', async () => {
+    const fsHandle = fakeFs({
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/b.ts': 'hello\n',
+      'libs/y/c.ts': 'hello\n',
+      'src/a.ts': 'hello\n',
+    });
+
+    const rgSuggest = makeSession(
+      {},
+      rgLinesHandler(['libs/x/b.ts', 'libs/y/c.ts', 'src/a.ts']),
+      [],
+      defaultGitStub(),
+      [],
+      undefined,
+      {},
+      [`${WORK_DIR}/libs/x`],
+      'posix',
+      stubLog(),
+      fsHandle,
+    );
+    const jsSuggest = jsSession(fsHandle, [`${WORK_DIR}/libs/x`]);
+    const suggestRequest = {
+      query: 'ts',
+      limit: 50,
+      follow_gitignore: true,
+      show_hidden: false,
+    };
+    const rgSuggested = await rgSuggest.suggest(suggestRequest);
+    const jsSuggested = await jsSuggest.suggest(suggestRequest);
+    expect(new Set(rgSuggested.items.map((i) => i.path))).toEqual(
+      new Set(jsSuggested.items.map((i) => i.path)),
+    );
+    expect(new Set(rgSuggested.items.map((i) => i.path))).toEqual(
+      new Set(['libs/x/b.ts', 'src/a.ts']),
+    );
+
+    const rgJson = [
+      ...['libs/x/b.ts', 'libs/y/c.ts', 'src/a.ts'].flatMap((p) => [
+        JSON.stringify({ type: 'begin', data: { path: { text: p } } }),
+        JSON.stringify({
+          type: 'match',
+          data: {
+            path: { text: p },
+            lines: { text: 'hello\n' },
+            line_number: 1,
+            submatches: [{ start: 0, end: 5 }],
+          },
+        }),
+        JSON.stringify({ type: 'end', data: { path: { text: p } } }),
+      ]),
+    ].join('\n');
+    const rgGrep = makeSession(
+      {},
+      (args) => {
+        if (args[0] === 'rg' && args[1] === '--version') return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
+        if (args[0] === 'rg' && args.includes('--json')) return { stdout: rgJson, exitCode: 0 };
+        return { stdout: '', exitCode: 0 };
+      },
+      [],
+      defaultGitStub(),
+      [],
+      undefined,
+      {},
+      [`${WORK_DIR}/libs/x`],
+      'posix',
+      stubLog(),
+      fsHandle,
+    );
+    const jsGrep = jsSession(fsHandle, [`${WORK_DIR}/libs/x`]);
+    const grepRequest = {
+      pattern: 'hello',
+      regex: false,
+      case_sensitive: true,
+      follow_gitignore: true,
+      max_files: 200,
+      max_matches_per_file: 50,
+      max_total_matches: 5000,
+      context_lines: 0,
+    };
+    const rgGrepped = await rgGrep.grep(grepRequest);
+    const jsGrepped = await jsGrep.grep(grepRequest);
+    expect(new Set(rgGrepped.files.map((f) => f.path))).toEqual(
+      new Set(jsGrepped.files.map((f) => f.path)),
+    );
+    expect(new Set(rgGrepped.files.map((f) => f.path))).toEqual(
+      new Set(['libs/x/b.ts', 'src/a.ts']),
+    );
+  });
+
+  it('A9: gitignore changes keep taking effect through the instance-level cache', async () => {
+    const fsHandle = fakeFs({
+      '.gitignore': 'vendor/\n',
+      '.kimi-code/ignore': 'dist/\n',
+      'vendor/v.ts': '',
+      'dist/d.ts': '',
+      'src/a.ts': '',
+    });
+    const fs = jsSession(fsHandle);
+    const first = await fs.search({ query: 'ts', limit: 50, follow_gitignore: true });
+    expect(first.items.map((i) => i.path)).toEqual(['src/a.ts']);
+    const withoutGitignore = await fs.search({ query: 'ts', limit: 50, follow_gitignore: false });
+    expect(withoutGitignore.items.map((i) => i.path)).toEqual(['src/a.ts', 'vendor/v.ts']);
+    fsHandle.setFile('.gitignore', '');
+    const cached = await fs.search({ query: 'ts', limit: 50, follow_gitignore: true });
+    expect(cached.items.map((i) => i.path)).toEqual(['src/a.ts']);
+    const fresh = jsSession(fsHandle);
+    const uncached = await fresh.search({ query: 'ts', limit: 50, follow_gitignore: true });
+    expect(uncached.items.map((i) => i.path)).toEqual(['src/a.ts', 'vendor/v.ts']);
+    fsHandle.setFile('.gitignore', 'src/\n');
+    const srcIgnored = jsSession(fsHandle);
+    const fourth = await srcIgnored.search({ query: 'ts', limit: 50, follow_gitignore: true });
+    expect(fourth.items.map((i) => i.path)).toEqual(['vendor/v.ts']);
+  });
+});
+
+describe('WorkspaceFsService project ignore (cross-path consistency)', () => {
+  const NESTED_ROOT = `${WORK_DIR}/libs/x`;
+  const EXPECTED_PATHS = ['libs/x/keep.ts', 'src/a.ts'];
+
+  function overlayFixture(): IHostFileSystem & FakeFsHandle {
+    return fakeFs({
+      '.gitignore': 'secret/\n',
+      '.kimi-code/ignore': 'libs/\n',
+      'libs/x/keep.ts': 'hello\n',
+      'libs/y/c.ts': 'hello\n',
+      'secret/s.ts': 'hello\n',
+      'src/a.ts': 'hello\n',
+      'tmp/t.ts': 'hello\n',
+    });
+  }
+
+  function overlaySession(
+    handler: RunHandler,
+    fsHandle: IHostFileSystem & FakeFsHandle,
+  ): IWorkspaceFsService {
+    return makeSession(
+      {},
+      handler,
+      [],
+      defaultGitStub(),
+      [],
+      undefined,
+      {},
+      [NESTED_ROOT],
+      'posix',
+      stubLog(),
+      fsHandle,
+    );
+  }
+
+  function rgGrepJsonHandler(paths: readonly string[]): RunHandler {
+    const records = paths.flatMap((p) => [
+      JSON.stringify({ type: 'begin', data: { path: { text: p } } }),
+      JSON.stringify({
+        type: 'match',
+        data: {
+          path: { text: p },
+          lines: { text: 'hello\n' },
+          line_number: 1,
+          submatches: [{ start: 0, end: 5 }],
+        },
+      }),
+      JSON.stringify({ type: 'end', data: { path: { text: p } } }),
+    ]);
+    return (args) => {
+      if (args[0] === 'rg' && args[1] === '--version') {
+        return { stdout: 'ripgrep 15.0.0', exitCode: 0 };
+      }
+      if (args[0] === 'rg' && args.includes('--json')) {
+        return { stdout: `${records.join('\n')}\n`, exitCode: 0 };
+      }
+      return { stdout: '', exitCode: 0 };
+    };
+  }
+
+  it('CP3: suggest returns the same visible set on the rg replay and JS walk for nested root + gitignore + exclude_globs', async () => {
+    const fsHandle = overlayFixture();
+    const rgPath = overlaySession(
+      rgLinesHandler(['libs/x/keep.ts', 'libs/y/c.ts', 'src/a.ts', 'tmp/t.ts']),
+      fsHandle,
+    );
+    const jsPath = overlaySession(rgMissingHandler, fsHandle);
+    const request = {
+      query: 'ts',
+      limit: 50,
+      follow_gitignore: true,
+      show_hidden: false,
+      exclude_globs: ['tmp/**'],
+    };
+    const rgResult = await rgPath.suggest(request);
+    const jsResult = await jsPath.suggest(request);
+    expect(new Set(rgResult.items.map((i) => i.path))).toEqual(
+      new Set(jsResult.items.map((i) => i.path)),
+    );
+    expect([...rgResult.items.map((i) => i.path)].toSorted()).toEqual(EXPECTED_PATHS);
+    expect([...jsResult.items.map((i) => i.path)].toSorted()).toEqual(EXPECTED_PATHS);
+  });
+
+  it('CP3: grep returns the same visible set on the rg replay and JS walk for nested root + gitignore + exclude_globs', async () => {
+    const fsHandle = overlayFixture();
+    const rgPath = overlaySession(rgGrepJsonHandler(['libs/x/keep.ts', 'src/a.ts']), fsHandle);
+    const jsPath = overlaySession(rgMissingHandler, fsHandle);
+    const request = {
+      pattern: 'hello',
+      regex: false,
+      case_sensitive: true,
+      follow_gitignore: true,
+      exclude_globs: ['tmp/**'],
+      max_files: 200,
+      max_matches_per_file: 50,
+      max_total_matches: 5000,
+      context_lines: 0,
+    };
+    const rgResult = await rgPath.grep(request);
+    const jsResult = await jsPath.grep(request);
+    expect(new Set(rgResult.files.map((f) => f.path))).toEqual(
+      new Set(jsResult.files.map((f) => f.path)),
+    );
+    expect([...rgResult.files.map((f) => f.path)].toSorted()).toEqual(EXPECTED_PATHS);
+    expect([...jsResult.files.map((f) => f.path)].toSorted()).toEqual(EXPECTED_PATHS);
+  });
+
+  it('CP3: search returns the same visible set with rg present or missing for nested root + gitignore + exclude_globs', async () => {
+    const fsHandle = overlayFixture();
+    const rgPresent = overlaySession(emptyHandler, fsHandle);
+    const rgMissing = overlaySession(rgMissingHandler, fsHandle);
+    const request = { query: 'ts', limit: 50, follow_gitignore: true, exclude_globs: ['tmp/**'] };
+    const present = await rgPresent.search(request);
+    const missing = await rgMissing.search(request);
+    expect(new Set(present.items.map((i) => i.path))).toEqual(
+      new Set(missing.items.map((i) => i.path)),
+    );
+    expect([...present.items.map((i) => i.path)].toSorted()).toEqual(EXPECTED_PATHS);
+    expect([...missing.items.map((i) => i.path)].toSorted()).toEqual(EXPECTED_PATHS);
   });
 });

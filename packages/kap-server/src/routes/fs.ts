@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 
 import {
   ErrorCodes,
+  ILogService,
   IRuntimeResolver,
   ISessionContext,
   ISessionWorkspaceContext,
@@ -239,6 +240,7 @@ function buildRuntimeFsScope(
       resolver,
       core.accessor.get(ITelemetryService),
       git,
+      core.accessor.get(ILogService),
       runtimeId,
     ),
     hostFs: lease.runtime.fs!,
@@ -395,8 +397,8 @@ export function registerFsRoutes(app: FsRouteHost, core: Scope): void {
             await handleReveal(runtimeFs.fs, req, reply);
             return;
         }
-      } catch (err) {
-        sendMappedError(reply, req, err);
+      } catch (error) {
+        sendMappedError(reply, req, error);
       } finally {
         runtimeFs?.lease.dispose();
       }
@@ -441,8 +443,8 @@ export function registerFsRoutes(app: FsRouteHost, core: Scope): void {
         }
         const data = await runtimeFs.fs.search(searchRequest);
         reply.send(okEnvelope(data, req.id));
-      } catch (err) {
-        sendMappedError(reply, req, err);
+      } catch (error) {
+        sendMappedError(reply, req, error);
       } finally {
         runtimeFs?.lease.dispose();
       }
@@ -486,8 +488,8 @@ export function registerFsRoutes(app: FsRouteHost, core: Scope): void {
         }
         const data = await runtimeFs.fs.suggest(suggestRequest);
         reply.send(okEnvelope(data, req.id));
-      } catch (err) {
-        sendMappedError(reply, req, err);
+      } catch (error) {
+        sendMappedError(reply, req, error);
       } finally {
         runtimeFs?.lease.dispose();
       }
@@ -550,15 +552,15 @@ export function registerFsRoutes(app: FsRouteHost, core: Scope): void {
         }
         const data = await runtimeFs.fs.suggest(suggestRequest);
         reply.send(okEnvelope(data, req.id));
-      } catch (err) {
-        if (err instanceof RuntimeError) {
-          const code = err.code === 'runtime.not_found'
+      } catch (error) {
+        if (error instanceof RuntimeError) {
+          const code = error.code === 'runtime.not_found'
             ? ErrorCode.RUNTIME_NOT_FOUND
             : ErrorCode.RUNTIME_UNAVAILABLE;
-          reply.send(errEnvelope(code, err.message, req.id));
+          reply.send(errEnvelope(code, error.message, req.id));
           return;
         }
-        sendMappedError(reply, req, err);
+        sendMappedError(reply, req, error);
       } finally {
         runtimeFs?.lease.dispose();
       }
@@ -618,9 +620,9 @@ export function registerFsRoutes(app: FsRouteHost, core: Scope): void {
       try {
         runtimeFs = acquireSessionFs(core, session_id, req.query.runtime_id ?? 'local', ['fs']);
         resolved = await runtimeFs.fs.resolveDownload(relPath);
-      } catch (err) {
+      } catch (error) {
         runtimeFs?.lease.dispose();
-        sendMappedError(reply, req, err);
+        sendMappedError(reply, req, error);
         return;
       }
 
@@ -855,15 +857,15 @@ async function handleOpenIn(fs: IWorkspaceFsService, sessionId: string, req: Req
         isDirectory: resolved.isDirectory,
       }),
     );
-  } catch (err) {
+  } catch (error) {
     requestLog(req)?.warn(
-      { session_id: sessionId, app_id: body.app_id, err },
+      { session_id: sessionId, app_id: body.app_id, error },
       'fs open-in launch failed',
     );
     reply.send(
       errEnvelope(
         ErrorCode.INTERNAL_ERROR,
-        `failed to open in ${body.app_id}: ${err instanceof Error ? err.message : String(err)}`,
+        `failed to open in ${body.app_id}: ${error instanceof Error ? error.message : String(error)}`,
         req.id,
       ),
     );
@@ -965,6 +967,6 @@ function buildValidationEnvelope(
 
 function sanitizeFilename(rel: string): string {
   const segs = rel.split('/');
-  const base = segs[segs.length - 1] ?? rel;
-  return base.replace(/"/g, '\\"');
+  const base = segs.at(-1) ?? rel;
+  return base.replaceAll(/"/g, '\\"');
 }
