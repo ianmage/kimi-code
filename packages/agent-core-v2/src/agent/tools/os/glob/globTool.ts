@@ -12,6 +12,8 @@ import type { IHostFileSystem } from '#/os/interface/hostFileSystem';
 import type { IHostProcessService } from '#/os/interface/hostProcess';
 import { IAgentRuntimeService, inspectAgentRuntime } from '#/agent/runtimeBinding/agentRuntime';
 import { unwrapErrorCause } from '#/_base/errors/errors';
+import { ILogService } from '#/_base/log/log';
+import { loadProjectIgnore, type ProjectIgnore } from '#/_base/utils/projectIgnore';
 import { RuntimeWorkspaceView } from '#/runtime/runtimeWorkspaceView';
 import { ISessionSkillCatalog } from '#/features/skill/session/skillCatalog';
 import { ISessionWorkspaceContext } from '#/session/workspaceContext/workspaceContext';
@@ -66,7 +68,8 @@ export class GlobTool implements IGlobTool {
     @IAgentRuntimeService private readonly runtime: IAgentRuntimeService,
     @ISessionWorkspaceContext private readonly workspaceCtx: ISessionWorkspaceContext,
     @ITelemetryService private readonly telemetry: ITelemetryService,
-    @ISessionSkillCatalog private readonly skillCatalog?: ISessionSkillCatalog,
+    @ILogService private readonly log: ILogService,
+    private readonly skillCatalog?: ISessionSkillCatalog,
   ) {}
 
   get description(): string {
@@ -90,6 +93,10 @@ export class GlobTool implements IGlobTool {
     });
     const env = { _serviceBrand: undefined, ...inspected.environment, ready: Promise.resolve() };
     const workspace = this.workspaceConfig(view);
+    const ignoreRoots = new RuntimeWorkspaceView(inspected, {
+      workDir: this.workspaceCtx.workDir,
+      additionalDirs: this.workspaceCtx.additionalDirs,
+    }).roots;
     let path: string | undefined;
     if (args.path !== undefined) {
       path = resolvePathAccessPath(args.path, {
@@ -134,6 +141,7 @@ export class GlobTool implements IGlobTool {
             args,
             signal,
             searchRoots,
+            ignoreRoots,
           );
         } finally {
           lease.dispose();
@@ -150,6 +158,7 @@ export class GlobTool implements IGlobTool {
     args: GlobInput,
     signal: AbortSignal,
     searchRoots: readonly string[],
+    ignoreRoots: readonly string[],
   ): Promise<ExecutableToolResult> {
     const searchRoot = searchRoots[0] ?? workspace.workspaceDir;
 
@@ -168,6 +177,13 @@ export class GlobTool implements IGlobTool {
     if (signal.aborted) {
       return { isError: true, output: 'Glob aborted' };
     }
+
+    const projectIgnore = await loadProjectIgnore({
+      roots: ignoreRoots,
+      pathClass: env.pathClass,
+      fs,
+      log: this.log,
+    });
 
     let rgPath: string;
     try {
@@ -229,9 +245,11 @@ export class GlobTool implements IGlobTool {
       resolve(searchRoot, p),
     );
 
+    const visiblePaths = filterHiddenPaths(rawPaths, projectIgnore);
+
     const kept: string[] = [];
     let filteredSensitive = 0;
-    for (const p of rawPaths) {
+    for (const p of visiblePaths) {
       if (isSensitiveFile(p)) {
         filteredSensitive++;
       } else {
@@ -409,6 +427,13 @@ export function splitCompletePaths(stdoutText: string, truncatedOutput: boolean)
     text = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : '';
   }
   return text.split('\n').filter((p) => p.length > 0);
+}
+
+function filterHiddenPaths(
+  paths: readonly string[],
+  projectIgnore: ProjectIgnore,
+): string[] {
+  return paths.filter((p) => !projectIgnore.hidden(p));
 }
 
 function relativizeIfUnder(candidate: string, base: string, pathClass: PathClass): string {

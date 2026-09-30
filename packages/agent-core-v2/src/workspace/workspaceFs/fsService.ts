@@ -46,6 +46,9 @@ import {
   guessMime,
 } from '#/_base/utils/fileMeta';
 import { ErrorCodes, Error2, isError2, unwrapErrorCause } from '#/errors';
+import { ILogService } from '#/_base/log/log';
+import { loadProjectIgnore, type ProjectIgnore } from '#/_base/utils/projectIgnore';
+import type { PathClass } from '#/_base/execEnv/environmentProbe';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import { IHostFileSystem, type HostDirEntry, type HostFileStat } from '#/os/interface/hostFileSystem';
 import type { RuntimePath } from '#/runtime/runtime';
@@ -101,6 +104,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
   private readonly workDir: string;
   private readonly workspaceId: string;
   private readonly path: RuntimePath;
+  private readonly pathClass: PathClass;
 
   constructor(
     @IWorkspaceContext workspace: IWorkspaceContext,
@@ -109,10 +113,13 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     @IRuntimeResolver private readonly resolver: IRuntimeResolver,
     @ITelemetryService private readonly telemetry: ITelemetryService,
     @IWorkspaceGitService private readonly git: IWorkspaceGitService,
+    @ILogService private readonly log: ILogService,
     private readonly runtimeId = 'local',
   ) {
     this.workspaceId = workspace.workspaceId;
-    this.path = resolver.inspect({ workspaceId: workspace.workspaceId, runtimeId }).path;
+    const runtime = resolver.inspect({ workspaceId: workspace.workspaceId, runtimeId });
+    this.path = runtime.path;
+    this.pathClass = runtime.environment.pathClass;
     this.workDir = this.path.resolve(workspace.cwd);
   }
 
@@ -136,14 +143,21 @@ export class WorkspaceFsService implements IWorkspaceFsService {
   }
 
   async list(req: FsListRequest): Promise<FsListResponse> {
+    return this.listWithIgnore(req, await this.loadIgnoreSnapshot());
+  }
+
+  private async listWithIgnore(
+    req: FsListRequest,
+    projectIgnore: ProjectIgnore,
+  ): Promise<FsListResponse> {
     const abs = await this.resolveWithin(req.path);
     const rel = this.toRel(abs);
 
     let topStat: HostFileStat;
     try {
       topStat = await this.hostFs.stat(abs);
-    } catch (err) {
-      throw mapFsError(err, req.path);
+    } catch (error) {
+      throw mapFsError(error, req.path);
     }
     if (!topStat.isDirectory) {
       throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `path not found: ${req.path}`, {
@@ -168,32 +182,36 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     interface Child {
       readonly name: string;
       readonly relPath: string;
+      readonly abs: string;
       readonly stat: HostFileStat;
     }
 
     while (queue.length > 0) {
       const entry = queue.shift()!;
-      let names: readonly string[];
+      let entries: readonly HostDirEntry[];
       try {
-        names = (await this.hostFs.readdir(this.absOf(entry.relPath))).map((e) => e.name);
-      } catch (err) {
+        entries = await this.hostFs.readdir(this.absOf(entry.relPath));
+      } catch (error) {
         if (entry.relPath === (rel === '.' ? '' : rel)) {
-          throw mapFsError(err, req.path);
+          throw mapFsError(error, req.path);
         }
         continue;
       }
 
       const visible: Child[] = [];
-      for (const name of names) {
+      for (const childEntry of entries) {
+        const name = childEntry.name;
         if (!req.show_hidden && isHidden(name)) continue;
         const childRel = entry.relPath === '' ? name : `${entry.relPath}/${name}`;
         if (gitignore && (gitignore.ignores(childRel) || gitignore.ignores(`${childRel}/`))) {
           continue;
         }
         if (req.exclude_globs && matchesAnyGlob(childRel, req.exclude_globs)) continue;
-        const st = await this.hostFs.lstat(this.absOf(childRel)).catch(() => undefined);
+        const childAbs = this.absOf(childRel);
+        if (projectIgnore.hidden(childAbs, childEntry.isDirectory)) continue;
+        const st = await this.hostFs.lstat(childAbs).catch(() => undefined);
         if (st === undefined) continue;
-        visible.push({ name, relPath: childRel, stat: st });
+        visible.push({ name, relPath: childRel, abs: childAbs, stat: st });
       }
 
       sortChildren(visible, req.sort);
@@ -210,7 +228,11 @@ export class WorkspaceFsService implements IWorkspaceFsService {
           items.push(fsEntry);
         }
         bucket.push(fsEntry);
-        if (child.stat.isDirectory && entry.depthRemaining > 1) {
+        if (
+          child.stat.isDirectory &&
+          entry.depthRemaining > 1 &&
+          !projectIgnore.canPrune(child.abs)
+        ) {
           queue.push({ relPath: child.relPath, depthRemaining: entry.depthRemaining - 1 });
         }
       }
@@ -234,8 +256,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     let st: HostFileStat;
     try {
       st = await this.hostFs.stat(abs);
-    } catch (err) {
-      throw mapFsError(err, req.path);
+    } catch (error) {
+      throw mapFsError(error, req.path);
     }
     if (st.isDirectory) {
       throw new Error2(ErrorCodes.FS_IS_DIRECTORY, `path is a directory: ${req.path}`, {
@@ -314,6 +336,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
   }
 
   async listMany(req: FsListManyRequest): Promise<FsListManyResponse> {
+    const projectIgnore = await this.loadIgnoreSnapshot();
     const results: Record<string, FsEntry[]> = {};
     const partialErrors: Record<string, { code: number; msg: string }> = {};
     const truncatedPaths: string[] = [];
@@ -321,21 +344,24 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     await Promise.all(
       req.paths.map(async (p) => {
         try {
-          const sub = await this.list({
-            path: p,
-            depth: req.depth,
-            limit: req.limit,
-            show_hidden: req.show_hidden,
-            follow_gitignore: req.follow_gitignore,
-            exclude_globs: req.exclude_globs,
-            sort: req.sort,
-            include_git_status: req.include_git_status,
-          });
+          const sub = await this.listWithIgnore(
+            {
+              path: p,
+              depth: req.depth,
+              limit: req.limit,
+              show_hidden: req.show_hidden,
+              follow_gitignore: req.follow_gitignore,
+              exclude_globs: req.exclude_globs,
+              sort: req.sort,
+              include_git_status: req.include_git_status,
+            },
+            projectIgnore,
+          );
           results[p] = sub.items;
           if (sub.truncated) truncatedPaths.push(p);
-        } catch (err) {
-          if (err instanceof Error2 && err.code === ErrorCodes.FS_PATH_ESCAPES) throw err;
-          partialErrors[p] = toWireError(err);
+        } catch (error) {
+          if (error instanceof Error2 && error.code === ErrorCodes.FS_PATH_ESCAPES) throw error;
+          partialErrors[p] = toWireError(error);
         }
       }),
     );
@@ -352,8 +378,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     let st: HostFileStat;
     try {
       st = await this.hostFs.lstat(abs);
-    } catch (err) {
-      throw mapFsError(err, req.path);
+    } catch (error) {
+      throw mapFsError(error, req.path);
     }
     const name = rel === '.' ? this.path.basename(this.workDir) : this.path.basename(abs);
     return buildFsEntry(rel, name, st, true);
@@ -387,8 +413,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     const rel = this.toRel(abs);
     try {
       await this.hostFs.mkdir(abs, { recursive: req.recursive });
-    } catch (err) {
-      const code = errnoCode(err);
+    } catch (error) {
+      const code = errnoCode(error);
       if (code === 'EEXIST') {
         throw new Error2(ErrorCodes.FS_ALREADY_EXISTS, `path already exists: ${req.path}`, {
           details: { path: req.path },
@@ -399,7 +425,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
           details: { path: req.path },
         });
       }
-      throw err;
+      throw error;
     }
     const st = await this.hostFs.lstat(abs);
     return buildFsEntry(rel, this.path.basename(abs), st, false);
@@ -411,8 +437,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     let st: HostFileStat;
     try {
       st = await this.hostFs.lstat(abs);
-    } catch (err) {
-      throw mapFsError(err, relPath);
+    } catch (error) {
+      throw mapFsError(error, relPath);
     }
     return { absolute: abs, relative: rel, isDirectory: st.isDirectory };
   }
@@ -423,8 +449,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     let st: HostFileStat;
     try {
       st = await this.hostFs.stat(abs);
-    } catch (err) {
-      throw mapFsError(err, relPath);
+    } catch (error) {
+      throw mapFsError(error, relPath);
     }
     if (st.isDirectory) {
       throw new Error2(ErrorCodes.FS_IS_DIRECTORY, `path is a directory: ${relPath}`, {
@@ -447,17 +473,21 @@ export class WorkspaceFsService implements IWorkspaceFsService {
   }
 
   async search(req: FsSearchRequest): Promise<FsSearchResponse> {
+    const projectIgnore = await this.loadIgnoreSnapshot();
     if (req.query === '') {
-      const listed = await this.list({
-        path: '.',
-        depth: 1,
-        limit: req.limit,
-        show_hidden: false,
-        follow_gitignore: req.follow_gitignore,
-        exclude_globs: req.exclude_globs,
-        sort: 'type_first',
-        include_git_status: false,
-      });
+      const listed = await this.listWithIgnore(
+        {
+          path: '.',
+          depth: 1,
+          limit: req.limit,
+          show_hidden: false,
+          follow_gitignore: req.follow_gitignore,
+          exclude_globs: req.exclude_globs,
+          sort: 'type_first',
+          include_git_status: false,
+        },
+        projectIgnore,
+      );
       const items = listed.items
         .filter(
           (entry) =>
@@ -477,7 +507,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     const candidates: FsSearchHit[] = [];
     const queryLower = req.query.toLowerCase();
 
-    await this.walk(this.workDir, '', matcher, async (relPath, name, kind) => {
+    await this.walk(this.workDir, '', matcher, projectIgnore, async (relPath, name, kind) => {
       const score = computeFuzzyScore(name, queryLower);
       if (score <= 0) return;
       if (req.include_globs && !matchesAnyGlob(relPath, req.include_globs)) {
@@ -506,9 +536,10 @@ export class WorkspaceFsService implements IWorkspaceFsService {
   }
 
   async suggest(req: FsSuggestRequest): Promise<FsSuggestResponse> {
+    const projectIgnore = await this.loadIgnoreSnapshot();
     const roots = await this.suggestRoots();
     if (req.query === '') {
-      return this.suggestTopLevel(req, roots);
+      return this.suggestTopLevel(req, roots, projectIgnore);
     }
 
     const queryLower = req.query.toLowerCase();
@@ -540,15 +571,15 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       }
       if (resolution !== null) {
         try {
-          return await this.suggestWithRg(query, cap, controller.signal, resolution.path, roots);
-        } catch (err) {
-          if (controller.signal.aborted) throw err;
+          return await this.suggestWithRg(query, cap, controller.signal, resolution.path, roots, projectIgnore);
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
           this.telemetry.track2('fs_suggest_node_fallback', { reason: 'rg_error' });
-          return await this.suggestWithNode(query, cap, controller.signal, roots);
+          return await this.suggestWithNode(query, cap, controller.signal, roots, projectIgnore);
         }
       }
       this.telemetry.track2('fs_suggest_node_fallback', { reason: 'rg_missing' });
-      return await this.suggestWithNode(query, cap, controller.signal, roots);
+      return await this.suggestWithNode(query, cap, controller.signal, roots, projectIgnore);
     } finally {
       clearTimeout(timer);
     }
@@ -590,6 +621,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
   private async suggestTopLevel(
     req: FsSuggestRequest,
     roots: readonly SuggestRoot[],
+    projectIgnore: ProjectIgnore,
   ): Promise<FsSuggestResponse> {
     interface TopEntry {
       readonly path: string;
@@ -603,8 +635,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       let entries: readonly HostDirEntry[];
       try {
         entries = await this.hostFs.readdir(root.dir);
-      } catch (err) {
-        throw mapFsError(err, root.dir);
+      } catch (error) {
+        throw mapFsError(error, root.dir);
       }
       const visible: { name: string; kind: TopEntry['kind'] }[] = [];
       for (const entry of entries) {
@@ -619,6 +651,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
           : entry.isDirectory
             ? 'directory'
             : 'file';
+        if (projectIgnore.hidden(this.path.join(root.dir, name), kind === 'directory')) continue;
         visible.push({ name, kind });
       }
       visible.sort((a, b) => {
@@ -659,6 +692,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     signal: AbortSignal,
     rgBinary: string,
     roots: readonly SuggestRoot[],
+    projectIgnore: ProjectIgnore,
   ): Promise<FsSuggestResponse> {
     const args = ['--files'];
     if (query.followGitignore) {
@@ -699,6 +733,9 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       return { root, prefix: dir.endsWith('/') ? dir : `${dir}/` };
     });
 
+    const absOfRel = (root: SuggestRoot, rel: string): string =>
+      this.path.join(root.dir, ...rel.split('/'));
+
     const matchRoot = (line: string): { root: SuggestRoot; rel: string } | undefined => {
       let best: { root: SuggestRoot; prefix: string } | undefined;
       for (const matcher of rootMatchers) {
@@ -727,7 +764,9 @@ export class WorkspaceFsService implements IWorkspaceFsService {
         if (seenPaths.has(pathKey)) return;
         seenPaths.add(pathKey);
       }
-      const file = evaluateSuggestCandidate(rel, 'file', query);
+      const file = projectIgnore.hidden(absOfRel(root, rel))
+        ? null
+        : evaluateSuggestCandidate(rel, 'file', query);
       if (file !== null) {
         matched += 1;
         top.push(this.displayCandidate(root, file));
@@ -735,16 +774,15 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       let slash = rel.lastIndexOf('/');
       while (slash > 0) {
         const dir = rel.slice(0, slash);
-        const dirKey = multi ? `${root.real}/${dir}` : dir;
-        if (!seenDirs.has(dirKey)) {
-          seenDirs.add(dirKey);
-          const candidate = evaluateSuggestCandidate(dir, 'directory', query);
-          if (candidate !== null) {
-            matched += 1;
-            top.push(this.displayCandidate(root, candidate));
-          }
-        }
         slash = rel.lastIndexOf('/', slash - 1);
+        const dirKey = multi ? `${root.real}/${dir}` : dir;
+        if (seenDirs.has(dirKey)) continue;
+        seenDirs.add(dirKey);
+        if (projectIgnore.hidden(absOfRel(root, dir), true)) continue;
+        const candidate = evaluateSuggestCandidate(dir, 'directory', query);
+        if (candidate === null) continue;
+        matched += 1;
+        top.push(this.displayCandidate(root, candidate));
       }
     };
 
@@ -802,6 +840,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     cap: number,
     signal: AbortSignal,
     roots: readonly SuggestRoot[],
+    projectIgnore: ProjectIgnore,
   ): Promise<FsSuggestResponse> {
     const multi = roots.length > 1;
     const top = new SuggestTopHeap(cap);
@@ -810,7 +849,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     try {
       for (const root of roots) {
         const matcher = query.followGitignore ? await this.matcherFor(root.dir) : undefined;
-        await this.walk(root.dir, '', matcher, async (relPath, _name, kind) => {
+        await this.walk(root.dir, '', matcher, projectIgnore, async (relPath, _name, kind) => {
           if (signal.aborted) throw SUGGEST_WALK_ABORTED;
           if (multi) {
             const pathKey = `${root.real}/${relPath}`;
@@ -823,8 +862,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
           top.push(this.displayCandidate(root, candidate));
         });
       }
-    } catch (err) {
-      if (err !== SUGGEST_WALK_ABORTED) throw err;
+    } catch (error) {
+      if (error !== SUGGEST_WALK_ABORTED) throw error;
     }
     const items = top.drain().map((candidate) => ({
       path: candidate.path,
@@ -842,12 +881,13 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     const timer = setTimeout(() => controller.abort(), GREP_TIMEOUT_MS);
     timer.unref?.();
     try {
+      const projectIgnore = await this.loadIgnoreSnapshot();
       const resolution = await this.resolveRg();
       if (resolution !== null) {
-        return await this.grepWithRg(req, controller.signal, startedAt, resolution.path);
+        return await this.grepWithRg(req, controller.signal, startedAt, resolution.path, projectIgnore);
       }
       this.telemetry.track2('fs_grep_node_fallback', { reason: 'rg_missing' });
-      return await this.grepWithNode(req, controller.signal, startedAt);
+      return await this.grepWithNode(req, controller.signal, startedAt, projectIgnore);
     } finally {
       clearTimeout(timer);
     }
@@ -874,7 +914,8 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     req: FsGrepRequest,
     signal: AbortSignal,
     startedAt: number,
-    rgPath: string,
+    rgBinary: string,
+    projectIgnore: ProjectIgnore,
   ): Promise<FsGrepResponse> {
     const args = ['--json'];
     if (req.context_lines > 0) {
@@ -898,9 +939,11 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     args.push('.');
 
     const lease = this.resolver.acquire({ workspaceId: this.workspaceId, runtimeId: this.runtimeId }, ['process']);
-    const proc = await lease.runtime.process!.spawn(rgPath, args, { cwd: this.workDir });
+    const proc = await lease.runtime.process!.spawn(rgBinary, args, { cwd: this.workDir });
 
-    const acc = new RgJsonAccumulator(req);
+    const acc = new RgJsonAccumulator(req, (p) =>
+      projectIgnore.hidden(this.path.resolve(this.workDir, p)),
+    );
     let killed = false;
     const kill = (): void => {
       if (killed) return;
@@ -952,6 +995,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     req: FsGrepRequest,
     signal: AbortSignal,
     startedAt: number,
+    projectIgnore: ProjectIgnore,
   ): Promise<FsGrepResponse> {
     const matcher = req.follow_gitignore ? await this.matcher() : undefined;
     const re = compileGrepPattern(req);
@@ -962,7 +1006,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     let truncated = false;
 
     const filePaths: string[] = [];
-    await this.walk(this.workDir, '', matcher, async (rel, _name, kind) => {
+    await this.walk(this.workDir, '', matcher, projectIgnore, async (rel, _name, kind) => {
       if (kind !== 'file') return;
       if (req.include_globs && !matchesAnyGlob(rel, req.include_globs)) return;
       if (req.exclude_globs && matchesAnyGlob(rel, req.exclude_globs)) return;
@@ -1024,6 +1068,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     baseAbs: string,
     rootRel: string,
     matcher: Ignore | undefined,
+    projectIgnore: ProjectIgnore,
     visit: (
       relPath: string,
       name: string,
@@ -1042,6 +1087,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       const { name } = entry;
       if (name === '.git') continue;
       const childRel = rootRel === '' ? name : `${rootRel}/${name}`;
+      const childAbs = this.path.join(baseAbs, childRel);
       const isDir = entry.isDirectory && entry.isSymbolicLink !== true;
       if (matcher) {
         const probe = isDir ? `${childRel}/` : childRel;
@@ -1052,9 +1098,11 @@ export class WorkspaceFsService implements IWorkspaceFsService {
         : isDir
           ? 'directory'
           : 'file';
-      await visit(childRel, name, kind);
-      if (isDir) {
-        await this.walk(baseAbs, childRel, matcher, visit, depth + 1);
+      if (!projectIgnore.hidden(childAbs, isDir)) {
+        await visit(childRel, name, kind);
+      }
+      if (isDir && !projectIgnore.canPrune(childAbs)) {
+        await this.walk(baseAbs, childRel, matcher, projectIgnore, visit, depth + 1);
       }
     }
   }
@@ -1093,6 +1141,16 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     return this.rgResolution;
   }
 
+  private async loadIgnoreSnapshot(): Promise<ProjectIgnore> {
+    const pairs = await this.realRootPairs();
+    return loadProjectIgnore({
+      roots: pairs.map((pair) => pair.dir),
+      pathClass: this.pathClass,
+      fs: this.hostFs,
+      log: this.log,
+    });
+  }
+
   private async realRootPairs(): Promise<readonly { dir: string; real: string }[]> {
     const dirs = [this.workDir, ...this.workspaceDirs.additionalDirs.map((d) => this.path.resolve(d))];
     const key = dirs.join('\n');
@@ -1119,9 +1177,9 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     for (let i = 0; i < 256; i++) {
       try {
         const real = await this.hostFs.realpath(current);
-        return tail.length === 0 ? real : this.path.join(real, ...tail.reverse());
-      } catch (err) {
-        if (!isMissingPathError(err)) throw err;
+        return tail.length === 0 ? real : this.path.join(real, ...tail.toReversed());
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
         const parent = this.path.dirname(current);
         if (parent === current) return abs;
         tail.push(this.path.basename(current));
@@ -1185,7 +1243,10 @@ class RgJsonAccumulator {
   private filesScanned = 0;
   private truncated = false;
 
-  constructor(private readonly req: FsGrepRequest) {}
+  constructor(
+    private readonly req: FsGrepRequest,
+    private readonly isHidden: (rgPath: string) => boolean,
+  ) {}
 
   get capped(): boolean {
     return (
@@ -1204,6 +1265,7 @@ class RgJsonAccumulator {
     if (t === 'begin') {
       const p = rgPath(rec.data?.path);
       if (p === undefined) return;
+      if (this.isHidden(p)) return;
       if (this.filesScanned >= this.req.max_files) {
         this.truncated = true;
         return;
@@ -1213,6 +1275,7 @@ class RgJsonAccumulator {
     } else if (t === 'context') {
       const p = rgPath(rec.data?.path);
       if (p === undefined) return;
+      if (this.isHidden(p)) return;
       const buf = this.fileBuf.get(p);
       if (buf === undefined) return;
       buf.pending.push(stripTrailingNewline(rgText(rec.data?.lines)));
@@ -1222,6 +1285,7 @@ class RgJsonAccumulator {
     } else if (t === 'match') {
       const p = rgPath(rec.data?.path);
       if (p === undefined) return;
+      if (this.isHidden(p)) return;
       const buf = this.fileBuf.get(p);
       if (buf === undefined) return;
       if (this.totalMatches >= this.req.max_total_matches) {
@@ -1241,6 +1305,7 @@ class RgJsonAccumulator {
     } else if (t === 'end') {
       const p = rgPath(rec.data?.path);
       if (p === undefined) return;
+      if (this.isHidden(p)) return;
       this.finalize(p);
     }
   }
@@ -1268,7 +1333,7 @@ class RgJsonAccumulator {
     const buf = this.fileBuf.get(p);
     if (buf === undefined) return;
     if (buf.matches.length > 0 && buf.pending.length > 0) {
-      const last = buf.matches[buf.matches.length - 1]!;
+      const last = buf.matches.at(-1)!;
       last.after = buf.pending.slice(0, this.req.context_lines);
     }
     if (buf.matches.length > 0) {

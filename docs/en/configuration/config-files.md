@@ -607,9 +607,9 @@ Changes apply on the next start, or immediately with `/reload-tui` (which reload
 
 ## Project-local configuration
 
-In addition to the user-level files under `~/.kimi-code`, Kimi Code reads a project-local configuration file at `<project-root>/.kimi-code/local.toml`. It holds settings that are specific to one project checkout and typically should not be shared with teammates.
+In addition to the user-level files under `~/.kimi-code`, Kimi Code reads two project-local files under each project's `.kimi-code/` directory: `local.toml`, which holds settings specific to one project checkout and typically should not be shared with teammates, and `ignore`, which trims noise out of search results and is meant to be committed and shared with the team.
 
-The file is created automatically when you add an extra workspace directory with [`/add-dir`](../reference/slash-commands.md) and choose to remember it for the project. You rarely need to edit it by hand.
+The `local.toml` file is created automatically when you add an extra workspace directory with [`/add-dir`](../reference/slash-commands.md) and choose to remember it for the project. You rarely need to edit it by hand.
 
 ### `[workspace]`
 
@@ -625,6 +625,25 @@ additional_dir = ["/absolute/path/to/shared"]
 ```
 
 Because directories are stored as absolute paths, which are specific to your machine, we recommend adding `.kimi-code/local.toml` to your project's `.gitignore` so it is not committed.
+
+### `.kimi-code/ignore`
+
+The `ignore` file trims noise out of search results: files it matches disappear from the `Grep` and `Glob` tools and from the [web UI](../guides/web.md) file tree, file search, `@` completion, and content search. The goal is a cleaner result list, not faster searches.
+
+The file lives at `<root>/.kimi-code/ignore`, where `<root>` is each workspace root: the project root plus every [`additional_dir`](#workspace). Each root gets its own file, and a file only applies to the subtree of the root it lives in — unlike `local.toml`, the rules travel with the repository and are not gated by workspace trust.
+
+The rules use [gitignore syntax](https://git-scm.com/docs/gitignore). Patterns are anchored to the root the file lives in, and a `!` re-include rule only takes effect within that same file. Kimi Code never reads the repository's `.gitignore` for this feature; the two are independent.
+
+```text
+# <root>/.kimi-code/ignore
+node_modules/
+dist/
+vendor/
+*.min.js
+!vendor/keep-this.js
+```
+
+The filtering always applies: the `include_ignored` option of `Grep` and `Glob`, and turning off `.gitignore` following in the web UI, cannot bring the files back. It does not restrict direct access by path — the `Read`, `Write`, `Edit`, and `Bash` tools keep working on ignored files. Edits to the rules take effect on the next request, with no restart needed.
 
 ## Next steps
 

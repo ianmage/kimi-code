@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { join } from 'pathe';
 import { Readable, type Writable } from 'node:stream';
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -26,6 +27,7 @@ import { HostFileSystem } from '#/os/backends/node-local/hostFsService';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
 import { probeHostEnvironmentFromNode } from '#/_base/execEnv/environmentProbe';
 import type { ITelemetryService, TelemetryProperties } from '#/app/telemetry/telemetry';
+import { stubLog } from '../../../../_base/log/stubs';
 import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '#/tool/toolContract';
 
 vi.mock('#/os/backends/node-local/tools/rgLocator', () => ({
@@ -48,11 +50,38 @@ function fileStat(): HostFileStat {
   return { isFile: true, isDirectory: false, size: 0 };
 }
 
-function createTestFs(opts: { stat?: ReturnType<typeof vi.fn>; readdir?: ReturnType<typeof vi.fn> } = {}) {
+function enoentError(path: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`ENOENT: no such file or directory, open '${path}'`), {
+    code: 'ENOENT',
+  });
+}
+
+function ruleReadText(
+  rules: Record<string, string>,
+  calls?: Map<string, number>,
+): ReturnType<typeof vi.fn> {
+  return vi.fn(async (path: string): Promise<string> => {
+    if (calls !== undefined) calls.set(path, (calls.get(path) ?? 0) + 1);
+    const content = rules[path];
+    if (content === undefined) throw enoentError(path);
+    return content;
+  });
+}
+
+function createTestFs(
+  opts: {
+    stat?: ReturnType<typeof vi.fn>;
+    readdir?: ReturnType<typeof vi.fn>;
+    readText?: ReturnType<typeof vi.fn>;
+  } = {},
+) {
   const stat = opts.stat ?? vi.fn(async (): Promise<HostFileStat> => dirStat());
   const readdir = opts.readdir ?? vi.fn(async (): Promise<readonly string[]> => []);
-  const fs = { stat, readdir } as unknown as IHostFileSystem;
-  return { fs, stat, readdir };
+  const readText = opts.readText ?? vi.fn(async (path: string): Promise<string> => {
+    throw enoentError(path);
+  });
+  const fs = { stat, readdir, readText } as unknown as IHostFileSystem;
+  return { fs, stat, readdir, readText };
 }
 
 function fakeProcess(stdout: string, stderr = '', exitCode = 0): IHostProcess {
@@ -224,17 +253,19 @@ function makeTool(
     exec?: ReturnType<typeof vi.fn>;
     stat?: ReturnType<typeof vi.fn>;
     readdir?: ReturnType<typeof vi.fn>;
+    readText?: ReturnType<typeof vi.fn>;
     telemetry?: ITelemetryService;
   } = {},
 ): { tool: GlobTool; exec: ReturnType<typeof vi.fn>; withCwd: ReturnType<typeof withCwdOf> } {
   const exec = opts.exec ?? execReturning('');
-  const { fs } = createTestFs({ stat: opts.stat, readdir: opts.readdir });
+  const { fs } = createTestFs({ stat: opts.stat, readdir: opts.readdir, readText: opts.readText });
   const processService = createTestProcessService(exec);
   const env = createTestEnv({ home: opts.home, pathClass: opts.pathClass });
   const tool = new GlobTool(
     createRuntime(fs, env, processService),
     workspaceConfig,
     opts.telemetry ?? noopTelemetryService,
+    stubLog(),
   );
   return { tool, exec, withCwd: withCwdOf(exec) };
 }
@@ -873,6 +904,167 @@ describe('GlobTool', () => {
     expect(execArgs(exec).at(-1)).toBe('.');
   });
 
+  describe('project ignore filtering', () => {
+    const wsRules = () => ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' });
+
+    it('counts only visible items in the "Showing matches" pagination total', async () => {
+      const stdout =
+        [
+          '/workspace/vendor/a.ts',
+          '/workspace/src/a.ts',
+          '/workspace/vendor/b.ts',
+          '/workspace/src/b.ts',
+          '/workspace/src/c.ts',
+        ].join('\n') + '\n';
+      const { tool } = makeTool(workspace, { exec: execReturning(stdout), readText: wsRules() });
+
+      const result = await execute(tool, GlobInputSchema.parse({ pattern: '*.ts', head_limit: 2 }));
+
+      const text = toolContentString(result);
+      expect(text.split('\n').filter((line) => line.endsWith('.ts'))).toEqual([
+        'src/a.ts',
+        'src/b.ts',
+      ]);
+      expect(text).toContain('Showing matches 1–2 of 3.');
+    });
+
+    it('reports "No more matches" totals from visible items only', async () => {
+      const stdout = '/workspace/vendor/a.ts\n/workspace/src/a.ts\n/workspace/src/b.ts\n';
+      const { tool } = makeTool(workspace, { exec: execReturning(stdout), readText: wsRules() });
+
+      const result = await execute(tool, GlobInputSchema.parse({ pattern: '*.ts', offset: 2 }));
+
+      expect(toolContentString(result)).toBe(
+        'No more matches at offset=2 in the current result set (2 matches).',
+      );
+    });
+
+    it('reports "Found N matches" from visible items only', async () => {
+      const stdout =
+        ['/workspace/src/a.ts', '/workspace/vendor/b.ts', '/workspace/src/b.ts'].join('\n') + '\n';
+      const { tool } = makeTool(workspace, { exec: execReturning(stdout), readText: wsRules() });
+
+      const result = await execute(tool, GlobInputSchema.parse({ pattern: '*.ts', head_limit: 2 }));
+
+      expect(toolContentString(result)).toBe(['src/a.ts', 'src/b.ts', 'Found 2 matches'].join('\n'));
+    });
+
+    it('excludes hidden items from the sensitive-file count', async () => {
+      const stdout = '/workspace/vendor/.env\n/workspace/src/a.ts\n';
+      const { tool } = makeTool(workspace, { exec: execReturning(stdout), readText: wsRules() });
+
+      const result = await execute(tool, { pattern: '**' });
+
+      const text = toolContentString(result);
+      expect(text).toBe('src/a.ts');
+      expect(text).not.toContain('Filtered');
+      expect(text).not.toContain('vendor');
+    });
+
+    it('still counts visible sensitive files separately from hidden items', async () => {
+      const stdout = '/workspace/vendor/.env\n/workspace/src/.env\n/workspace/src/a.ts\n';
+      const { tool } = makeTool(workspace, { exec: execReturning(stdout), readText: wsRules() });
+
+      const result = await execute(tool, { pattern: '**' });
+
+      const text = toolContentString(result);
+      expect(text).toContain('src/a.ts');
+      expect(text).toContain('Filtered 1 sensitive file');
+    });
+
+    it('reads each root rule file exactly once per execute', async () => {
+      const stdout = '/workspace/src/a.ts\n/workspace/nested/e.ts\n/extra/x.ts\n';
+      const readText = ruleReadText(
+        {
+          '/workspace/.kimi-code/ignore': 'vendor/\n',
+          '/extra/.kimi-code/ignore': 'secret/\n',
+        },
+        new Map<string, number>(),
+      );
+      const calls = () => readText.mock.calls as unknown as ReadonlyArray<readonly [string]>;
+      const nestedWorkspace = stubWorkspaceContext('/workspace', ['/workspace/nested', '/extra']);
+      const { tool } = makeTool(nestedWorkspace, { exec: execReturning(stdout), readText });
+
+      await execute(tool, { pattern: '*.ts' });
+
+      expect(readText).toHaveBeenCalledTimes(3);
+      expect(calls().map((call) => call[0])).toEqual([
+        '/workspace/.kimi-code/ignore',
+        '/workspace/nested/.kimi-code/ignore',
+        '/extra/.kimi-code/ignore',
+      ]);
+
+      await execute(tool, { pattern: '*.ts' });
+
+      expect(readText).toHaveBeenCalledTimes(6);
+    });
+
+    it('keeps the nested-root subtree visible under a main-root libs/ rule', async () => {
+      const stdout = '/workspace/libs/x/b.ts\n/workspace/libs/y/c.ts\n';
+      const nestedWorkspace = stubWorkspaceContext('/workspace', ['/workspace/libs/x']);
+      const { tool } = makeTool(nestedWorkspace, {
+        exec: execReturning(stdout),
+        readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'libs/\n' }),
+      });
+
+      const result = await execute(tool, GlobInputSchema.parse({ pattern: '**/*.ts' }));
+
+      expect(toolContentString(result)).toBe('libs/x/b.ts');
+    });
+
+    it('keeps rg args identical with and without rule files', async () => {
+      const stdout = '/workspace/vendor/a.ts\n/workspace/src/a.ts\n';
+      const withRulesExec = execReturning(stdout);
+      const withoutRulesExec = execReturning(stdout);
+      const withRules = makeTool(workspace, { exec: withRulesExec, readText: wsRules() });
+      const withoutRules = makeTool(workspace, { exec: withoutRulesExec });
+
+      const filtered = await execute(withRules.tool, { pattern: '*.ts', include_ignored: true });
+      await execute(withoutRules.tool, { pattern: '*.ts', include_ignored: true });
+
+      expect(toolContentString(filtered)).toBe('src/a.ts');
+      expect(withRulesExec.mock.calls).toEqual(withoutRulesExec.mock.calls);
+    });
+
+    it('A1: output with blocked items is verbatim identical to the no-rule baseline', async () => {
+      const stdout = '/workspace/vendor/v.ts\n/workspace/src/a.ts\n';
+      const filtered = makeTool(workspace, { exec: execReturning(stdout), readText: wsRules() });
+      const baseline = makeTool(workspace, { exec: execReturning('/workspace/src/a.ts\n') });
+
+      const filteredText = toolContentString(await execute(filtered.tool, { pattern: '*.ts' }));
+      const baselineText = toolContentString(await execute(baseline.tool, { pattern: '*.ts' }));
+
+      expect(filteredText).toBe(baselineText);
+      expect(filteredText).not.toContain('vendor');
+      expect(filteredText).not.toContain('Filtered');
+      expect(filteredText).not.toContain('ignore');
+    });
+
+    it('A2: fully blocked output is exactly "No matches found"', async () => {
+      const { tool } = makeTool(workspace, {
+        exec: execReturning('/workspace/vendor/v.ts\n'),
+        readText: wsRules(),
+      });
+
+      const result = await execute(tool, { pattern: '*.ts' });
+
+      expect(result.isError).toBeFalsy();
+      expect(toolContentString(result)).toBe('No matches found');
+    });
+
+    it('A5: blocked items are not counted in the sensitive-file filter count', async () => {
+      const stdout = '/workspace/vendor/.env\n/workspace/src/.env\n/workspace/src/a.ts\n';
+      const { tool } = makeTool(workspace, { exec: execReturning(stdout), readText: wsRules() });
+
+      const result = await execute(tool, { pattern: '**' });
+
+      const text = toolContentString(result);
+      expect(text).toContain('src/a.ts');
+      expect(text).toContain('Filtered 1 sensitive file(s).');
+      expect(text).not.toContain('Filtered 2');
+    });
+  });
+
 });
 
 describe('splitCompletePaths', () => {
@@ -947,7 +1139,11 @@ describe('GlobTool integration (real ripgrep)', () => {
   });
 
   async function touch(rel: string, mtime: Date): Promise<void> {
-    const full = path.join(tmpDir!, rel);
+    await touchRel(tmpDir!, rel, mtime);
+  }
+
+  async function touchRel(root: string, rel: string, mtime: Date): Promise<void> {
+    const full = path.join(root, rel);
     await fs.mkdir(path.dirname(full), { recursive: true });
     await fs.writeFile(full, '');
     await fs.utimes(full, mtime, mtime);
@@ -958,7 +1154,7 @@ describe('GlobTool integration (real ripgrep)', () => {
   it('continues through every match beyond the default page without duplicates', async () => {
     const expected = Array.from({ length: 347 }, (_, index) => `file-${String(index).padStart(3, '0')}.ts`);
     await Promise.all(expected.map((name, index) => touch(name, new Date(1_700_000_000_000 - index * 1000))));
-    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService);
+    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService, stubLog());
     const recovered: string[] = [];
     for (const offset of [0, 100, 200, 300]) {
       const result = await execute(tool, GlobInputSchema.parse({ pattern: '*.ts', offset }));
@@ -976,7 +1172,7 @@ describe('GlobTool integration (real ripgrep)', () => {
     await touch('old.ts', new Date('2020-01-01T00:00:00Z'));
     await touch('mid.ts', new Date('2022-01-01T00:00:00Z'));
     await touch('new.ts', new Date('2024-01-01T00:00:00Z'));
-    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService);
+    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService, stubLog());
 
     const result = await execute(tool, { pattern: '*.ts', path: tmpDir! });
 
@@ -987,7 +1183,7 @@ describe('GlobTool integration (real ripgrep)', () => {
     await touch('root.ts', new Date('2024-01-01T00:00:00Z'));
     await touch('src/a.ts', new Date('2023-01-01T00:00:00Z'));
     await touch('src/sub/b.ts', new Date('2022-01-01T00:00:00Z'));
-    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService);
+    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService, stubLog());
 
     const result = await execute(tool, { pattern: '*.ts', path: tmpDir! });
 
@@ -1000,7 +1196,7 @@ describe('GlobTool integration (real ripgrep)', () => {
     await touch('src/a.ts', new Date('2024-01-01T00:00:00Z'));
     await touch('test/a.ts', new Date('2023-01-01T00:00:00Z'));
     await touch('other/a.ts', new Date('2022-01-01T00:00:00Z'));
-    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService);
+    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService, stubLog());
 
     const result = await execute(tool, { pattern: '{src,test}/*.ts', path: tmpDir! });
 
@@ -1013,7 +1209,7 @@ describe('GlobTool integration (real ripgrep)', () => {
     await touch('src/a.ts', new Date('2024-01-01T00:00:00Z'));
     await touch('src/sub/b.ts', new Date('2023-01-01T00:00:00Z'));
     await touch('other/c.ts', new Date('2022-01-01T00:00:00Z'));
-    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService);
+    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService, stubLog());
 
     const result = await execute(tool, { pattern: 'src/**/*.ts', path: tmpDir! });
 
@@ -1024,7 +1220,7 @@ describe('GlobTool integration (real ripgrep)', () => {
 
   it('treats an escaped brace as a literal filename', async () => {
     await touch('{a,b}.ts', new Date('2024-01-01T00:00:00Z'));
-    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService);
+    const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService, stubLog());
 
     const result = await execute(tool, { pattern: '\\{a,b\\}.ts', path: tmpDir! });
 
@@ -1036,7 +1232,7 @@ describe('GlobTool integration (real ripgrep)', () => {
     try {
       const extFile = path.join(externalDir, 'pkg.ts');
       await fs.writeFile(extFile, '');
-      const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService);
+      const tool = new GlobTool(createRuntime(realFs, realEnv, realProcessService), ws(), noopTelemetryService, stubLog());
 
       const result = await execute(tool, { pattern: '*.ts', path: externalDir });
 
@@ -1044,5 +1240,212 @@ describe('GlobTool integration (real ripgrep)', () => {
     } finally {
       await fs.rm(externalDir, { recursive: true, force: true });
     }
+  });
+
+  describe('project ignore filtering', () => {
+    const visibleLines = (text: string): string[] =>
+      text.split('\n').filter((line) => line.length > 0 && !/^Showing matches|^Found \d+ matches|^No more matches|^Filtered \d+ sensitive|^Continue with|^To remove the match-count limit|^Character limit/.test(line));
+
+    async function writeIgnore(root: string, content: string): Promise<void> {
+      const dir = path.join(root, '.kimi-code');
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, 'ignore'), content);
+    }
+
+    async function makeAncestorFixture(): Promise<{ ancestor: string; root: string }> {
+      const ancestor = await fs.mkdtemp(path.join(os.tmpdir(), 'glob-anc-'));
+      const root = path.join(ancestor, 'root');
+      await fs.mkdir(root, { recursive: true });
+      return { ancestor, root };
+    }
+
+    it('hides rule-matched vendor files even with include_ignored, unlike .gitignore filtering', async () => {
+      await touch('vendor/v.ts', new Date('2024-01-01T00:00:00Z'));
+      await touch('git-hidden.ts', new Date('2024-01-01T00:00:02Z'));
+      await touch('src/a.ts', new Date('2024-01-01T00:00:04Z'));
+      await fs.writeFile(path.join(tmpDir!, '.gitignore'), 'git-hidden.ts\n');
+      await writeIgnore(tmpDir!, 'vendor/\n');
+
+      const tool = new GlobTool(
+        createRuntime(realFs, realEnv, realProcessService),
+        ws(),
+        noopTelemetryService,
+        stubLog(),
+      );
+
+      const plain = await execute(tool, { pattern: '*.ts', include_ignored: false });
+      const noIgnore = await execute(tool, { pattern: '*.ts', include_ignored: true });
+
+      const plainLines = visibleLines(toolContentString(plain));
+      const noIgnoreLines = visibleLines(toolContentString(noIgnore));
+      expect(plainLines).toEqual(noIgnoreLines);
+      expect(plainLines).toContain('src/a.ts');
+      expect(plainLines).toContain('git-hidden.ts');
+      expect(plainLines).not.toContain('vendor/v.ts');
+    });
+
+    it('anchors /data/ rules to each root regardless of the search path', async () => {
+      const { ancestor, root } = await makeAncestorFixture();
+      try {
+        const touchIn = (rel: string, mtime: Date) => touchRel(root, rel, mtime);
+        await touchIn('data/a.ts', new Date('2024-01-01T00:00:00Z'));
+        await touchIn('sub/data/b.ts', new Date('2024-01-01T00:00:02Z'));
+        await touchIn('sub/keep.ts', new Date('2024-01-01T00:00:04Z'));
+        await writeIgnore(root, '/data/\n');
+        const tool = new GlobTool(
+          createRuntime(realFs, realEnv, realProcessService),
+          stubWorkspaceContext(root),
+          noopTelemetryService,
+          stubLog(),
+        );
+
+        const atRoot = visibleLines(toolContentString(
+          await execute(tool, { pattern: '**/*.ts', path: root }),
+        ));
+        expect(atRoot).toContain('sub/data/b.ts');
+        expect(atRoot).toContain('sub/keep.ts');
+        expect(atRoot).not.toContain('data/a.ts');
+
+        const atAncestor = visibleLines(toolContentString(
+          await execute(tool, { pattern: '**/*.ts', path: ancestor }),
+        ));
+        expect(atAncestor.length).toBe(2);
+        expect(atAncestor.some((line) => line.endsWith('root/sub/data/b.ts'))).toBe(true);
+        expect(atAncestor.some((line) => line.endsWith('root/sub/keep.ts'))).toBe(true);
+        expect(atAncestor.some((line) => line.endsWith('root/data/a.ts'))).toBe(false);
+
+        const atSub = visibleLines(toolContentString(
+          await execute(tool, { pattern: '**/*.ts', path: path.join(root, 'sub') }),
+        ));
+        expect(atSub).toContain('data/b.ts');
+        expect(atSub).toContain('keep.ts');
+      } finally {
+        await fs.rm(ancestor, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps root-external /data/ subtrees visible under an ancestor search', async () => {
+      const { ancestor, root } = await makeAncestorFixture();
+      try {
+        await fs.mkdir(path.join(ancestor, 'other', 'data'), { recursive: true });
+        await fs.writeFile(path.join(ancestor, 'other', 'data', 'o.ts'), '');
+        await writeIgnore(root, '/data/\n');
+        const tool = new GlobTool(
+          createRuntime(realFs, realEnv, realProcessService),
+          stubWorkspaceContext(root),
+          noopTelemetryService,
+          stubLog(),
+        );
+
+        const lines = visibleLines(toolContentString(
+          await execute(tool, { pattern: '**/*.ts', path: ancestor }),
+        ));
+
+        expect(lines.some((line) => line.endsWith('other/data/o.ts'))).toBe(true);
+      } finally {
+        await fs.rm(ancestor, { recursive: true, force: true });
+      }
+    });
+
+    it('judges nested additional_dir subtrees by the nested root rules', async () => {
+      await touch('libs/y.ts', new Date('2024-01-01T00:00:00Z'));
+      await touch('libs/x/b.ts', new Date('2024-01-01T00:00:02Z'));
+      await touch('libs/x/secret/s.ts', new Date('2024-01-01T00:00:04Z'));
+      await writeIgnore(tmpDir!, 'build/\n');
+      await writeIgnore(path.join(tmpDir!, 'libs', 'x'), 'secret/\n');
+
+      const nestedRoot = path.join(tmpDir!, 'libs', 'x');
+      const tool = new GlobTool(
+        createRuntime(realFs, realEnv, realProcessService),
+        stubWorkspaceContext(tmpDir!, [nestedRoot]),
+        noopTelemetryService,
+        stubLog(),
+      );
+
+      const result = await execute(tool, { pattern: '**/*.ts' });
+
+      const lines = visibleLines(toolContentString(result));
+      expect(lines).toContain('libs/x/b.ts');
+      expect(lines).toContain('libs/y.ts');
+      expect(lines).not.toContain('libs/x/secret/s.ts');
+    });
+
+    it('judges nested additional_dir subtrees by the nested root rules when the main root hides them', async () => {
+      await touch('libs/y.ts', new Date('2024-01-01T00:00:00Z'));
+      await touch('libs/x/b.ts', new Date('2024-01-01T00:00:02Z'));
+      await writeIgnore(tmpDir!, 'libs/\n');
+      await writeIgnore(path.join(tmpDir!, 'libs', 'x'), '');
+
+      const nestedRoot = path.join(tmpDir!, 'libs', 'x');
+      const tool = new GlobTool(
+        createRuntime(realFs, realEnv, realProcessService),
+        stubWorkspaceContext(tmpDir!, [nestedRoot]),
+        noopTelemetryService,
+        stubLog(),
+      );
+
+      const result = await execute(tool, { pattern: '**/*.ts' });
+
+      const lines = visibleLines(toolContentString(result));
+      expect(lines).toContain('libs/x/b.ts');
+      expect(lines).not.toContain('libs/y.ts');
+    });
+
+    it('returns baseline output after the rule file is deleted', async () => {
+      await touch('vendor/v.ts', new Date('2024-01-01T00:00:00Z'));
+      await touch('src/a.ts', new Date('2024-01-01T00:00:02Z'));
+
+      const tool = new GlobTool(
+        createRuntime(realFs, realEnv, realProcessService),
+        ws(),
+        noopTelemetryService,
+        stubLog(),
+      );
+
+      const baseline = toolContentString(await execute(tool, { pattern: '*.ts' }));
+      expect(baseline).toContain('vendor/v.ts');
+
+      await writeIgnore(tmpDir!, 'vendor/\n');
+      const filtered = toolContentString(await execute(tool, { pattern: '*.ts' }));
+      expect(filtered).not.toContain('vendor/v.ts');
+
+      await fs.rm(path.join(tmpDir!, '.kimi-code', 'ignore'));
+      const restored = toolContentString(await execute(tool, { pattern: '*.ts' }));
+      expect(restored).toBe(baseline);
+    });
+
+    it('reads each root rule file exactly once per execute', async () => {
+      await touch('src/a.ts', new Date('2024-01-01T00:00:00Z'));
+      await writeIgnore(tmpDir!, 'vendor/\n');
+      const nestedRoot = path.join(tmpDir!, 'src');
+      const readCalls: string[] = [];
+      const countingFs = {
+        _serviceBrand: undefined as undefined,
+        readText: async (p: string): Promise<string> => {
+          readCalls.push(p);
+          return realFs.readText(p);
+        },
+        stat: (p: string, ...rest: unknown[]) =>
+          (realFs as unknown as { stat: (p: string, ...rest: unknown[]) => Promise<HostFileStat> }).stat(p, ...rest),
+      } as unknown as IHostFileSystem;
+      const tool = new GlobTool(
+        createRuntime(countingFs, realEnv, realProcessService),
+        stubWorkspaceContext(tmpDir!, [nestedRoot]),
+        noopTelemetryService,
+        stubLog(),
+      );
+
+      await execute(tool, { pattern: '*.ts' });
+
+      const expected = [
+        join(tmpDir!, '.kimi-code', 'ignore'),
+        join(nestedRoot, '.kimi-code', 'ignore'),
+      ];
+      expect(readCalls).toEqual(expected);
+
+      await execute(tool, { pattern: '*.ts' });
+
+      expect(readCalls).toEqual([...expected, ...expected]);
+    });
   });
 });

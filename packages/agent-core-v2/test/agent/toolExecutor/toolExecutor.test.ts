@@ -1118,7 +1118,7 @@ describe('truncation pipeline', () => {
       { resolve: () => ({}) } as unknown as IAgentToolRegistryService,
       attachmentStore,
     ));
-    registry.register(new GlobTool(binding, stubWorkspaceContext(homeDir), noopTelemetryService));
+    registry.register(new GlobTool(binding, stubWorkspaceContext(homeDir), noopTelemetryService, stubLog()));
   });
 
   afterEach(async () => {

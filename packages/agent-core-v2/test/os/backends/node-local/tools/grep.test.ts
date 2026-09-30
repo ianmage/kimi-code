@@ -33,6 +33,7 @@ import {
 import { IHostEnvironment } from '#/os/interface/hostEnvironment';
 import { IHostFileSystem, type HostFileStat } from '#/os/interface/hostFileSystem';
 import { IHostProcessService, type IHostProcess } from '#/os/interface/hostProcess';
+import { ILogService } from '#/_base/log/log';
 import { ISessionSkillCatalog } from '#/features/skill/session/skillCatalog';
 import { ISessionToolPolicyGate } from '#/session/sessionToolPolicyGate/sessionToolPolicyGate';
 import { Event } from '#/_base/event';
@@ -47,6 +48,7 @@ import { IAgentRuntimeService } from '#/agent/runtimeBinding/agentRuntime';
 import { FakeRuntime } from '#/runtime/fakeRuntime';
 import { ensureRgPath } from '#/os/backends/node-local/tools/rgLocator';
 import { stubWorkspaceContext } from '../../../../session/workspaceContext/stub-workspace-context';
+import { stubLog } from '../../../../_base/log/stubs';
 import { recordingTelemetry, type TelemetryRecord } from '../../../../app/telemetry/stubs';
 import { registerStateServices } from '../../../../state/stubs';
 
@@ -115,6 +117,7 @@ interface FakeKaos {
   gethome(): string;
   stat(path: string): Promise<HostFileStat>;
   exec(...args: string[]): Promise<IHostProcess>;
+  readText?(path: string): Promise<string>;
 }
 
 function notImplemented(method: string): never {
@@ -145,10 +148,18 @@ function createTestEnv(kaos: FakeKaos): IHostEnvironment {
   };
 }
 
+function enoentError(path: string): NodeJS.ErrnoException {
+  const error = Object.assign(new Error(`ENOENT: no such file or directory, open '${path}'`), {
+    code: 'ENOENT',
+  });
+  return error;
+}
+
 function createTestFs(kaos: FakeKaos): IHostFileSystem {
   return {
     _serviceBrand: undefined,
-    readText: () => notImplemented('readText'),
+    readText: (path) =>
+      kaos.readText !== undefined ? kaos.readText(path) : Promise.reject(enoentError(path)),
     writeText: () => notImplemented('writeText'),
     appendText: () => notImplemented('appendText'),
     readBytes: () => notImplemented('readBytes'),
@@ -200,6 +211,7 @@ class GrepTool extends ProductionGrepTool {
       runtime,
       stubWorkspaceContext(workspaceConfig.workspaceDir, workspaceConfig.additionalDirs),
       telemetry,
+      stubLog(),
     );
   }
 }
@@ -353,6 +365,7 @@ describe('GrepTool', () => {
           });
           reg.defineInstance(ISessionWorkspaceContext, stubWorkspaceContext('/workspace'));
           reg.defineInstance(ITelemetryService, noopTelemetryService);
+          reg.defineInstance(ILogService, stubLog());
           reg.defineInstance(ISessionSkillCatalog, {
             _serviceBrand: undefined,
             catalog: { getSkillRoots: () => [] },
@@ -2128,5 +2141,322 @@ describe('GrepTool', () => {
 
     expect(result).toEqual({ isError: true, output: 'Aborted before search started' });
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  describe('project ignore filtering', () => {
+    function ruleReadText(
+      rules: Record<string, string>,
+      calls?: Map<string, number>,
+    ): (path: string) => Promise<string> {
+      return (path) => {
+        if (calls !== undefined) calls.set(path, (calls.get(path) ?? 0) + 1);
+        const content = rules[path];
+        if (content === undefined) return Promise.reject(enoentError(path));
+        return Promise.resolve(content);
+      };
+    }
+
+    function okStat(): FakeKaos['stat'] {
+      return async () => statResult(1);
+    }
+
+    it('filters hidden records from files_with_matches output', async () => {
+      const stdout = nullRecord('/workspace/vendor/v.ts') + nullRecord('/workspace/src/a.ts');
+      const stat = vi.fn(okStat());
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(stdout)),
+          stat,
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const result = await executeTool(tool, context({ pattern: 'hit' }));
+
+      expect(toolContentString(result)).toBe('src/a.ts');
+      expect(stat).toHaveBeenCalledTimes(1);
+      expect(stat).toHaveBeenCalledWith('/workspace/src/a.ts');
+    });
+
+    it('filters hidden records from count_matches output', async () => {
+      const stdout =
+        [nullRecord('/workspace/vendor/v.ts', '5'), nullRecord('/workspace/src/a.ts', '3')].join(
+          '\n',
+        ) + '\n';
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(stdout)),
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const result = await executeTool(tool, context({ pattern: 'hit', output_mode: 'count_matches' }));
+
+      expect(toolContentString(result)).toBe(
+        ['Found 3 total occurrences across 1 file.', 'src/a.ts:3'].join('\n'),
+      );
+    });
+
+    it('filters hidden records from content output with context without stray separators', async () => {
+      const stdout =
+        [
+          nullRecord('/workspace/vendor/v.ts', '1:hit'),
+          '--',
+          nullRecord('/workspace/src/a.ts', '1-l1'),
+          nullRecord('/workspace/src/a.ts', '2:hit'),
+          nullRecord('/workspace/src/a.ts', '3-l3'),
+          '--',
+          nullRecord('/workspace/vendor/w.ts', '1:hit'),
+        ].join('\n') + '\n';
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(stdout)),
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const result = await executeTool(tool,
+        context({ pattern: 'hit', output_mode: 'content', '-C': 1 }),
+      );
+
+      expect(toolContentString(result)).toBe(
+        ['src/a.ts-1-l1', 'src/a.ts:2:hit', 'src/a.ts-3-l3'].join('\n'),
+      );
+    });
+
+    it('still filters with include_ignored and keeps rg args identical with and without rules', async () => {
+      const stdout = nullRecord('/workspace/vendor/v.ts') + nullRecord('/workspace/src/a.ts');
+      const withRulesExec = vi.fn().mockResolvedValue(processWithOutput(stdout));
+      const withoutRulesExec = vi.fn().mockResolvedValue(processWithOutput(stdout));
+      const withRules = new GrepTool(
+        createFakeKaos({
+          exec: withRulesExec,
+          stat: okStat(),
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+      const withoutRules = new GrepTool(
+        createFakeKaos({ exec: withoutRulesExec, stat: okStat() }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const filtered = await executeTool(withRules, context({ pattern: 'hit', include_ignored: true }));
+      await executeTool(withoutRules, context({ pattern: 'hit', include_ignored: true }));
+
+      expect(toolContentString(filtered)).toBe('src/a.ts');
+      expect(withRulesExec.mock.calls).toEqual(withoutRulesExec.mock.calls);
+    });
+
+    it('counts only visible items in the count summary and pagination total', async () => {
+      const stdout =
+        [
+          nullRecord('/workspace/vendor/a.ts', '2'),
+          nullRecord('/workspace/src/a.ts', '3'),
+          nullRecord('/workspace/vendor/b.ts', '4'),
+          nullRecord('/workspace/src/b.ts', '3'),
+          nullRecord('/workspace/src/c.ts', '5'),
+        ].join('\n') + '\n';
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(stdout)),
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const result = await executeTool(tool,
+        context({ pattern: 'hit', output_mode: 'count_matches', head_limit: 2 }),
+      );
+
+      expect(toolContentString(result)).toBe(
+        [
+          'Found 11 total occurrences across 3 files.',
+          'Results truncated to 2 lines (total: 3). Use offset=2 to see more.',
+          'src/a.ts:3',
+          'src/b.ts:3',
+        ].join('\n'),
+      );
+    });
+
+    it('judges additional_dir files by their owning root rules', async () => {
+      const stdout =
+        nullRecord('/workspace/vendor/v.ts') +
+        nullRecord('/workspace/nested/vendor/n.ts') +
+        nullRecord('/extra/secret/s.ts') +
+        nullRecord('/extra/e.ts');
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(stdout)),
+          stat: okStat(),
+          readText: ruleReadText({
+            '/workspace/.kimi-code/ignore': 'vendor/\n',
+            '/extra/.kimi-code/ignore': 'secret/\n',
+          }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: ['/workspace/nested', '/extra'] },
+      );
+
+      const result = await executeTool(tool, context({ pattern: 'hit' }));
+
+      expect(toolContentString(result).split('\n')).toEqual([
+        'nested/vendor/n.ts',
+        '/extra/e.ts',
+      ]);
+    });
+
+    it('leaves results outside the workspace untouched', async () => {
+      const stdout = nullRecord('/outside/vendor/v.ts') + nullRecord('/outside/src/a.ts');
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(stdout)),
+          stat: okStat(),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const result = await executeTool(tool, context({ pattern: 'hit', path: '/outside' }));
+
+      expect(toolContentString(result)).toBe(['/outside/vendor/v.ts', '/outside/src/a.ts'].join('\n'));
+    });
+
+    it('reads each root rule file exactly once per execute', async () => {
+      const calls = new Map<string, number>();
+      const exec = vi
+        .fn()
+        .mockResolvedValueOnce(
+          processWithOutput('', 'rg: failed to spawn worker: Resource temporarily unavailable\n', 2),
+        )
+        .mockResolvedValueOnce(processWithOutput(nullRecord('/workspace/src/a.ts')));
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec,
+          readText: ruleReadText(
+            {
+              '/workspace/.kimi-code/ignore': 'vendor/\n',
+              '/extra/.kimi-code/ignore': 'secret/\n',
+            },
+            calls,
+          ),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: ['/extra'] },
+      );
+
+      await executeTool(tool, context({ pattern: 'hit' }));
+
+      expect(exec).toHaveBeenCalledTimes(2);
+      expect(calls.get('/workspace/.kimi-code/ignore')).toBe(1);
+      expect(calls.get('/extra/.kimi-code/ignore')).toBe(1);
+
+      await executeTool(tool, context({ pattern: 'hit' }));
+
+      expect(calls.get('/workspace/.kimi-code/ignore')).toBe(2);
+      expect(calls.get('/extra/.kimi-code/ignore')).toBe(2);
+    });
+
+    it('keeps the nested-root subtree visible under a main-root libs/ rule', async () => {
+      const stdout = nullRecord('/workspace/libs/x/b.ts') + nullRecord('/workspace/libs/y/c.ts');
+      const tool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(stdout)),
+          stat: okStat(),
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'libs/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: ['/workspace/libs/x'] },
+      );
+
+      const result = await executeTool(tool, context({ pattern: 'hit' }));
+
+      expect(toolContentString(result)).toBe('libs/x/b.ts');
+    });
+
+    it('matches hidden paths case-insensitively on win32 but not posix', async () => {
+      const win32Tool = new GrepTool(
+        createFakeKaos({
+          pathClass: () => 'win32',
+          exec: vi.fn().mockResolvedValue(
+            processWithOutput(
+              nullRecord('c:/REPO\\vendor\\v.ts') + nullRecord('c:/REPO\\src\\a.ts'),
+            ),
+          ),
+          stat: okStat(),
+          readText: ruleReadText({ 'C:/repo/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: 'C:\\repo', additionalDirs: [] },
+      );
+
+      const win32Result = await executeTool(win32Tool, context({ pattern: 'hit' }));
+
+      expect(toolContentString(win32Result)).toBe('src/a.ts');
+
+      const posixTool = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(
+            processWithOutput(nullRecord('/REPO/vendor/v.ts') + nullRecord('/REPO/src/a.ts')),
+          ),
+          stat: okStat(),
+          readText: ruleReadText({ '/repo/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/repo', additionalDirs: [] },
+      );
+
+      const posixResult = await executeTool(posixTool, context({ pattern: 'hit' }));
+
+      expect(toolContentString(posixResult)).toBe(['/REPO/vendor/v.ts', '/REPO/src/a.ts'].join('\n'));
+    });
+
+    it('A1: output with blocked records is verbatim identical to the no-rule baseline', async () => {
+      const blockedStdout = nullRecord('/workspace/vendor/v.ts') + nullRecord('/workspace/vendor/w.ts');
+      const visibleStdout = nullRecord('/workspace/src/a.ts');
+      const filtered = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(blockedStdout + visibleStdout)),
+          stat: okStat(),
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+      const baseline = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(visibleStdout)),
+          stat: okStat(),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const filteredResult = await executeTool(filtered, context({ pattern: 'hit' }));
+      const baselineResult = await executeTool(baseline, context({ pattern: 'hit' }));
+
+      const filteredText = toolContentString(filteredResult);
+      expect(filteredText).toBe(toolContentString(baselineResult));
+      expect(filteredText).not.toContain('vendor');
+      expect(filteredText).not.toContain('Filtered');
+      expect(filteredText).not.toContain('ignore');
+    });
+
+    it('A2: fully blocked output matches the genuine no-match message verbatim', async () => {
+      const blocked = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput(nullRecord('/workspace/vendor/v.ts'))),
+          readText: ruleReadText({ '/workspace/.kimi-code/ignore': 'vendor/\n' }),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+      const noMatch = new GrepTool(
+        createFakeKaos({
+          exec: vi.fn().mockResolvedValue(processWithOutput('', '', 1)),
+        }),
+        { workspaceDir: '/workspace', additionalDirs: [] },
+      );
+
+      const blockedResult = await executeTool(blocked, context({ pattern: 'hit' }));
+      const noMatchResult = await executeTool(noMatch, context({ pattern: 'hit' }));
+
+      expect(toolContentString(blockedResult)).toBe(toolContentString(noMatchResult));
+      expect(toolContentString(blockedResult)).toBe('No non-sensitive matches found');
+    });
   });
 });
