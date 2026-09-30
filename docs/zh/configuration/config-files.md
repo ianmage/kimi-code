@@ -606,9 +606,9 @@ auto_install = true
 
 ## 项目级本地配置
 
-除了 `~/.kimi-code` 下的用户级文件，Kimi Code 还会读取位于 `<项目根目录>/.kimi-code/local.toml` 的项目级本地配置文件。它保存的是与某一个项目检出相关、通常不应与队友共享的设置。
+除了 `~/.kimi-code` 下的用户级文件，Kimi Code 还会读取各项目 `.kimi-code/` 目录下的两个项目级文件：`local.toml` 保存与某一个项目检出相关、通常不应与队友共享的设置；`ignore` 用于过滤搜索结果中的噪音，适合提交进仓库、与团队共享。
 
-该文件会在你通过 [`/add-dir`](../reference/slash-commands.md) 添加额外工作目录并选择记入项目时自动创建，通常无需手动编辑。
+`local.toml` 会在你通过 [`/add-dir`](../reference/slash-commands.md) 添加额外工作目录并选择记入项目时自动创建，通常无需手动编辑。
 
 ### `[workspace]`
 
@@ -624,6 +624,25 @@ additional_dir = ["/absolute/path/to/shared"]
 ```
 
 目录以绝对路径存储，与具体机器相关。因此建议把 `.kimi-code/local.toml` 加入项目的 `.gitignore`，避免被提交。
+
+### `.kimi-code/ignore`
+
+`ignore` 文件用于过滤搜索结果中的噪音：命中的文件会从 `Grep`、`Glob` 工具和 [Web 界面](../guides/web.md) 的文件树、文件搜索、`@` 补全、内容搜索中消失。目标是让结果列表更干净，而不是让搜索更快。
+
+文件位于 `<根目录>/.kimi-code/ignore`，`<根目录>` 指每个工作区根：项目根目录加上所有 [`additional_dir`](#workspace)。每个根各有一份文件，且只作用于它所在根的子树——与 `local.toml` 不同，规则随仓库生效，不受 workspace trust（工作区信任）门控。
+
+规则使用 [gitignore 语法](https://git-scm.com/docs/gitignore)。模式锚定到文件所在的根，`!` 反排除规则只作用于本文件。Kimi Code 不会读取仓库的 `.gitignore`，两者相互独立。
+
+```text
+# <根目录>/.kimi-code/ignore
+node_modules/
+dist/
+vendor/
+*.min.js
+!vendor/keep-this.js
+```
+
+该过滤始终生效：`Grep`、`Glob` 的 `include_ignored` 选项，以及 Web 界面中关闭跟随 `.gitignore`，都无法让这些文件重新出现。它不限制按路径直接访问——`Read`、`Write`、`Edit`、`Bash` 工具仍可正常操作被忽略的文件。修改规则在下一次请求时生效，无需重启。
 
 ## 下一步
 
