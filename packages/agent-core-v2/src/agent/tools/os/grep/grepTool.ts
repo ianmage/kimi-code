@@ -14,6 +14,8 @@ import type { IHostProcessService } from '#/os/interface/hostProcess';
 import { IAgentRuntimeService, inspectAgentRuntime } from '#/agent/runtimeBinding/agentRuntime';
 import { RuntimeWorkspaceView } from '#/runtime/runtimeWorkspaceView';
 import { unwrapErrorCause } from '#/_base/errors/errors';
+import { ILogService } from '#/_base/log/log';
+import { loadProjectIgnore } from '#/_base/utils/projectIgnore';
 import { ISessionSkillCatalog } from '#/features/skill/session/skillCatalog';
 import { ISessionWorkspaceContext } from '#/session/workspaceContext/workspaceContext';
 import {
@@ -71,7 +73,8 @@ export class GrepTool implements IGrepTool {
     @IAgentRuntimeService private readonly runtime: IAgentRuntimeService,
     @ISessionWorkspaceContext private readonly workspaceCtx: ISessionWorkspaceContext,
     @ITelemetryService private readonly telemetry: ITelemetryService,
-    @ISessionSkillCatalog private readonly skillCatalog?: ISessionSkillCatalog,
+    @ILogService private readonly log: ILogService,
+    private readonly skillCatalog?: ISessionSkillCatalog,
   ) {}
 
   private workspace(view: RuntimeWorkspaceView): WorkspaceConfig {
@@ -89,6 +92,10 @@ export class GrepTool implements IGrepTool {
     });
     const env = { _serviceBrand: undefined, ...inspected.environment, ready: Promise.resolve() };
     const workspace = this.workspace(view);
+    const ignoreRoots = new RuntimeWorkspaceView(inspected, {
+      workDir: this.workspaceCtx.workDir,
+      additionalDirs: this.workspaceCtx.additionalDirs,
+    }).roots;
     let path: string | undefined;
     if (args.path !== undefined) {
       path = resolvePathAccessPath(args.path, {
@@ -112,7 +119,7 @@ export class GrepTool implements IGrepTool {
           if (lease.runtime.identity.generation !== inspected.identity.generation) {
             return { isError: true, output: 'Runtime changed before execution. Retry the tool call.' };
           }
-          return await this.execution(lease.runtime.process!, lease.runtime.fs!, env, workspace, args, signal, searchPaths);
+          return await this.execution(lease.runtime.process!, lease.runtime.fs!, env, workspace, args, signal, searchPaths, ignoreRoots);
         } finally {
           lease.dispose();
         }
@@ -128,10 +135,18 @@ export class GrepTool implements IGrepTool {
     args: GrepInput,
     signal: AbortSignal,
     searchPaths: string[],
+    ignoreRoots: readonly string[],
   ): Promise<ExecutableToolResult> {
     if (signal.aborted) {
       return { isError: true, output: 'Aborted before search started' };
     }
+
+    const projectIgnore = await loadProjectIgnore({
+      roots: ignoreRoots,
+      pathClass: env.pathClass,
+      fs,
+      log: this.log,
+    });
 
     const pathClass = env.pathClass;
     let rgPath: string;
@@ -208,8 +223,16 @@ export class GrepTool implements IGrepTool {
 
     const rawLines = parseRipgrepOutput(stdoutText, mode);
 
+    const visibleLines = filterLinesByPath(rawLines, mode, pathClass, (filePath) =>
+      projectIgnore.hidden(filePath),
+    );
+
     const filteredSensitive = new Set<string>();
-    const keptLines = filterSensitiveLines(rawLines, mode, filteredSensitive, pathClass);
+    const keptLines = filterLinesByPath(visibleLines, mode, pathClass, (filePath) => {
+      if (!isSensitiveFile(filePath)) return false;
+      filteredSensitive.add(filePath);
+      return true;
+    });
     let orderedLines: ParsedGrepLine[];
     try {
       orderedLines =
@@ -642,11 +665,11 @@ function summarizeRipgrepStderr(stderr: string): string {
   return errorLine ?? lines.at(-1) ?? 'ripgrep error';
 }
 
-function filterSensitiveLines(
+function filterLinesByPath(
   lines: readonly ParsedGrepLine[],
   mode: GrepMode,
-  filteredPaths: Set<string>,
   pathClass: PathClass,
+  isFiltered: (filePath: string) => boolean,
 ): ParsedGrepLine[] {
   const kept: ParsedGrepLine[] = [];
   for (const line of lines) {
@@ -655,10 +678,7 @@ function filterSensitiveLines(
       continue;
     }
     const filePath = parsedFilePath(line, mode, pathClass);
-    if (filePath !== undefined && isSensitiveFile(filePath)) {
-      filteredPaths.add(filePath);
-      continue;
-    }
+    if (filePath !== undefined && isFiltered(filePath)) continue;
     kept.push(line);
   }
   return mode === 'content' ? normalizeContextSeparators(kept) : kept;
