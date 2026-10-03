@@ -1,105 +1,114 @@
-import type { Session } from '@moonshot-ai/kimi-code-sdk';
-import type { ActionFrame } from '@moonshot-ai/forum-link';
+import type { ApprovalResponse } from '@moonshot-ai/kimi-code-sdk';
+import type { OpIntent, ReceiptReport } from '@moonshot-ai/forum-link';
 
-import type { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
-import type { QuestionController } from '#/tui/reverse-rpc/question/controller';
-import type { AppState } from '#/tui/types';
-import type { OpenCard } from './controller';
-import type { CardSettlementOutcome } from './projector';
+import { adaptPanelResponse } from '#/tui/reverse-rpc/approval/adapter';
+import type { ApprovalPanelData, QuestionPanelData, QuestionPanelResponse } from '#/tui/reverse-rpc/types';
+import { encodeApproval, encodeApprovalCancel, encodeQuestion, encodeQuestionCancel } from './encoding';
+import { executeSessionControl, type SessionControlHostView, type SessionControlOutcome } from './session-control';
+import type { DownlinkOp } from './link';
 
-/**
- * Explicit host surface for the downlink injector. The injector never imports
- * KimiTUI; every local capability it needs is declared here and wired by the
- * owner (P3.3). `endSession` is the controller-level orchestration seam
- * implemented in P3.2 — the injector only fire-and-forgets it. `session` may
- * be undefined before the first `setSession`; the session-scoped actions are
- * no-ops then. `appState` is a getter so live mutations (isCompacting) are
- * always observed.
- */
-export interface InjectorHost {
-  readonly session: Session | undefined;
-  readonly appState: AppState;
-  readonly approvalController: ApprovalController;
-  readonly questionController: QuestionController;
-  sendNormalUserInput(text: string): Promise<void>;
-  endSession(): Promise<void>;
-  getOpenCards(): readonly OpenCard[];
-  onCardClosed(kind: OpenCard['kind'], upstreamId: string, outcome: CardSettlementOutcome): void;
-  onDroppedAction?(frame: ActionFrame): void;
+export interface OpenCardView {
+  readonly kind: 'approval' | 'question';
+  readonly approval?: ApprovalPanelData | undefined;
+  readonly question?: QuestionPanelData | undefined;
 }
 
-type CardActionFrame = Extract<ActionFrame, { type: 'answer-question' | 'approve' | 'deny' }>;
+export interface InjectorHost {
+  reportReceipt(report: ReceiptReport): void;
+  getOpenCard(cardId: string): OpenCardView | undefined;
+  isCurrentPanel(cardId: string): boolean;
+  respondApproval(cardId: string, response: ApprovalResponse): void;
+  respondQuestion(cardId: string, response: QuestionPanelResponse): void;
+}
 
-const CARD_KIND: Record<CardActionFrame['type'], OpenCard['kind']> = {
-  'answer-question': 'question',
-  approve: 'approval',
-  deny: 'approval',
-};
+type CardIntent = Extract<OpIntent, { type: 'approve' | 'approve-cancel' | 'answer' | 'answer-cancel' }>;
 
-const CARD_OUTCOME: Record<CardActionFrame['type'], CardSettlementOutcome> = {
-  'answer-question': 'answered',
-  approve: 'approved',
-  deny: 'rejected',
-};
+const APPLIED: SessionControlOutcome = { state: 'applied' };
 
-/**
- * Maps downlink action frames onto existing local paths. `dispatch` is
- * synchronous by contract (K12): the three card actions settle the card and
- * respond with no await between the two steps (G1), and the async actions
- * (send-message / pause / end-session) are started with `void` and never
- * awaited here. Card actions whose cardId or kind no longer matches an open
- * card are dropped as late arrivals (A6) — a late remote answer can never hit
- * the card that replaced the one the local user already answered.
- */
+function isCardIntent(intent: OpIntent): intent is CardIntent {
+  return (
+    intent.type === 'approve' ||
+    intent.type === 'approve-cancel' ||
+    intent.type === 'answer' ||
+    intent.type === 'answer-cancel'
+  );
+}
+
 export class Injector {
-  constructor(private readonly host: InjectorHost) {}
+  constructor(
+    private readonly host: InjectorHost,
+    private readonly sessionControl: SessionControlHostView,
+  ) {}
 
-  dispatch(frame: ActionFrame): void {
-    switch (frame.type) {
-      case 'answer-question':
-      case 'approve':
-      case 'deny':
-        this.dispatchCardAction(frame);
-        break;
-      case 'send-message':
-        this.safely(() => this.host.sendNormalUserInput(frame.text));
-        break;
-      case 'pause': {
-        const session = this.host.session;
-        if (session === undefined) break;
-        if (this.host.appState.isCompacting) this.safely(() => session.cancelCompaction());
-        else this.safely(() => session.cancel());
-        break;
-      }
-      case 'end-session':
-        this.safely(() => this.host.endSession());
-        break;
-      default:
-        this.host.onDroppedAction?.(frame);
-        break;
-    }
-  }
-
-  private safely(run: () => Promise<unknown>): void {
-    run().catch(() => {});
-  }
-
-  private dispatchCardAction(frame: CardActionFrame): void {
-    const kind = CARD_KIND[frame.type];
-    const card = this.host
-      .getOpenCards()
-      .find((open) => open.cardId === frame.cardId && open.kind === kind);
-    if (card === undefined) {
-      this.host.onDroppedAction?.(frame);
+  async handle(op: DownlinkOp): Promise<void> {
+    this.host.reportReceipt({ opId: op.opId, state: 'delivered' });
+    if (this.sessionControl.session()?.id !== op.sessionId) {
+      this.host.reportReceipt({ opId: op.opId, state: 'rejected', reason: 'thread-unknown' });
       return;
     }
-    this.host.onCardClosed(kind, card.upstreamId, CARD_OUTCOME[frame.type]);
-    if (frame.type === 'answer-question') {
-      this.host.questionController.respond({ answers: [frame.answer] });
-    } else if (frame.type === 'approve') {
-      this.host.approvalController.respond({ decision: 'approved', feedback: frame.feedback });
-    } else {
-      this.host.approvalController.respond({ decision: 'rejected', feedback: frame.feedback });
+    if (op.intent.type === 'end-session') {
+      await this.settleEndSession(op.opId);
+      return;
     }
+    let outcome: SessionControlOutcome;
+    try {
+      outcome = isCardIntent(op.intent)
+        ? this.settleCard(op.intent)
+        : await executeSessionControl(op.intent, this.sessionControl);
+    } catch {
+      outcome = { state: 'rejected', reason: 'postcondition-failed' };
+    }
+    this.reportTerminal(op.opId, outcome);
+  }
+
+  private settleCard(intent: CardIntent): SessionControlOutcome {
+    const card = this.host.getOpenCard(intent.cardId);
+    if (card === undefined) return { state: 'rejected', reason: 'card-closed' };
+    if (!this.host.isCurrentPanel(intent.cardId)) return { state: 'rejected', reason: 'card-closed' };
+    if (intent.type === 'approve' || intent.type === 'approve-cancel') {
+      if (card.kind !== 'approval' || card.approval === undefined) {
+        return { state: 'rejected', reason: 'card-closed' };
+      }
+      const encoded =
+        intent.type === 'approve'
+          ? encodeApproval(card, { optionIndex: intent.optionIndex, feedback: intent.feedback })
+          : { ok: true as const, value: encodeApprovalCancel() };
+      if (!encoded.ok) return { state: 'rejected', reason: 'invalid-params' };
+      this.host.respondApproval(intent.cardId, adaptPanelResponse(encoded.value));
+      return APPLIED;
+    }
+    if (card.kind !== 'question' || card.question === undefined) {
+      return { state: 'rejected', reason: 'card-closed' };
+    }
+    const encoded =
+      intent.type === 'answer'
+        ? encodeQuestion(card, intent.answers)
+        : { ok: true as const, value: encodeQuestionCancel() };
+    if (!encoded.ok) return { state: 'rejected', reason: 'invalid-params' };
+    this.host.respondQuestion(intent.cardId, encoded.value);
+    return APPLIED;
+  }
+
+  private async settleEndSession(opId: string): Promise<void> {
+    let reported = false;
+    const beforeStop = () => {
+      this.host.reportReceipt({ opId, state: 'applied' });
+      reported = true;
+    };
+    try {
+      await this.sessionControl.runEndSession({ beforeStop });
+    } catch {
+      if (!reported) this.reportTerminal(opId, { state: 'rejected', reason: 'postcondition-failed' });
+      return;
+    }
+    if (!reported) beforeStop();
+  }
+
+  private reportTerminal(opId: string, outcome: SessionControlOutcome): void {
+    this.host.reportReceipt(
+      outcome.state === 'applied'
+        ? { opId, state: 'applied' }
+        : { opId, state: 'rejected', reason: outcome.reason },
+    );
   }
 }

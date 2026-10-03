@@ -29,7 +29,7 @@ export async function handleForumCommand(host: SlashCommandHost): Promise<void> 
   }
 
   const controller = host.ensureForumLink();
-  const result = await controller.start({ url: credential.url, password: credential.password });
+  const result = await controller.start({ url: credential.url, token: credential.token });
   if (!result.ok) {
     if (result.reason === 'connect-failed') {
       host.showError(`Forum Link publish failed: ${formatErrorMessage(result.error)}`);
