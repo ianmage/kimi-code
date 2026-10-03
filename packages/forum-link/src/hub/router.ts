@@ -1,360 +1,663 @@
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 
-import type { ActionFrame, Descriptor } from '#/contract/frames';
-import { descriptorSchema, parseActionFrame, parseUplinkFrame } from '#/contract/frames';
+import {
+  type OpPush,
+  type RegisterResponse,
+  parseUplinkBatch,
+  parseWorkerReceiptReport,
+  parseWorkerRegister,
+  parseWorkerUnregister,
+} from '#/contract/worker';
+import {
+  BROWSER_COOKIE_NAME,
+  parseBrowserLoginRequest,
+  parseBrowserOpsRequest,
+} from '#/contract/browser';
+import { parseAdminIssueRequest } from '#/contract/admin';
 import { servePage } from '#/hub/assets';
-import { Gate } from '#/hub/gate';
-import { Registry } from '#/hub/registry';
+import { Gate, type GateRole } from '#/hub/gate';
+import { logLine } from '#/hub/log';
+import { createNotifier } from '#/hub/notifier';
+import { WorkerRegistry } from '#/hub/ownership';
+import { HubState, type FanoutEvent, type State } from '#/hub/state';
+import { Store } from '#/hub/store';
+import { Tokens } from '#/hub/tokens';
 
 export interface HubServerOptions {
-  password: string;
+  dataDir: string;
   bind?: string;
+  port?: number;
+  heartbeatIntervalMs?: number;
+  trustedProxies?: readonly string[];
   maxFailures?: number;
   windowMs?: number;
-  bufferSize?: number;
-  livenessWindowMs?: number;
-  heartbeatIntervalMs?: number;
-  reapIntervalMs?: number;
+  adminKey?: string;
+  ntfyUrl?: string;
+  ntfyTopic?: string;
+  ntfyToken?: string;
+  publicUrl?: string;
+  workerGraceMs?: number;
+  workerScanIntervalMs?: number;
+  writeIntervalMs?: number;
 }
 
 export interface HubServer {
   server: Server;
-  registry: Registry;
   gate: Gate;
+  state: State;
+  tokens: Tokens;
   bind: string;
-  close(): Promise<void>;
+  close(): Promise<{ ok: boolean }>;
 }
 
-interface RouterTiming {
-  heartbeatIntervalMs: number;
-  reapIntervalMs: number;
-}
-
-interface RouterContext {
-  registry: Registry;
-  gate: Gate;
-  timing: RouterTiming;
-  subscribers: Map<string, Set<ServerResponse>>;
-}
-
-const DEFAULT_MAX_FAILURES = 5;
-const DEFAULT_WINDOW_MS = 60000;
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 30000;
-const DEFAULT_REAP_INTERVAL_MS = 5000;
 const DEFAULT_BIND = '127.0.0.1';
-const MAX_BODY_BYTES = 1024 * 1024;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 15000;
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
-const STREAM_PATH = /^\/api\/stream\/([^/]+)$/;
-const SNAPSHOT_PATH = /^\/api\/threads\/([^/]+)\/snapshot$/;
-
-function sendJson(res: ServerResponse, status: number, body: string): void {
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
-  res.end(body);
+  res.end(typeof body === 'string' ? body : JSON.stringify(body));
 }
 
 function sendError(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, JSON.stringify({ error: message }));
+  sendJson(res, status, { error: message });
 }
 
-function bearerOf(req: IncomingMessage): string | undefined {
-  const header = req.headers.authorization;
-  if (header === undefined) return undefined;
-  const match = /^Bearer (.+)$/.exec(header);
-  return match === null ? undefined : match[1];
+interface AuthContext {
+  tokenId: string;
+  role: GateRole;
 }
 
-function sourceOf(req: IncomingMessage): string {
-  return req.socket.remoteAddress ?? 'unknown';
+type RouteHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  match: RegExpMatchArray,
+  auth: AuthContext,
+) => void;
+
+interface Route {
+  method: string;
+  pattern: RegExp;
+  face: 'public' | 'login' | 'worker' | 'browser' | 'admin';
+  handler: RouteHandler;
+}
+
+export class WorkerFace {
+  private readonly streams = new Map<string, ServerResponse>();
+
+  constructor(
+    private readonly state: State,
+    private readonly heartbeatIntervalMs: number,
+    private readonly workerRegistry?: WorkerRegistry,
+  ) {}
+
+  openStream(workerId: string, res: ServerResponse): void {
+    const previous = this.streams.get(workerId);
+    this.streams.set(workerId, res);
+    previous?.destroy();
+    const handle = this.workerRegistry?.online(workerId);
+    const timer = setInterval(() => {
+      this.write(res, ': hb');
+    }, this.heartbeatIntervalMs);
+    timer.unref?.();
+    res.on('close', () => {
+      clearInterval(timer);
+      if (handle !== undefined) this.workerRegistry?.offline(workerId, handle);
+      if (this.streams.get(workerId) !== res) return;
+      this.streams.delete(workerId);
+      this.state.workerDisconnected(workerId);
+    });
+    this.state.workerConnected(workerId);
+  }
+
+  pushOp(workerId: string, push: OpPush): void {
+    const res = this.streams.get(workerId);
+    if (res === undefined) return;
+    this.write(res, `event: op\ndata: ${JSON.stringify(push)}`);
+  }
+
+  closeWorker(workerId: string): void {
+    this.streams.get(workerId)?.destroy();
+  }
+
+  private write(res: ServerResponse, text: string): void {
+    try {
+      res.write(`${text}\n\n`);
+    } catch {
+      res.destroy();
+    }
+  }
+}
+
+export class BrowserFace {
+  private readonly streams = new Set<ServerResponse>();
+  private listening = false;
+
+  constructor(
+    private readonly state: State,
+    private readonly heartbeatIntervalMs: number,
+  ) {}
+
+  start(): void {
+    if (this.listening) return;
+    this.listening = true;
+    this.state.onFanout((event) => {
+      this.broadcast(event);
+    });
+  }
+
+  openStream(res: ServerResponse): void {
+    this.streams.add(res);
+    const timer = setInterval(() => {
+      this.write(res, ': hb');
+    }, this.heartbeatIntervalMs);
+    timer.unref?.();
+    res.on('close', () => {
+      clearInterval(timer);
+      this.streams.delete(res);
+    });
+  }
+
+  private broadcast(event: FanoutEvent): void {
+    if (this.streams.size === 0) return;
+    this.writeEvent(event.type, event);
+  }
+
+  private writeEvent(name: string, body: unknown): void {
+    this.writeToAll(`event: ${name}\ndata: ${JSON.stringify(body)}`);
+  }
+
+  private writeToAll(text: string): void {
+    for (const res of this.snapshotStreams()) this.write(res, text);
+  }
+
+  private snapshotStreams(): ServerResponse[] {
+    return Array.from(this.streams);
+  }
+
+  private write(res: ServerResponse, text: string): void {
+    try {
+      res.write(`${text}\n\n`);
+    } catch {
+      this.streams.delete(res);
+      res.destroy();
+    }
+  }
+}
+
+export interface RouterDeps {
+  gate: Gate;
+  state: State;
+  tokens: Tokens;
+  workers: WorkerFace;
+  browsers: BrowserFace;
+  workerRegistry: WorkerRegistry;
+  heartbeatIntervalMs: number;
+}
+
+export function createRouterDeps(options: HubServerOptions): { deps: RouterDeps; store: Store } | { fatal: string } {
+  const store = new Store({
+    dataDir: options.dataDir,
+    writeIntervalMs: options.writeIntervalMs,
+    onWriteError: (error) => {
+      logLine('store-write-failed', String(error));
+    },
+  });
+  const loaded = store.load();
+  if (!loaded.ok) return { fatal: loaded.error };
+  let tokensCommitted = loaded.state.tokens;
+  const stateView = () => {
+    const view = state.persistView();
+    return { tokens: tokensCommitted, threads: view.threads, receipts: view.receipts };
+  };
+  const tokens = new Tokens({
+    store: {
+      records: () => tokensCommitted,
+      save: async (next) => {
+        const result = await store.commitTokens(next);
+        if (!result.ok) throw new Error('persist-failed');
+        tokensCommitted = [...next];
+      },
+    },
+  });
+  store.bindPersistView(stateView);
+  const gate = new Gate({
+    lookup: (secret) => tokens.lookup(secret),
+    adminKey: options.adminKey,
+    trustedProxies: options.trustedProxies,
+    maxFailures: options.maxFailures,
+    windowMs: options.windowMs,
+  });
+  let workers: WorkerFace;
+  let browsers: BrowserFace;
+  const state = new HubState({
+    deliver: (workerId, push) => {
+      workers.pushOp(workerId, push);
+    },
+    tokenName: (tokenId) => tokens.list().find((record) => record.tokenId === tokenId)?.name,
+    onLog: (message) => {
+      logLine('register-rejected', message);
+    },
+    notifier: createNotifier({
+      ntfyUrl: options.ntfyUrl,
+      ntfyTopic: options.ntfyTopic,
+      ntfyToken: options.ntfyToken,
+      publicUrl: options.publicUrl,
+    }),
+  });
+  state.restore({
+    threads: loaded.state.threads,
+    receipts: loaded.state.receipts,
+  });
+  const workerRegistry = new WorkerRegistry({
+    graceMs: options.workerGraceMs,
+    scanIntervalMs: options.workerScanIntervalMs,
+    onLog: (message) => {
+      logLine('register-rejected', message);
+    },
+    onExpire: (workerId) => {
+      state.markWorkerReceiptsLost(workerId);
+    },
+  });
+  workerRegistry.restoreFrom(loaded.state.threads, loaded.state.receipts);
+  workerRegistry.startScan();
+  state.onPersist(() => {
+    store.requestWrite();
+  });
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+  workers = new WorkerFace(state, heartbeatIntervalMs, workerRegistry);
+  browsers = new BrowserFace(state, heartbeatIntervalMs);
+  browsers.start();
+  return {
+    store,
+    deps: {
+      gate,
+      state,
+      tokens,
+      workers,
+      browsers,
+      workerRegistry,
+      heartbeatIntervalMs,
+    },
+  };
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
-    const piece = chunk as Buffer;
-    size += piece.length;
-    if (size > MAX_BODY_BYTES) throw new Error('body too large');
-    chunks.push(piece);
+    const buffer = chunk as Buffer;
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) throw new Error('payload too large');
+    chunks.push(buffer);
   }
-  if (chunks.length === 0) return undefined;
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (text.trim().length === 0) return undefined;
+  return JSON.parse(text);
 }
 
-function broadcast(ctx: RouterContext, threadId: string, payload: string): void {
-  const set = ctx.subscribers.get(threadId);
-  if (set === undefined) return;
-  for (const res of set) res.write(payload);
+async function rejectNonJson(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  if (hasJsonContentType(req)) return false;
+  await new Promise<void>((resolve) => {
+    req.resume();
+    req.once('end', resolve);
+    req.once('close', resolve);
+  });
+  sendError(res, 415, 'content-type must be application/json');
+  return true;
 }
 
-function dropSubscriber(ctx: RouterContext, threadId: string, res: ServerResponse): void {
-  const set = ctx.subscribers.get(threadId);
-  if (set === undefined) return;
-  set.delete(res);
-  if (set.size === 0) ctx.subscribers.delete(threadId);
+function hasJsonContentType(req: IncomingMessage): boolean {
+  const header = req.headers['content-type'];
+  const value = Array.isArray(header) ? header[0] : header;
+  if (value === undefined) return false;
+  const semicolon = value.indexOf(';');
+  const mime = (semicolon === -1 ? value : value.slice(0, semicolon)).trim().toLowerCase();
+  return mime === 'application/json';
 }
 
-function closeSubscribers(ctx: RouterContext, threadId: string): void {
-  const set = ctx.subscribers.get(threadId);
-  if (set === undefined) return;
-  for (const res of set) res.end();
-  ctx.subscribers.delete(threadId);
+export function buildRoutes(deps: RouterDeps): Route[] {
+  const route = (method: string, pattern: RegExp, face: Route['face'], handler: RouteHandler): Route => ({
+    method,
+    pattern,
+    face,
+    handler,
+  });
+  return [
+    route('GET', /^\/$/, 'public', (_req, res) => {
+      servePage(res);
+    }),
+    route('POST', /^\/api\/worker\/register$/, 'worker', (req, res, _match, auth) => {
+      void handleWorkerRegister(deps, auth, req, res);
+    }),
+    route('GET', /^\/api\/worker\/stream$/, 'worker', (req, res, _match, auth) => {
+      handleWorkerStream(deps, auth, req, res);
+    }),
+    route('POST', /^\/api\/worker\/batch$/, 'worker', (req, res, _match, auth) => {
+      void handleWorkerBatch(deps, auth, req, res);
+    }),
+    route('POST', /^\/api\/worker\/receipt$/, 'worker', (req, res, _match, auth) => {
+      void handleWorkerReceipt(deps, auth, req, res);
+    }),
+    route('POST', /^\/api\/worker\/unregister$/, 'worker', (req, res, _match, auth) => {
+      void handleWorkerUnregister(deps, auth, req, res);
+    }),
+    route('POST', /^\/api\/browser\/login$/, 'login', (req, res) => {
+      void handleBrowserLogin(deps, req, res);
+    }),
+    route('POST', /^\/api\/browser\/logout$/, 'browser', (_req, res) => {
+      handleBrowserLogout(res);
+    }),
+    route('GET', /^\/api\/browser\/inbox$/, 'browser', (_req, res) => {
+      handleBrowserInbox(deps, res);
+    }),
+    route('GET', /^\/api\/browser\/threads\/([^/]+)$/, 'browser', (_req, res, match) => {
+      handleBrowserThread(deps, res, decodeURIComponent(match[1] ?? ''));
+    }),
+    route('GET', /^\/api\/browser\/stream$/, 'browser', (_req, res, _match, auth) => {
+      handleBrowserStream(deps, auth, res);
+    }),
+    route('POST', /^\/api\/browser\/ops$/, 'browser', (req, res, _match, auth) => {
+      void handleBrowserOps(deps, auth, req, res);
+    }),
+    route('DELETE', /^\/api\/browser\/threads\/([^/]+)$/, 'browser', (_req, res, match) => {
+      void handleBrowserThreadDelete(deps, res, decodeURIComponent(match[1] ?? ''));
+    }),
+    route('GET', /^\/api\/browser\/devices$/, 'browser', (_req, res) => {
+      handleBrowserDevices(deps, res);
+    }),
+    route('DELETE', /^\/api\/browser\/tokens\/([^/]+)$/, 'browser', (_req, res, match) => {
+      void revokeToken(deps, res, decodeURIComponent(match[1] ?? ''));
+    }),
+    route('POST', /^\/api\/admin\/tokens$/, 'admin', (req, res) => {
+      void handleAdminIssue(deps, req, res);
+    }),
+    route('GET', /^\/api\/admin\/tokens$/, 'admin', (_req, res) => {
+      handleAdminList(deps, res);
+    }),
+    route('DELETE', /^\/api\/admin\/tokens\/([^/]+)$/, 'admin', (_req, res, match) => {
+      void revokeToken(deps, res, decodeURIComponent(match[1] ?? ''));
+    }),
+  ];
 }
 
-function openStream(ctx: RouterContext, req: IncomingMessage, res: ServerResponse, threadId: string): void {
-  if (ctx.registry.get(threadId) === undefined) {
-    sendError(res, 404, 'unknown thread');
+async function handleWorkerRegister(
+  deps: RouterDeps,
+  auth: AuthContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const parsed = parseWorkerRegister(await readJsonBody(req));
+  if (!parsed.ok) {
+    sendError(res, 400, parsed.issues);
     return;
   }
+  if (!deps.workerRegistry.claim(parsed.value.workerId, auth.tokenId)) {
+    const response: RegisterResponse = {
+      workerId: parsed.value.workerId,
+      threads: parsed.value.threads.map((thread) => ({
+        sessionId: thread.descriptor.sessionId,
+        accepted: false,
+      })),
+    };
+    sendJson(res, 200, response);
+    return;
+  }
+  const response = deps.state.register(auth.tokenId, parsed.value.workerId, parsed.value);
+  sendJson(res, 200, response);
+}
+
+function handleWorkerStream(deps: RouterDeps, auth: AuthContext, req: IncomingMessage, res: ServerResponse): void {
+  const url = new URL(req.url ?? '/', 'http://hub.local');
+  const workerId = url.searchParams.get('workerId') ?? '';
+  if (workerId.length === 0) {
+    sendError(res, 400, 'workerId required');
+    return;
+  }
+  if (!deps.workerRegistry.authorize(workerId, auth.tokenId)) {
+    sendError(res, 404, 'not found');
+    return;
+  }
+  deps.gate.registerConnection(auth.tokenId, res);
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache',
     'x-accel-buffering': 'no',
-    connection: 'keep-alive',
   });
-  res.flushHeaders();
-  let set = ctx.subscribers.get(threadId);
-  if (set === undefined) {
-    set = new Set();
-    ctx.subscribers.set(threadId, set);
-  }
-  set.add(res);
-  const heartbeat = setInterval(() => {
-    res.write(': heartbeat\n\n');
-  }, ctx.timing.heartbeatIntervalMs);
-  let dropped = false;
-  const drop = () => {
-    if (dropped) return;
-    dropped = true;
-    clearInterval(heartbeat);
-    dropSubscriber(ctx, threadId, res);
-  };
-  req.on('close', drop);
-  res.on('close', drop);
+  res.write(': connected\n\n');
+  deps.workers.openStream(workerId, res);
 }
 
-function descriptorFrom(body: unknown): Descriptor | undefined {
-  const parsed = descriptorSchema.safeParse(body);
-  return parsed.success ? parsed.data : undefined;
-}
-
-async function handleRegister(ctx: RouterContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let body: unknown;
-  try {
-    body = await readJsonBody(req);
-  } catch {
-    sendError(res, 400, 'invalid descriptor');
-    return;
-  }
-  const descriptor = descriptorFrom(body);
-  if (descriptor === undefined) {
-    sendError(res, 400, 'invalid descriptor');
-    return;
-  }
-  const thread = ctx.registry.create(descriptor);
-  sendJson(res, 200, JSON.stringify({ id: thread.id }));
-}
-
-async function handleEntry(ctx: RouterContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const threadId = new URL(req.url ?? '/', 'http://hub.local').searchParams.get('target');
-  let body: unknown;
-  try {
-    body = await readJsonBody(req);
-  } catch {
-    sendError(res, 400, 'invalid frame');
-    return;
-  }
-  const parsed = parseUplinkFrame(body);
+async function handleWorkerBatch(deps: RouterDeps, auth: AuthContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const parsed = parseUplinkBatch(await readJsonBody(req));
   if (!parsed.ok) {
-    sendError(res, 400, 'invalid frame');
+    sendError(res, 400, parsed.issues);
     return;
   }
-  const frame = parsed.frame;
-  const thread = threadId === null ? undefined : ctx.registry.get(threadId);
-  if (thread === undefined) {
-    sendError(res, 404, 'unknown thread');
+  if (!deps.workerRegistry.authorize(parsed.value.workerId, auth.tokenId)) {
+    logLine('batch-gap', `resync required for worker ${parsed.value.workerId}`);
+    sendError(res, 409, 'resync-required');
     return;
   }
-  if (frame.type === 'register') {
-    thread.buffer.reset();
-    thread.descriptor = { ...frame.descriptor };
-    thread.touch();
-    broadcast(ctx, thread.id, `data: ${JSON.stringify({ reset: true, descriptor: frame.descriptor })}\n\n`);
-    sendJson(res, 200, JSON.stringify({ ok: true }));
+  const result = deps.state.applyBatch(parsed.value.workerId, parsed.value);
+  if (result.ok) {
+    res.writeHead(200);
+    res.end();
     return;
   }
-  if (frame.type === 'descriptor') {
-    thread.descriptor = { ...frame.descriptor };
-    thread.touch();
-    broadcast(ctx, thread.id, `data: ${JSON.stringify({ descriptor: frame.descriptor })}\n\n`);
-    sendJson(res, 200, JSON.stringify({ ok: true }));
-    return;
-  }
-  const seq = thread.buffer.append(frame.entry);
-  thread.touch();
-  broadcast(ctx, thread.id, `data: ${JSON.stringify({ seq, entry: frame.entry })}\n\n`);
-  sendJson(res, 200, JSON.stringify({ seq }));
+  logLine('batch-gap', `resync required for worker ${parsed.value.workerId}`);
+  sendError(res, 409, result.reason);
 }
 
-async function handleAction(ctx: RouterContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let body: unknown;
-  try {
-    body = await readJsonBody(req);
-  } catch {
-    sendError(res, 400, 'invalid action');
-    return;
-  }
-  const parsed = parseActionFrame(body);
+async function handleWorkerReceipt(deps: RouterDeps, auth: AuthContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const parsed = parseWorkerReceiptReport(await readJsonBody(req));
   if (!parsed.ok) {
-    sendError(res, 400, 'invalid action');
+    sendError(res, 400, parsed.issues);
     return;
   }
-  const frame: ActionFrame = parsed.frame;
-  const thread = ctx.registry.get(frame.target);
-  if (thread === undefined) {
-    sendError(res, 404, 'unknown thread');
-    return;
+  if (deps.workerRegistry.authorize(parsed.value.workerId, auth.tokenId)) {
+    for (const report of parsed.value.receipts) {
+      deps.state.reportReceipt(parsed.value.workerId, report);
+    }
   }
-  broadcast(ctx, thread.id, `data: ${JSON.stringify({ action: frame })}\n\n`);
-  sendJson(res, 200, JSON.stringify({ ok: true }));
+  res.writeHead(204);
+  res.end();
 }
 
-async function handleHeartbeat(ctx: RouterContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let body: unknown;
-  try {
-    body = await readJsonBody(req);
-  } catch {
-    sendError(res, 400, 'invalid heartbeat');
+async function handleWorkerUnregister(deps: RouterDeps, auth: AuthContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const parsed = parseWorkerUnregister(await readJsonBody(req));
+  if (!parsed.ok) {
+    sendError(res, 400, parsed.issues);
     return;
   }
-  const target =
-    typeof body === 'object' && body !== null && 'target' in body && typeof body.target === 'string'
-      ? body.target
-      : undefined;
-  const thread = target === undefined ? undefined : ctx.registry.get(target);
-  if (thread === undefined) {
-    sendError(res, 404, 'unknown thread');
+  if (deps.workerRegistry.authorize(parsed.value.workerId, auth.tokenId)) {
+    deps.workerRegistry.unregister(parsed.value.workerId);
+    deps.workers.closeWorker(parsed.value.workerId);
+    deps.state.unregister(parsed.value.workerId, parsed.value.finalReceipts);
+  }
+  res.writeHead(204);
+  res.end();
+}
+
+async function handleBrowserLogin(deps: RouterDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (await rejectNonJson(req, res)) return;
+  const ip = deps.gate.clientIp(req);
+  const limited = deps.gate.isLimited(ip);
+  const body = await readJsonBody(req);
+  const parsed = parseBrowserLoginRequest(body);
+  if (!limited && parsed.ok) {
+    const record = deps.tokens.lookup(parsed.value.token);
+    if (record !== undefined && record.role === 'device') {
+      res.writeHead(204, {
+        'set-cookie': `${BROWSER_COOKIE_NAME}=${parsed.value.token}; HttpOnly; Secure; SameSite=Strict; Path=/`,
+      });
+      res.end();
+      return;
+    }
+  }
+  deps.gate.noteAuthFailure(ip);
+  sendError(res, limited ? 429 : 401, limited ? 'rate limited' : 'invalid token');
+}
+
+function handleBrowserLogout(res: ServerResponse): void {
+  res.writeHead(204, {
+    'set-cookie': `${BROWSER_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`,
+  });
+  res.end();
+}
+
+function handleBrowserInbox(deps: RouterDeps, res: ServerResponse): void {
+  sendJson(res, 200, { threads: deps.state.inbox() });
+}
+
+function handleBrowserThread(deps: RouterDeps, res: ServerResponse, sessionId: string): void {
+  const snapshot = deps.state.threadSnapshot(sessionId);
+  if (snapshot === undefined) {
+    sendError(res, 404, 'thread not found');
     return;
   }
-  thread.touch();
-  sendJson(res, 200, JSON.stringify({ ok: true }));
+  sendJson(res, 200, snapshot);
 }
 
-function handleSnapshot(ctx: RouterContext, res: ServerResponse, threadId: string): void {
-  const thread = ctx.registry.get(threadId);
-  if (thread === undefined) {
-    sendError(res, 404, 'unknown thread');
+function handleBrowserStream(deps: RouterDeps, auth: AuthContext, res: ServerResponse): void {
+  deps.gate.registerConnection(auth.tokenId, res);
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    'x-accel-buffering': 'no',
+  });
+  res.write(': connected\n\n');
+  deps.browsers.openStream(res);
+}
+
+async function handleBrowserOps(
+  deps: RouterDeps,
+  auth: AuthContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (await rejectNonJson(req, res)) return;
+  const parsed = parseBrowserOpsRequest(await readJsonBody(req));
+  if (!parsed.ok) {
+    sendError(res, 400, parsed.issues);
     return;
   }
-  const snapshot = thread.buffer.snapshot();
-  sendJson(
-    res,
-    200,
-    JSON.stringify({
-      descriptor: thread.descriptor,
-      entries: snapshot.entries,
-      maxSeq: snapshot.maxSeq,
-      openCards: snapshot.openCards,
-    }),
-  );
+  const receipt = deps.state.acceptOp(auth.tokenId, parsed.value.sessionId, parsed.value.intent);
+  sendJson(res, 202, receipt);
 }
 
-function handleThreads(ctx: RouterContext, res: ServerResponse): void {
-  sendJson(res, 200, JSON.stringify({ threads: ctx.registry.list() }));
+async function handleBrowserThreadDelete(deps: RouterDeps, res: ServerResponse, sessionId: string): Promise<void> {
+  const result = deps.state.removeOfflineThread(sessionId);
+  if (result.ok) {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  sendError(res, 409, result.reason);
 }
 
-async function handleRequest(ctx: RouterContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
+function handleBrowserDevices(deps: RouterDeps, res: ServerResponse): void {
+  sendJson(res, 200, deps.tokens.list());
+}
+
+async function handleAdminIssue(deps: RouterDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (await rejectNonJson(req, res)) return;
+  const parsed = parseAdminIssueRequest(await readJsonBody(req));
+  if (!parsed.ok) {
+    sendError(res, 400, parsed.issues);
+    return;
+  }
+  const result = await deps.tokens.issue(parsed.value.role, parsed.value.name);
+  if (result.ok) {
+    sendJson(res, 200, { tokenId: result.tokenId, secret: result.secret });
+    return;
+  }
+  sendError(res, result.reason === 'duplicate-name' ? 409 : 500, result.reason);
+}
+
+function handleAdminList(deps: RouterDeps, res: ServerResponse): void {
+  sendJson(res, 200, deps.tokens.list());
+}
+
+async function revokeToken(deps: RouterDeps, res: ServerResponse, tokenId: string): Promise<void> {
+  const record = deps.tokens.list().find((entry) => entry.tokenId === tokenId);
+  const result = await deps.tokens.revoke(tokenId);
+  if (!result.ok) {
+    sendError(res, 500, 'revoke failed');
+    return;
+  }
+  deps.gate.closeAll(tokenId);
+  if (record?.role === 'machine') {
+    deps.state.dropOwner(tokenId);
+    deps.workerRegistry.revokeOwner(tokenId);
+  }
+  res.writeHead(204);
+  res.end();
+}
+
+async function handleRequest(routes: Route[], deps: RouterDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://hub.local');
-  const method = req.method ?? 'GET';
-  const path = url.pathname;
-  if (method === 'GET' && path === '/') {
-    servePage(res);
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (hasQueryCredential(url)) {
+    sendError(res, 401, 'credentials are not accepted in the query string');
     return;
   }
-  const verdict = ctx.gate.check(sourceOf(req), bearerOf(req) ?? url.searchParams.get('key') ?? undefined);
-  if (verdict === 'unauthorized') {
-    sendError(res, 401, 'unauthorized');
-    return;
-  }
-  if (verdict === 'rate-limited') {
-    sendError(res, 429, 'rate limited');
-    return;
-  }
-  if (method === 'GET' && path === '/api/threads') {
-    handleThreads(ctx, res);
-    return;
-  }
-  if (method === 'POST' && path === '/api/register') {
-    await handleRegister(ctx, req, res);
-    return;
-  }
-  if (method === 'POST' && path === '/api/entry') {
-    await handleEntry(ctx, req, res);
-    return;
-  }
-  if (method === 'POST' && path === '/api/action') {
-    await handleAction(ctx, req, res);
-    return;
-  }
-  if (method === 'POST' && path === '/api/heartbeat') {
-    await handleHeartbeat(ctx, req, res);
-    return;
-  }
-  if (method === 'GET') {
-    const streamMatch = STREAM_PATH.exec(path);
-    if (streamMatch !== null) {
-      openStream(ctx, req, res, streamMatch[1]!);
+  for (const route of routes) {
+    if (route.method !== method) continue;
+    const match = route.pattern.exec(url.pathname);
+    if (match === null) continue;
+    if (route.face === 'public' || route.face === 'login') {
+      route.handler(req, res, match, { tokenId: '', role: 'machine' });
       return;
     }
-    const snapshotMatch = SNAPSHOT_PATH.exec(path);
-    if (snapshotMatch !== null) {
-      handleSnapshot(ctx, res, snapshotMatch[1]!);
+    const verdict = deps.gate.authorize(req, route.face);
+    if (!verdict.ok) {
+      sendError(res, verdict.status, verdict.status === 429 ? 'rate limited' : 'unauthorized');
       return;
     }
+    route.handler(req, res, match, { tokenId: verdict.tokenId, role: verdict.role });
+    return;
   }
   sendError(res, 404, 'not found');
 }
 
+function hasQueryCredential(url: URL): boolean {
+  return url.searchParams.has('key') || url.searchParams.has('token');
+}
+
 export function createHubServer(options: HubServerOptions): HubServer {
   const bind = options.bind ?? DEFAULT_BIND;
-  const gate = new Gate({
-    password: options.password,
-    maxFailures: options.maxFailures ?? DEFAULT_MAX_FAILURES,
-    windowMs: options.windowMs ?? DEFAULT_WINDOW_MS,
-  });
-  const registry = new Registry({ bufferSize: options.bufferSize, livenessWindowMs: options.livenessWindowMs });
-  const ctx: RouterContext = {
-    registry,
-    gate,
-    timing: {
-      heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
-      reapIntervalMs: options.reapIntervalMs ?? DEFAULT_REAP_INTERVAL_MS,
-    },
-    subscribers: new Map(),
-  };
+  const router = createRouterDeps(options);
+  if ('fatal' in router) throw new Error(router.fatal);
+  const { deps, store } = router;
+  const routes = buildRoutes(deps);
   const server = createServer((req, res) => {
-    void handleRequest(ctx, req, res).catch(() => {
+    void handleRequest(routes, deps, req, res).catch(() => {
       if (!res.headersSent) sendError(res, 400, 'bad request');
       else res.end();
     });
   });
-  const reaper = setInterval(() => {
-    for (const threadId of registry.reap(Date.now())) closeSubscribers(ctx, threadId);
-  }, ctx.timing.reapIntervalMs);
   return {
     server,
-    registry,
-    gate,
+    gate: deps.gate,
+    state: deps.state,
+    tokens: deps.tokens,
     bind,
-    close() {
-      clearInterval(reaper);
-      for (const threadId of ctx.subscribers.keys()) closeSubscribers(ctx, threadId);
+    async close() {
+      deps.workerRegistry.stopScan();
+      server.close();
       server.closeAllConnections();
-      return new Promise<void>((resolve) => {
-        server.close(() => {
-          resolve();
-        });
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
       });
+      try {
+        await store.flush();
+        return { ok: true };
+      } catch (error) {
+        logLine('store-write-failed', String(error));
+        return { ok: false };
+      }
     },
   };
 }

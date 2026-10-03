@@ -83,7 +83,7 @@ describe('forum slash command registration', () => {
 describe('handleForumCommand', () => {
   it('shows the no-active-session error and never touches the network or controller', async () => {
     const host = makeHost({ session: undefined, controller: makeStubController() });
-    writeRemoteKey('url=http://127.0.0.1:8787\npassword=x\n');
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=x\n');
 
     await handleForumCommand(host);
 
@@ -135,7 +135,7 @@ describe('handleForumCommand', () => {
   it('publishes when detached: credential resolved and forwarded to start', async () => {
     const controller = makeStubController('detached');
     const host = makeHost({ controller });
-    writeRemoteKey('url=http://127.0.0.1:8787\npassword=secret123\n');
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=secret123\n');
 
     await handleForumCommand(host);
 
@@ -143,23 +143,23 @@ describe('handleForumCommand', () => {
     expect(controller.start).toHaveBeenCalledTimes(1);
     expect(controller.start).toHaveBeenCalledWith({
       url: 'http://127.0.0.1:8787',
-      password: 'secret123',
+      token: 'secret123',
     });
     expect(host.showStatus).toHaveBeenCalledWith('Forum Link: published');
     expect(host.showError).not.toHaveBeenCalled();
   });
 
-  it('passes an empty password through when the key file omits it', async () => {
+  it('shows the credential error when the key file omits the token', async () => {
     const controller = makeStubController('detached');
     const host = makeHost({ controller });
     writeRemoteKey('url=http://127.0.0.1:8787\n');
 
     await handleForumCommand(host);
 
-    expect(controller.start).toHaveBeenCalledWith({
-      url: 'http://127.0.0.1:8787',
-      password: '',
-    });
+    expect(controller.start).not.toHaveBeenCalled();
+    expect(host.showError).toHaveBeenCalledTimes(1);
+    const message = host.showError.mock.calls[0]?.[0] as string;
+    expect(message).toContain('token');
   });
 
   it('shows the error when start fails (e.g. 401)', async () => {
@@ -170,7 +170,7 @@ describe('handleForumCommand', () => {
       error: new Error('unauthorized'),
     });
     const host = makeHost({ controller });
-    writeRemoteKey('url=http://127.0.0.1:8787\npassword=bad\n');
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=bad\n');
 
     await handleForumCommand(host);
 
@@ -255,31 +255,22 @@ describe('KimiTUI — ensureForumLink / buildForumDescriptor wiring', () => {
     tui.setAppState({ sessionTitle: '我的调试会话' });
 
     expect(controller).toBeInstanceOf(ForumLinkController);
-    const describe = (
-      controller as unknown as { deps: { buildDescriptor?: (session: unknown) => unknown } }
-    ).deps;
-    const result = describe.buildDescriptor?.({ id: 'ses-42' }) as {
-      sessionId: string;
-      machineName: string;
-      projectName: string;
-      title: string;
-    };
-    expect(result.sessionId).toBe('ses-42');
-    expect(result.projectName).toBe('forum-demo');
-    expect(result.title).toBe('我的调试会话');
-    expect(result).not.toHaveProperty('status');
-    expect(typeof result.machineName).toBe('string');
-    expect(result.machineName.length).toBeGreaterThan(0);
+    const snapshot = controller.getSnapshot();
+    const thread = snapshot.threads[0]!;
+    expect(thread.descriptor.kind).toBe('interactive');
+    expect(thread.descriptor.project).toBe('forum-demo');
+    expect(thread.descriptor.title).toBe('我的调试会话');
+    expect(thread.descriptor.machine.tokenName).toBe('');
+    expect(typeof thread.descriptor.machine.hostname).toBe('string');
+    expect(thread.descriptor.machine.hostname.length).toBeGreaterThan(0);
+    expect(thread.descriptor.capabilities.length).toBeGreaterThan(0);
   });
 
   it('descriptor title falls back to empty string without a session title', () => {
     const tui = makeTui('/tmp/proj-b');
     const controller = tui.ensureForumLink();
-    const describe = (
-      controller as unknown as { deps: { buildDescriptor?: (session: unknown) => unknown } }
-    ).deps;
-    const result = describe.buildDescriptor?.({ id: 's' }) as { title: string };
-    expect(result.title).toBe('');
+    const snapshot = controller.getSnapshot();
+    expect(snapshot.threads[0]!.descriptor.title).toBe('');
   });
 
   it('S3 wrapper picks up the lazily created controller on later panel shows', () => {
@@ -316,19 +307,17 @@ describe('KimiTUI — ensureForumLink / buildForumDescriptor wiring', () => {
       display: [],
       choices: [{ label: 'Allow', response: 'approved' }],
     });
-    expect(tui.forumLink?.openCards ?? []).toEqual([
-      { cardId: 'c1', kind: 'approval', upstreamId: 'late-1' },
-    ]);
+    const openCards = tui.forumLink?.openCards ?? [];
+    expect(openCards).toHaveLength(1);
+    expect(openCards[0]!.kind).toBe('approval');
+    expect(openCards[0]!.cardId.startsWith('approval_')).toBe(true);
   });
 
   it('basename mapping uses the platform separator for workDir', () => {
     const tui = makeTui(join('C:', 'work', 'repo-x'));
     const controller = tui.ensureForumLink();
-    const describe = (
-      controller as unknown as { deps: { buildDescriptor?: (session: unknown) => unknown } }
-    ).deps;
-    const result = describe.buildDescriptor?.({ id: 's' }) as { projectName: string };
-    expect(result.projectName).toBe('repo-x');
+    const snapshot = controller.getSnapshot();
+    expect(snapshot.threads[0]!.descriptor.project).toBe('repo-x');
   });
 
   it('ensureForumLink seeds the current session when one already exists', async () => {
@@ -361,7 +350,7 @@ describe('dispatchInput — /forum routing', () => {
   it('dispatches /forum through the builtin path to the command handler', async () => {
     const controller = makeStubController('detached');
     const host = makeHost({ controller });
-    writeRemoteKey('url=http://127.0.0.1:8787\npassword=route\n');
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=route\n');
 
     dispatchInput(host, '/forum');
     await vi.waitFor(() => {
@@ -369,7 +358,7 @@ describe('dispatchInput — /forum routing', () => {
     });
     expect(controller.start).toHaveBeenCalledWith({
       url: 'http://127.0.0.1:8787',
-      password: 'route',
+      token: 'route',
     });
     expect(host.showStatus).toHaveBeenCalledWith('Forum Link: published');
   });
@@ -377,7 +366,7 @@ describe('dispatchInput — /forum routing', () => {
   it('dispatches /forum to stop when already published', async () => {
     const controller = makeStubController('published');
     const host = makeHost({ controller });
-    writeRemoteKey('url=http://127.0.0.1:8787\npassword=route\n');
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=route\n');
 
     dispatchInput(host, '/forum');
     await vi.waitFor(() => {

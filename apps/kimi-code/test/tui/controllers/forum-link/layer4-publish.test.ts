@@ -1,95 +1,451 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import { createServer, type Server } from 'node:http';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import type { ActionFrame, Descriptor, Entry, UplinkFrame } from '@moonshot-ai/forum-link';
-import type { Event, Session, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
+import type { ModelAlias, Session } from '@moonshot-ai/kimi-code-sdk';
+import { BROWSER_COOKIE_NAME, type ReceiptReport, type UplinkFrame } from '@moonshot-ai/forum-link';
 
-import type { SlashCommandHost } from '#/tui/commands/dispatch';
-import { handleForumCommand } from '#/tui/commands/forum';
-import { ForumLinkController, wrapUiHooksForForumLink } from '#/tui/controllers/forum-link';
-import { Link } from '#/tui/controllers/forum-link/link';
-import { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
-import type { ReverseRPCUIHooks } from '#/tui/reverse-rpc/index';
-import { QuestionController } from '#/tui/reverse-rpc/question/controller';
-import type { ApprovalPanelData, QuestionPanelData } from '#/tui/reverse-rpc/types';
 import type { AppState } from '#/tui/types';
+import { DEFAULT_NOTIFICATIONS_CONFIG, DEFAULT_UPGRADE_PREFERENCES } from '#/tui/config';
+import type { SlashCommandHost } from '#/tui/commands/dispatch';
+import { ForumLinkController } from '#/tui/controllers/forum-link';
+import { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
+import { QuestionController } from '#/tui/reverse-rpc/question/controller';
+import type { ApprovalPanelData, DiffDisplayBlock, QuestionPanelData } from '#/tui/reverse-rpc/types';
 
-const HUB_MJS = fileURLToPath(new URL('../../../../../../packages/forum-link/dist/hub.mjs', import.meta.url));
-const LINK_SOURCE = fileURLToPath(new URL('../../../../src/tui/controllers/forum-link/link.ts', import.meta.url));
-const CONTROLLER_SOURCE = fileURLToPath(
-  new URL('../../../../src/tui/controllers/forum-link/controller.ts', import.meta.url),
-);
-const HUB_BUILT = existsSync(HUB_MJS);
+const TEST_TIMING = {
+  heartbeatTimeoutMs: 5_000,
+  backoffBaseMs: 10,
+  backoffCapMs: 40,
+  batchIntervalMs: 5,
+};
 
-const PASSWORD = 'secret';
-const SESSION_ID = 'layer4-session';
+const APPROVAL_CHOICES: ApprovalPanelData['choices'] = [
+  { label: 'Approve once', response: 'approved' },
+  { label: 'Approve for this session', response: 'approved_for_session' },
+  { label: 'Reject', response: 'rejected' },
+];
 
-const LINK_TIMING = { heartbeatIntervalMs: 200, heartbeatTimeoutMs: 800, backoffBaseMs: 100, backoffCapMs: 300 };
-
-interface ThreadSummaryJson {
-  id: string;
-  descriptor: Descriptor;
+function approvalData(id: string, overrides: Partial<ApprovalPanelData> = {}): ApprovalPanelData {
+  return {
+    id,
+    tool_call_id: id,
+    tool_name: 'Bash',
+    action: 'run a command',
+    description: '',
+    display: [],
+    choices: APPROVAL_CHOICES,
+    ...overrides,
+  };
 }
 
-interface SnapshotJson {
-  descriptor: Descriptor;
-  entries: { seq: number; entry: Entry }[];
-  maxSeq: number;
-}
-
-interface HubProcess {
-  readonly baseUrl: string;
-  readonly port: number;
-  kill(): Promise<void>;
-}
-
-const liveChildren = new Map<ChildProcess, Promise<void>>();
-
-function trackChild(child: ChildProcess): void {
-  const exited = new Promise<void>((resolve) => {
-    child.once('exit', resolve);
+function planReviewData(id: string): ApprovalPanelData {
+  const diff: DiffDisplayBlock = {
+    type: 'diff',
+    path: 'src/a.ts',
+    old_text: 'line1\nline2',
+    new_text: 'line1\nline2 changed',
+  } as unknown as DiffDisplayBlock;
+  return approvalData(id, {
+    tool_name: 'ExitPlanMode',
+    action: 'review plan',
+    display: [diff],
   });
-  liveChildren.set(child, exited);
-  void exited.then(() => {
-    liveChildren.delete(child);
-  });
 }
 
-afterAll(async () => {
-  for (const child of [...liveChildren.keys()]) await stopChild(child);
+function questionData(id: string): QuestionPanelData {
+  return {
+    id,
+    tool_call_id: id,
+    questions: [{ question: 'Pick one?', multi_select: false, options: [{ label: 'A' }, { label: 'B' }] }],
+  };
+}
+
+function makeSession(id: string): Session {
+  return { id, onEvent: () => () => {} } as never as Session;
+}
+
+interface RecordedRequest {
+  method: string;
+  path: string;
+  body: unknown;
+}
+
+class PublishFakeHub {
+  readonly requests: RecordedRequest[] = [];
+  readonly registerSnapshots: unknown[] = [];
+  readonly unregisterBodies: unknown[] = [];
+  readonly receiptBodies: unknown[] = [];
+  readonly batches: { frames: UplinkFrame[] }[] = [];
+  private server: Server | undefined;
+  private readonly streamControllers = new Set<{ write: (chunk: string) => void; close: () => void }>();
+
+  get url(): string {
+    const address = this.server?.address();
+    if (address === undefined || address === null || typeof address === 'string') {
+      throw new Error('hub not listening');
+    }
+    return `http://127.0.0.1:${address.port}`;
+  }
+
+  get registerCount(): number {
+    return this.requests.filter((request) => request.path === '/api/worker/register').length;
+  }
+
+  async start(): Promise<void> {
+    this.server = createServer((req, res) => {
+      void this.handle(req, res);
+    });
+    await new Promise<void>((resolve) => {
+      this.server!.listen(0, '127.0.0.1', resolve);
+    });
+  }
+
+  async close(): Promise<void> {
+    for (const controller of this.streamControllers) controller.close();
+    this.streamControllers.clear();
+    await new Promise<void>((resolve) => {
+      this.server!.close(() => {
+        resolve();
+      });
+      this.server!.closeAllConnections?.();
+    });
+  }
+
+  pushOp(opId: string, sessionId: string, intent: unknown): void {
+    const payload = `event: op\ndata: ${JSON.stringify({ opId, sessionId, intent })}`;
+    for (const controller of this.streamControllers) controller.write(`${payload}\n\n`);
+  }
+
+  timelineEntries(): { seq: number; kind: string; [key: string]: unknown }[] {
+    const entries: { seq: number; kind: string; [key: string]: unknown }[] = [];
+    for (const batch of this.batches) {
+      for (const frame of batch.frames) {
+        if (frame.kind !== 'timeline') continue;
+        entries.push(...(frame.entries as never as { seq: number; kind: string }[]));
+      }
+    }
+    return entries;
+  }
+
+  private async handle(
+    req: import('node:http').IncomingMessage,
+    res: import('node:http').ServerResponse,
+  ): Promise<void> {
+    const path = (req.url ?? '').split('?')[0] ?? '';
+    const body = await readBody(req);
+    this.requests.push({ method: req.method ?? '', path, body });
+    if (req.method === 'GET' && path === '/api/worker/stream') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': connected\n\n');
+      const controller = {
+        write: (chunk: string) => res.write(chunk),
+        close: () => res.destroy(),
+      };
+      this.streamControllers.add(controller);
+      res.on('close', () => {
+        this.streamControllers.delete(controller);
+      });
+      return;
+    }
+    if (req.method === 'POST' && path === '/api/worker/register') {
+      this.registerSnapshots.push(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ workerId: 'w1', threads: [] }));
+      return;
+    }
+    if (req.method === 'POST' && path === '/api/worker/batch') {
+      this.batches.push(body as { frames: UplinkFrame[] });
+    }
+    if (req.method === 'POST' && path === '/api/worker/receipt') {
+      this.receiptBodies.push(body);
+    }
+    if (req.method === 'POST' && path === '/api/worker/unregister') {
+      this.unregisterBodies.push(body);
+    }
+    res.writeHead(204);
+    res.end();
+  }
+}
+
+async function readBody(req: import('node:http').IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (text.length === 0) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    if (condition()) return;
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timeout');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+interface PublishFixture {
+  controller: ForumLinkController;
+  approvalController: ApprovalController;
+  questionController: ApprovalController extends never ? never : QuestionController;
+  showApproval(payload: ApprovalPanelData): void;
+  hideApproval(): void;
+  showQuestion(payload: QuestionPanelData): void;
+  hideQuestion(): void;
+  planContent: string | null;
+}
+
+function makeController(): PublishFixture {
+  const approvalController = new ApprovalController();
+  const questionController = new QuestionController();
+  let planContent: string | null = '# The plan\n\n1. Do the thing.';
+  const controller = new ForumLinkController({
+    host: {
+      appState: () =>
+        ({
+          streamingPhase: 'idle',
+          isCompacting: false,
+          model: 'k2',
+          thinkingEffort: 'high',
+          permissionMode: 'auto',
+          planMode: false,
+          contextUsage: 0,
+          goal: null,
+          availableModels: {},
+        }) as never,
+      approvalController,
+      questionController,
+      sendNormalUserInput: async () => {},
+      createNewSession: async () => {},
+      showStatus: () => {},
+      steerMessage: () => {},
+      slashHost: {} as never,
+      getTodos: () => [],
+      getPlan: async () =>
+        planContent === null ? null : { id: 'p1', content: planContent, path: 'plan.md' },
+      cancelForeground: () => {},
+      session: () => undefined,
+      workDir: () => '/tmp/proj',
+      sessionTitle: () => null,
+    },
+    linkTiming: TEST_TIMING,
+    overviewIntervalMs: 20,
+  });
+  let approvalId: string | undefined;
+  let questionId: string | undefined;
+  return {
+    controller,
+    approvalController,
+    questionController,
+    get planContent() {
+      return planContent;
+    },
+    set planContent(value: string | null) {
+      planContent = value;
+    },
+    showApproval: (payload) => {
+      approvalId = payload.id;
+      controller.onCardOpened('approval', payload.id, payload);
+    },
+    hideApproval: () => {
+      const id = approvalId;
+      approvalId = undefined;
+      if (id !== undefined) controller.onCardClosed('approval', id);
+    },
+    showQuestion: (payload) => {
+      questionId = payload.id;
+      controller.onCardOpened('question', payload.id, payload);
+    },
+    hideQuestion: () => {
+      const id = questionId;
+      questionId = undefined;
+      if (id !== undefined) controller.onCardClosed('question', id);
+    },
+  };
+}
+
+describe('layer4 publish full chain (real controller + fake hub)', () => {
+  it('publish → thread appears → card opens with extras → local answer → card-settled uplink', async () => {
+    const hub = new PublishFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      const started = await fixture.controller.start({ url: hub.url, token: 't' });
+      expect(started.ok).toBe(true);
+      await waitFor(() => fixture.controller.state === 'published');
+      expect(hub.registerSnapshots).toHaveLength(1);
+
+      const shown = fixture.approvalController.show(planReviewData('plan-1'));
+      fixture.showApproval(planReviewData('plan-1'));
+      const cardId = fixture.controller.openCards[0]!.cardId;
+      expect(cardId.startsWith('approval_')).toBe(true);
+
+      await waitFor(() =>
+        hub.registerSnapshots.some((snapshot) =>
+          (snapshot as { threads?: { openCards?: { cardId: string }[]; timeline?: { kind: string }[] }[] })
+            .threads?.some(
+              (thread) =>
+                thread.openCards?.some((card) => card.cardId === cardId) === true ||
+                thread.timeline?.some((entry) => entry.kind === 'card-opened') === true,
+            ),
+        ),
+      );
+
+      await waitFor(() => {
+        const snapshot = fixture.controller.getSnapshot();
+        const card = snapshot.threads[0]!.openCards.find((open) => open.cardId === cardId);
+        const blocks = (card?.['approval'] as { display?: unknown[] } | undefined)?.display ?? [];
+        return blocks.some((block) => (block as { type?: string })?.type === 'plan_body');
+      });
+      const snapshot = fixture.controller.getSnapshot();
+      const openedCard = snapshot.threads[0]!.openCards.find((card) => card.cardId === cardId);
+      expect(openedCard).toBeDefined();
+      const approval = openedCard!['approval'] as { display?: unknown[] } | undefined;
+      const display = approval?.display ?? [];
+      const planBlock = display.find(
+        (block) => (block as { type?: string })?.type === 'plan_body',
+      ) as { text: string } | undefined;
+      expect(planBlock?.text).toContain('# The plan');
+      const diffBlock = display.find(
+        (block) => (block as { type?: string })?.type === 'diff',
+      ) as { lines?: unknown[] } | undefined;
+      expect(Array.isArray(diffBlock?.lines)).toBe(true);
+      expect((diffBlock?.lines ?? []).length).toBeGreaterThan(0);
+
+      fixture.approvalController.respond({ decision: 'approved' });
+      await expect(shown).resolves.toEqual({ decision: 'approved' });
+      fixture.hideApproval();
+
+      await waitFor(() =>
+        hub.registerSnapshots.some((snapshot) =>
+          (snapshot as { threads?: { timeline?: { kind: string; cardId?: string }[] }[] })
+            .threads?.some((thread) =>
+              thread.timeline?.some(
+                (entry) => entry.kind === 'card-settled' && entry.cardId === cardId,
+              ),
+            ),
+        ),
+      );
+      const finalSnapshot = fixture.controller.getSnapshot();
+      expect(finalSnapshot.threads[0]!.openCards).toEqual([]);
+      await fixture.controller.stop();
+      expect(hub.unregisterBodies).toHaveLength(1);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('remote answer over the downlink resolves the local panel and reports receipts', async () => {
+    const hub = new PublishFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+
+      const shown = fixture.questionController.show(questionData('q-1'));
+      fixture.showQuestion(questionData('q-1'));
+      const cardId = fixture.controller.openCards[0]!.cardId;
+      await waitFor(() => fixture.controller.getSnapshot().threads[0]!.openCards.length === 1);
+      await waitFor(() => fixture.controller.state === 'published');
+
+      hub.pushOp('op1', 's1', {
+        type: 'answer',
+        sessionId: 's1',
+        cardId,
+        answers: [{ selected: [0] }],
+      });
+
+      await expect(shown).resolves.toEqual({ answers: ['A'], method: 'enter' });
+      await waitFor(() => {
+        const posts = hub.receiptBodies as { receipts: ReceiptReport[] }[];
+        return posts.some((body) =>
+          body.receipts.some((report) => report.opId === 'op1' && report.state === 'applied'),
+        );
+      });
+      await fixture.controller.stop();
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('remote end-session stops the link with the terminal receipt in finalReceipts', async () => {
+    const hub = new PublishFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+
+      hub.pushOp('opEnd', 's1', { type: 'end-session', sessionId: 's1' });
+
+      await waitFor(() => hub.unregisterBodies.length === 1);
+      const body = hub.unregisterBodies[0] as { finalReceipts: ReceiptReport[] };
+      const opEnd = body.finalReceipts.filter((report) => report.opId === 'opEnd');
+      expect(opEnd).toEqual([{ opId: 'opEnd', state: 'applied' }]);
+      await waitFor(() => fixture.controller.state === 'detached');
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('start/stop lifecycle keeps the detached invariant without a hub', async () => {
+    const controller = new ForumLinkController({});
+    controller.onSessionChanged(makeSession('s1'));
+    const started = await controller.start({ url: 'http://127.0.0.1:1', token: 't' });
+    expect(started.ok).toBe(true);
+    await controller.stop();
+    expect(controller.state).toBe('detached');
+  });
 });
 
-async function stopChild(child: ChildProcess): Promise<void> {
-  const exited = liveChildren.get(child);
-  if (exited === undefined) return;
-  child.kill();
-  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 3000))]);
+const HUB_MJS = fileURLToPath(
+  new URL('../../../../../../packages/forum-link/dist/hub.mjs', import.meta.url),
+);
+const E2E_TIMEOUT_MS = 30_000;
+
+let hubBuilt = false;
+
+function ensureHubBuilt(): void {
+  if (hubBuilt || existsSync(HUB_MJS)) {
+    hubBuilt = true;
+    return;
+  }
+  const result = spawnSync('pnpm', ['-F', '@moonshot-ai/forum-link', 'build'], {
+    cwd: fileURLToPath(new URL('../../../../../', import.meta.url)),
+    stdio: 'ignore',
+    shell: true,
+    timeout: 120_000,
+  });
+  if (result.status !== 0) throw new Error('forum-link hub build failed');
+  hubBuilt = true;
 }
 
-async function startHub(port?: number): Promise<HubProcess> {
-  const child = spawn(
-    process.execPath,
-    [
-      HUB_MJS,
-      '--port',
-      port === undefined ? '0' : String(port),
-      '--password',
-      PASSWORD,
-      '--heartbeat-interval-ms',
-      '300',
-      '--liveness-window-ms',
-      '1500',
-      '--reap-interval-ms',
-      '100',
-    ],
-    { stdio: ['ignore', 'pipe', 'pipe'] },
-  );
-  trackChild(child);
+interface SpawnedHub {
+  child: ChildProcess;
+  baseUrl: string;
+  stop(): Promise<void>;
+}
+
+async function spawnHub(dataDir: string, extraArgs: string[] = []): Promise<SpawnedHub> {
+  ensureHubBuilt();
+  const child = spawn(process.execPath, [HUB_MJS, 'serve', '--data-dir', dataDir, '--port', '0', ...extraArgs], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   let output = '';
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
@@ -99,686 +455,824 @@ async function startHub(port?: number): Promise<HubProcess> {
   child.stderr.on('data', (chunk: string) => {
     output += chunk;
   });
-  const deadline = Date.now() + 5000;
-  for (;;) {
-    const match = /listening on http:\/\/(\S+):(\d+)/.exec(output);
-    if (match !== null) {
-      return {
-        baseUrl: `http://127.0.0.1:${match[2]}`,
-        port: Number(match[2]),
-        kill: () => stopChild(child),
-      };
-    }
-    if (child.exitCode !== null || Date.now() > deadline) {
-      await stopChild(child);
-      throw new Error(`hub process failed to start: ${output}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
-
-async function startHubOnPort(port: number, attempts = 8): Promise<HubProcess> {
-  let lastError: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await startHub(port);
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 120));
-    }
-  }
-  throw lastError;
-}
-
-async function getJson<T>(baseUrl: string, path: string): Promise<T> {
-  const res = await fetch(`${baseUrl}${path}`, { headers: { authorization: `Bearer ${PASSWORD}` } });
-  expect(res.status).toBe(200);
-  return (await res.json()) as T;
-}
-
-async function getThreads(baseUrl: string): Promise<ThreadSummaryJson[]> {
-  const body = await getJson<{ threads: ThreadSummaryJson[] }>(baseUrl, '/api/threads');
-  return body.threads;
-}
-
-async function getSnapshot(baseUrl: string, threadId: string): Promise<SnapshotJson> {
-  return getJson<SnapshotJson>(baseUrl, `/api/threads/${threadId}/snapshot`);
-}
-
-async function postAction(baseUrl: string, frame: ActionFrame): Promise<void> {
-  const res = await fetch(`${baseUrl}/api/action`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${PASSWORD}`, 'content-type': 'application/json' },
-    body: JSON.stringify(frame),
+  const baseUrl = await new Promise<string>((resolve, reject) => {
+    const deadline = Date.now() + 8000;
+    const poll = () => {
+      const match = /listening on http:\/\/\S+:(\d+)/.exec(output);
+      if (match !== null) {
+        resolve(`http://127.0.0.1:${match[1]}`);
+        return;
+      }
+      if (child.exitCode !== null || Date.now() > deadline) {
+        child.kill();
+        reject(new Error(`hub failed to start: ${output}`));
+        return;
+      }
+      setTimeout(poll, 20);
+    };
+    poll();
   });
-  expect(res.status).toBe(200);
-  await res.json();
+  return {
+    child,
+    baseUrl,
+    stop: async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.kill();
+      await new Promise<void>((resolve) => {
+        child.once('exit', () => {
+          resolve();
+        });
+        setTimeout(() => {
+          child.kill('SIGKILL');
+          resolve();
+        }, 5000).unref?.();
+      });
+    },
+  };
 }
 
-async function until(predicate: () => Promise<boolean> | boolean, timeoutMs = 5000): Promise<void> {
+async function issueTokens(
+  baseUrl: string,
+  dataDir: string,
+): Promise<{ machineSecret: string; deviceSecret: string; device2Secret: string }> {
+  const adminKey = readFileSync(join(dataDir, 'admin.key'), 'utf8').trim();
+  const issue = async (role: 'machine' | 'device', name: string): Promise<string> => {
+    const response = await fetch(`${baseUrl}/api/admin/tokens`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${adminKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ role, name }),
+    });
+    if (response.status !== 200) throw new Error(`token issue failed: ${response.status}`);
+    const body = (await response.json()) as { secret: string };
+    return body.secret;
+  };
+  return {
+    machineSecret: await issue('machine', 'laptop'),
+    deviceSecret: await issue('device', 'phone-1'),
+    device2Secret: await issue('device', 'phone-2'),
+  };
+}
+
+interface SseLineStream {
+  lines: string[];
+  close(): void;
+  closed: Promise<void>;
+}
+
+async function openBrowserStream(baseUrl: string, cookie: string): Promise<SseLineStream> {
+  const response = await fetch(`${baseUrl}/api/browser/stream`, { headers: { cookie } });
+  if (response.status !== 200 || response.body === null) {
+    throw new Error(`browser stream failed: ${response.status}`);
+  }
+  const lines: string[] = [];
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let closedResolve: () => void = () => {};
+  const closed = new Promise<void>((resolve) => {
+    closedResolve = resolve;
+  });
+  const pump = (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline = buffer.indexOf('\n');
+      while (newline >= 0) {
+        lines.push(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf('\n');
+      }
+    }
+    closedResolve();
+  })();
+  void pump.catch(() => {
+    closedResolve();
+  });
+  return {
+    lines,
+    close() {
+      void reader.cancel().catch(() => {});
+    },
+    closed,
+  };
+}
+
+function streamEvents(stream: SseLineStream): { event: string; data: unknown }[] {
+  const events: { event: string; data: unknown }[] = [];
+  for (let i = 0; i < stream.lines.length - 1; i += 1) {
+    if (!stream.lines[i]!.startsWith('event: ')) continue;
+    const dataLine = stream.lines[i + 1]!;
+    if (!dataLine.startsWith('data: ')) continue;
+    events.push({ event: stream.lines[i]!.slice(7), data: JSON.parse(dataLine.slice(6)) as unknown });
+  }
+  return events;
+}
+
+class BrowserClient {
+  readonly cookie: string;
+  constructor(
+    readonly baseUrl: string,
+    deviceSecret: string,
+  ) {
+    this.cookie = `${BROWSER_COOKIE_NAME}=${deviceSecret}`;
+  }
+
+  get(path: string): Promise<Response> {
+    return fetch(`${this.baseUrl}${path}`, { headers: { cookie: this.cookie } });
+  }
+
+  async postOps(sessionId: string, intent: Record<string, unknown>): Promise<{ opId: string; state: string; reason?: string }> {
+    const response = await fetch(`${this.baseUrl}/api/browser/ops`, {
+      method: 'POST',
+      headers: { cookie: this.cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId, intent }),
+    });
+    if (response.status !== 202) throw new Error(`ops failed: ${response.status}`);
+    return (await response.json()) as { opId: string; state: string; reason?: string };
+  }
+
+  openStream(): Promise<SseLineStream> {
+    return openBrowserStream(this.baseUrl, this.cookie);
+  }
+}
+
+async function waitForAsync(
+  predicate: () => boolean | Promise<boolean>,
+  label: string,
+  timeoutMs = 8000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await predicate()) return;
-    if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (Date.now() > deadline) throw new Error(`timeout waiting for ${label}`);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
   }
 }
 
-function messageTexts(snapshot: SnapshotJson, role: 'user' | 'assistant'): string[] {
-  return snapshot.entries
-    .filter((snapshotEntry) => snapshotEntry.entry.kind === 'message' && snapshotEntry.entry.role === role)
-    .map((snapshotEntry) =>
-      snapshotEntry.entry.kind === 'message' ? snapshotEntry.entry.text : '',
-    );
+function e2eModel(): ModelAlias {
+  return {
+    provider: 'test',
+    model: 'k2',
+    maxContextSize: 200_000,
+    displayName: 'k2',
+    supportEfforts: ['low', 'high'],
+    defaultEffort: 'high',
+    capabilities: ['thinking'],
+  } as unknown as ModelAlias;
 }
 
-interface SessionFixture {
+interface E2EGoal {
+  goalId: string;
+  objective: string;
+  status: string;
+}
+
+interface E2ESessionState {
   session: Session;
-  emit(event: Event): void;
 }
 
-function makeSession(id = SESSION_ID): SessionFixture {
-  const listeners = new Set<(event: Event) => void>();
-  const session = {
+function makeE2ESession(id: string, goalStore: { value: E2EGoal | null }): Session {
+  return {
     id,
-    onEvent: (listener: (event: Event) => void): Unsubscribe => {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
+    onEvent: () => () => {},
+    getGoal: async () => ({ goal: goalStore.value }),
+    createGoal: async (input: { objective: string }) => {
+      goalStore.value = { goalId: `goal-${id}`, objective: input.objective, status: 'active' };
     },
+    setPermission: async () => {},
+    setModel: async () => {},
+    setThinking: async () => {},
+    pauseGoal: async () => {},
+    resumeGoal: async () => {},
+    cancelGoal: async () => {},
     cancel: async () => {},
     cancelCompaction: async () => {},
-  } as unknown as Session;
-  return {
-    session,
-    emit: (event) => {
-      for (const listener of listeners) listener(event);
-    },
-  };
+    steer: async () => {},
+  } as never as Session;
 }
 
-function promptSubmitted(text: string): Event {
-  return {
-    type: 'prompt.submitted',
-    promptId: 'p1',
-    userMessageId: 'um1',
-    status: 'running',
-    content: [{ type: 'text', text }],
-    createdAt: '2025-01-01T00:00:00.000Z',
-    agentId: 'main',
-    sessionId: SESSION_ID,
-  };
-}
-
-function turnStarted(): Event {
-  return { type: 'turn.started', turnId: 1, origin: { kind: 'user' }, agentId: 'main', sessionId: SESSION_ID };
-}
-
-function turnEnded(reason: 'completed' | 'cancelled' = 'completed'): Event {
-  return { type: 'turn.ended', turnId: 1, reason, agentId: 'main', sessionId: SESSION_ID };
-}
-
-function approvalPayload(id: string): ApprovalPanelData {
-  return {
-    id,
-    tool_call_id: `tc-${id}`,
-    tool_name: 'Bash',
-    action: 'PRE-PUBLISH-ACTION',
-    description: 'pre publish approval',
-    display: [],
-    choices: [],
-  };
-}
-
-function questionPayload(id: string): QuestionPanelData {
-  return {
-    id,
-    tool_call_id: `tc-${id}`,
-    questions: [
-      { question: '选择哪个方案？', multi_select: false, options: [{ label: '选项A' }, { label: '选项B' }] },
-    ],
-  };
-}
-
-type ForumLinkState = ForumLinkController['state'];
-
-interface ControllerFixture {
+interface E2EFixture {
   controller: ForumLinkController;
   approvalController: ApprovalController;
   questionController: QuestionController;
-  frames: UplinkFrame[];
-  statuses: string[];
-  states: ForumLinkState[];
-  session: SessionFixture;
+  appState: AppState;
+  sent: string[];
+  setStreamingPhase(phase: AppState['streamingPhase']): void;
+  setGoal(goal: E2EGoal | null): void;
+  showApproval(payload: ApprovalPanelData): Promise<{ decision: string; scope?: string }>;
 }
 
-function makeController(): ControllerFixture {
-  const frames: UplinkFrame[] = [];
-  const statuses: string[] = [];
-  const states: ForumLinkState[] = [];
-  const sessionFixture = makeSession();
+function makeE2EController(): E2EFixture {
   const approvalController = new ApprovalController();
   const questionController = new QuestionController();
-  const sendNormalUserInput = vi.fn(async () => {});
-  const controller = new ForumLinkController({
-    onProjectorFrame: (frame) => {
-      frames.push(frame);
-    },
-    onStatus: (message) => {
-      statuses.push(message);
-    },
-    getAppState: () => ({ isCompacting: false }) as AppState,
-    buildDescriptor: (session: Session): Omit<Descriptor, 'status'> => ({
-      sessionId: session.id,
-      machineName: 'layer4-machine',
-      projectName: 'layer4-project',
-      title: 'layer4 title',
-    }),
-    approvalController,
-    questionController,
-    sendNormalUserInput,
-    createNewSession: vi.fn(async () => {}),
-    createLink: (handlers) =>
-      new Link({
-        ...handlers,
-        timing: LINK_TIMING,
-        onStateChange: (state) => {
-          states.push(state);
-          handlers.onStateChange(state);
-        },
-      }),
-  });
-  const original: ReverseRPCUIHooks = {
-    showApprovalPanel: vi.fn(),
-    hideApprovalPanel: vi.fn(),
-    showQuestionDialog: vi.fn(),
-    hideQuestionDialog: vi.fn(),
+  const mutableGoal = { value: null as E2EGoal | null };
+  const sessionState: E2ESessionState = { session: makeE2ESession('s1', mutableGoal) };
+  const sent: string[] = [];
+  const appState: AppState = {
+    model: 'k2',
+    workDir: '/workspace/proj',
+    additionalDirs: [],
+    thinkingEffort: 'high',
+    permissionMode: 'auto',
+    planMode: false,
+    inputMode: 'prompt',
+    swarmMode: false,
+    towerMode: false,
+    streamingPhase: 'idle',
+    isCompacting: false,
+    isReplaying: false,
+    sessionId: 's1',
+    contextUsage: 0,
+    contextTokens: 0,
+    maxContextTokens: 0,
+    cumulativeTokens: 0,
+    streamingStartTime: 0,
+    stepRetry: null,
+    theme: 'dark',
+    version: 'test',
+    editorCommand: null,
+    notifications: DEFAULT_NOTIFICATIONS_CONFIG,
+    upgrade: DEFAULT_UPGRADE_PREFERENCES,
+    sessionTitle: null,
+    goal: null,
+    mcpServersSummary: null,
+    availableModels: { k2: e2eModel() },
+    availableProviders: {},
   };
-  const wrapped = wrapUiHooksForForumLink(original, controller);
+  let controller!: ForumLinkController;
+  const slashHost = {
+    state: {
+      appState,
+      editor: { getText: () => '' },
+      transcriptContainer: { addChild: () => {} },
+      transcriptEntries: [],
+      ui: { requestRender: () => {} },
+    },
+    get session(): Session {
+      return sessionState.session;
+    },
+    requireSession: () => sessionState.session,
+    setAppState: (patch: Record<string, unknown>) => Object.assign(appState, patch),
+    showError: () => {},
+    showStatus: () => {},
+    showNotice: () => {},
+    mountEditorReplacement: () => {},
+    restoreEditor: () => {},
+    restoreInputText: () => {},
+    sendNormalUserInput: (text: string) => {
+      sent.push(text);
+    },
+    waitForLazyCreation: async () => {},
+    track: () => {},
+    harness: {
+      getConfig: async () => ({}),
+      setConfig: async () => {},
+    },
+    authFlow: {
+      activateModelAfterLogin: async () => {},
+      refreshOAuthProviderModels: async () => undefined,
+    },
+  } as unknown as SlashCommandHost;
+  let nextSessionNumber = 2;
+  controller = new ForumLinkController({
+    host: {
+      appState: () => appState,
+      approvalController,
+      questionController,
+      sendNormalUserInput: async (text) => {
+        sent.push(text);
+      },
+      createNewSession: async () => {
+        sessionState.session = makeE2ESession(`s${nextSessionNumber}`, mutableGoal);
+        nextSessionNumber += 1;
+        controller.onSessionChanged(sessionState.session);
+      },
+      showStatus: () => {},
+      steerMessage: () => {},
+      slashHost,
+      getTodos: () => [],
+      getPlan: async () => null,
+      cancelForeground: () => {},
+      session: () => sessionState.session,
+      workDir: () => '/workspace/proj',
+      sessionTitle: () => null,
+    },
+    linkTiming: TEST_TIMING,
+    overviewIntervalMs: 30,
+  });
+  controller.onSessionChanged(sessionState.session);
+  let approvalShownId: string | undefined;
+  let questionShownId: string | undefined;
   approvalController.setUIHooks({
-    showPanel: wrapped.showApprovalPanel,
-    hidePanel: wrapped.hideApprovalPanel,
+    showPanel: (payload) => {
+      if (approvalShownId !== undefined && approvalShownId !== payload.id) {
+        controller.onCardClosed('approval', approvalShownId);
+      }
+      approvalShownId = payload.id;
+      controller.onCardOpened('approval', payload.id, payload);
+    },
+    hidePanel: () => {
+      const id = approvalShownId;
+      approvalShownId = undefined;
+      if (id !== undefined) controller.onCardClosed('approval', id);
+    },
   });
   questionController.setUIHooks({
-    showPanel: wrapped.showQuestionDialog,
-    hidePanel: wrapped.hideQuestionDialog,
-  });
-  controller.onSessionChanged(sessionFixture.session);
-  return { controller, approvalController, questionController, frames, statuses, states, session: sessionFixture };
-}
-
-describe('Layer4 真发布 — 发布出现与 toggle 消失（CP5 / M-1 IV1 A1 A2）', () => {
-  it.skipIf(!HUB_BUILT)(
-    'start 发布线程且 descriptor 正确，帧上行入 hub，stop 后线程经 reap 消失',
-    { timeout: 20000 },
-    async () => {
-      const hub = await startHub();
-      const fixture = makeController();
-      try {
-        expect(await getThreads(hub.baseUrl)).toEqual([]);
-
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        expect(fixture.controller.state).toBe('published');
-        expect(fixture.statuses).toContain('Forum Link: published');
-
-        const threads = await getThreads(hub.baseUrl);
-        expect(threads).toHaveLength(1);
-        expect(threads[0]!.descriptor).toEqual({
-          sessionId: SESSION_ID,
-          machineName: 'layer4-machine',
-          projectName: 'layer4-project',
-          title: 'layer4 title',
-          status: 'idle',
-        });
-        const threadId = threads[0]!.id;
-
-        fixture.session.emit(promptSubmitted('hello from layer4'));
-        fixture.session.emit(turnStarted());
-        fixture.session.emit(turnEnded('completed'));
-        let snapshot = await getSnapshot(hub.baseUrl, threadId);
-        await until(async () => {
-          snapshot = await getSnapshot(hub.baseUrl, threadId);
-          return messageTexts(snapshot, 'user').includes('hello from layer4');
-        });
-        expect(messageTexts(snapshot, 'user')).toEqual(['hello from layer4']);
-        expect(snapshot.entries.map((snapshotEntry) => snapshotEntry.seq)).toEqual([1, 2, 3]);
-
-        await fixture.controller.stop();
-        expect(fixture.controller.state).toBe('detached');
-        expect(fixture.statuses).toContain('Forum Link: unpublished');
-        await until(async () => (await getThreads(hub.baseUrl)).length === 0);
-      } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
+    showPanel: (payload) => {
+      if (questionShownId !== undefined && questionShownId !== payload.id) {
+        controller.onCardClosed('question', questionShownId);
       }
+      questionShownId = payload.id;
+      controller.onCardOpened('question', payload.id, payload);
     },
-  );
-});
-
-describe('Layer4 真发布 — 时间线自发布时刻累积（CP5 / M-1 A4 / D-I）', () => {
-  it.skipIf(!HUB_BUILT)('发布前帧不回填，发布后新事件 seq 从 1 开始', { timeout: 20000 }, async () => {
-    const hub = await startHub();
-    const fixture = makeController();
-    try {
-      fixture.controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
-      expect(fixture.frames).toContainEqual({
-        type: 'entry',
-        entry: {
-          kind: 'approval-card',
-          cardId: 'c1',
-          toolName: 'Bash',
-          action: 'PRE-PUBLISH-ACTION',
-          summary: 'pre publish approval',
-        },
-      });
-
-      await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-      const threads = await getThreads(hub.baseUrl);
-      expect(threads).toHaveLength(1);
-      const threadId = threads[0]!.id;
-      let snapshot = await getSnapshot(hub.baseUrl, threadId);
-      expect(snapshot.entries).toEqual([]);
-      expect(snapshot.maxSeq).toBe(0);
-
-      fixture.session.emit(promptSubmitted('after publish'));
-      fixture.session.emit(turnStarted());
-      fixture.session.emit(turnEnded('completed'));
-      await until(async () => {
-        snapshot = await getSnapshot(hub.baseUrl, threadId);
-        return snapshot.entries.length === 3;
-      });
-      expect(snapshot.entries[0]!.seq).toBe(1);
-      expect(snapshot.entries.map((snapshotEntry) => snapshotEntry.seq)).toEqual([1, 2, 3]);
-      expect(messageTexts(snapshot, 'user')).toEqual(['after publish']);
-      expect(JSON.stringify(snapshot.entries)).not.toContain('PRE-PUBLISH-ACTION');
-    } finally {
-      await fixture.controller.stop().catch(() => {});
-      await hub.kill();
-    }
+    hidePanel: () => {
+      const id = questionShownId;
+      questionShownId = undefined;
+      if (id !== undefined) controller.onCardClosed('question', id);
+    },
   });
-});
-
-describe('Layer4 真发布 — 凭证缺失零连接（CP5 / M-1 A3）', () => {
-  let homeDir: string;
-
-  beforeEach(() => {
-    homeDir = mkdtempSync(join(tmpdir(), 'forum-layer4-'));
-    vi.stubEnv('KIMI_CODE_HOME', homeDir);
-  });
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    rmSync(homeDir, { recursive: true, force: true });
-  });
-
-  it.skipIf(!HUB_BUILT)('凭证缺失时 showError 指引且 hub 注册表保持空', { timeout: 20000 }, async () => {
-    const hub = await startHub();
-    try {
-      const host = makeCommandHost();
-      await handleForumCommand(host);
-
-      expect(host.showError).toHaveBeenCalledTimes(1);
-      expect(host.showError.mock.calls[0]?.[0]).toContain('remote_key');
-      expect(host.ensureForumLink).not.toHaveBeenCalled();
-      expect(host.showStatus).not.toHaveBeenCalled();
-      expect(await getThreads(hub.baseUrl)).toEqual([]);
-      expect(readdirSync(homeDir)).toEqual([]);
-    } finally {
-      await hub.kill();
-    }
-  });
-});
-
-function makeCommandHost(): SlashCommandHost & {
-  showError: ReturnType<typeof vi.fn>;
-  showStatus: ReturnType<typeof vi.fn>;
-  ensureForumLink: ReturnType<typeof vi.fn>;
-} {
   return {
-    session: { id: 'layer4-cmd' },
-    showError: vi.fn(),
-    showStatus: vi.fn(),
-    ensureForumLink: vi.fn(),
-  } as unknown as SlashCommandHost & {
-    showError: ReturnType<typeof vi.fn>;
-    showStatus: ReturnType<typeof vi.fn>;
-    ensureForumLink: ReturnType<typeof vi.fn>;
+    controller,
+    approvalController,
+    questionController,
+    appState,
+    sent,
+    setStreamingPhase: (phase) => {
+      appState.streamingPhase = phase;
+    },
+    setGoal: (goal) => {
+      mutableGoal.value = goal;
+      appState.goal = goal as never;
+      controller.onAppStateChanged();
+    },
+    showApproval: (payload) => approvalController.show(payload),
   };
 }
 
-describe('Layer4 真发布 — Web 卡片可操作（CP5 / A1 A2）', () => {
-  it.skipIf(!HUB_BUILT)(
-    'A1 问题卡全链路：远程作答经 hub SSE 送达，show promise resolve，card-settled answered 入快照',
-    { timeout: 30000 },
+function shellApprovalData(id: string, action: string): ApprovalPanelData {
+  const diff: DiffDisplayBlock = {
+    type: 'diff',
+    path: 'src/a.ts',
+    old_text: 'line1\nline2',
+    new_text: 'line1\nline2 changed',
+  } as unknown as DiffDisplayBlock;
+  return {
+    id,
+    tool_call_id: id,
+    tool_name: 'Bash',
+    action,
+    description: '',
+    display: [
+      { type: 'shell', language: 'bash', command: 'rm -rf build && echo done', cwd: '/workspace/proj' },
+      diff,
+    ],
+    choices: APPROVAL_CHOICES,
+  };
+}
+
+interface ThreadView {
+  descriptor: { sessionId: string };
+  online: boolean;
+  timeline: { seq: number; kind: string; cardId?: string }[];
+  openCards: { cardId: string; kind: string; approval?: { display?: { type?: string; command?: string; lines?: unknown[] }[] } }[];
+  receipts: { opId: string; state: string; reason?: string }[];
+}
+
+async function readThread(client: BrowserClient, sessionId: string): Promise<ThreadView | undefined> {
+  const response = await client.get(`/api/browser/threads/${sessionId}`);
+  if (response.status !== 200) return undefined;
+  return (await response.json()) as ThreadView;
+}
+
+describe('layer4 E2E (spawned hub + real controller + browser clients)', () => {
+  it(
+    'G-A1: session-scoped remote approval carries full payload and auto-resolves the queued request',
+    { timeout: E2E_TIMEOUT_MS },
     async () => {
-      const hub = await startHub();
-      const fixture = makeController();
+      const dataDir = mkdtempSync(join(tmpdir(), 'forum-link-e2e-a1-'));
+      const hub = await spawnHub(dataDir);
       try {
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        fixture.session.emit(turnStarted());
-        const shown = fixture.questionController.show(questionPayload('q-1'));
-        expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'question', upstreamId: 'q-1' }]);
+        const tokens = await issueTokens(hub.baseUrl, dataDir);
+        const fixture = makeE2EController();
+        await fixture.controller.start({ url: hub.baseUrl, token: tokens.machineSecret });
+        await waitFor(() => fixture.controller.state === 'published');
+        const client = new BrowserClient(hub.baseUrl, tokens.deviceSecret);
+        const stream = await client.openStream();
 
-        await until(async () => {
-          const threads = await getThreads(hub.baseUrl);
-          return threads[0] !== undefined && threads[0].descriptor.status === 'waiting-question';
+        const payload = shellApprovalData('a-1', 'run a command');
+        const first = fixture.approvalController.show(payload);
+        const second = fixture.approvalController.show(shellApprovalData('a-2', 'run a command'));
+
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's1');
+          return thread?.openCards.length === 1;
+        }, 'card payload visible on the hub');
+        const thread = (await readThread(client, 's1'))!;
+        const card = thread.openCards[0]!;
+        const display = card.approval?.display ?? [];
+        const shell = display.find((block) => block.type === 'shell');
+        expect(shell?.command).toBe('rm -rf build && echo done');
+        const diff = display.find((block) => block.type === 'diff');
+        expect(Array.isArray(diff?.lines)).toBe(true);
+        expect((diff?.lines ?? []).length).toBeGreaterThan(0);
+
+        const receipt = await client.postOps('s1', {
+          type: 'approve',
+          sessionId: 's1',
+          cardId: card.cardId,
+          optionIndex: 1,
         });
-        const threadId = (await getThreads(hub.baseUrl))[0]!.id;
+        expect(receipt.state).toBe('accepted');
 
-        await postAction(hub.baseUrl, { type: 'answer-question', target: threadId, cardId: 'c1', answer: '选项A' });
+        await expect(first).resolves.toEqual({ decision: 'approved', scope: 'session' });
+        await expect(second).resolves.toEqual({ decision: 'approved', scope: 'session' });
 
-        await vi.waitFor(async () => {
-          await expect(shown).resolves.toEqual({ answers: ['选项A'] });
-        });
-        expect(fixture.controller.openCards).toEqual([]);
-
-        let snapshot = await getSnapshot(hub.baseUrl, threadId);
-        await until(async () => {
-          snapshot = await getSnapshot(hub.baseUrl, threadId);
-          return snapshot.entries.some(
-            (snapshotEntry) =>
-              snapshotEntry.entry.kind === 'card-settled' &&
-              snapshotEntry.entry.cardId === 'c1' &&
-              snapshotEntry.entry.outcome === 'answered',
-          );
-        });
-      } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
-      }
-    },
-  );
-
-  it.skipIf(!HUB_BUILT)(
-    'A2 审批卡全链路：远程批准经 hub SSE 送达，show promise resolve，card-settled approved 入快照',
-    { timeout: 30000 },
-    async () => {
-      const hub = await startHub();
-      const fixture = makeController();
-      try {
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        fixture.session.emit(turnStarted());
-        const shown = fixture.approvalController.show(approvalPayload('a-1'));
-        expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'approval', upstreamId: 'a-1' }]);
-
-        await until(async () => {
-          const threads = await getThreads(hub.baseUrl);
-          return threads[0] !== undefined && threads[0].descriptor.status === 'running';
-        });
-        const threadId = (await getThreads(hub.baseUrl))[0]!.id;
-
-        await postAction(hub.baseUrl, { type: 'approve', target: threadId, cardId: 'c1' });
-
-        await vi.waitFor(async () => {
-          await expect(shown).resolves.toEqual({ decision: 'approved' });
-        });
-        expect(fixture.controller.openCards).toEqual([]);
-
-        let snapshot = await getSnapshot(hub.baseUrl, threadId);
-        await until(async () => {
-          snapshot = await getSnapshot(hub.baseUrl, threadId);
-          return snapshot.entries.some(
-            (snapshotEntry) =>
-              snapshotEntry.entry.kind === 'card-settled' &&
-              snapshotEntry.entry.cardId === 'c1' &&
-              snapshotEntry.entry.outcome === 'approved',
-          );
-        });
-      } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
-      }
-    },
-  );
-});
-
-describe('Layer4 真发布 — 断连期间卡片存活与重连收敛（CP5 / A4 X1）', () => {
-  it.skipIf(!HUB_BUILT)(
-    'A4 断连重连：backoff 期间卡片保持 open，重注册新线程后远程动作仍可操作',
-    { timeout: 30000 },
-    async () => {
-      const hub = await startHub();
-      const fixture = makeController();
-      try {
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        fixture.session.emit(turnStarted());
-        const shown = fixture.questionController.show(questionPayload('q-1'));
-
-        await until(async () => {
-          const threads = await getThreads(hub.baseUrl);
-          return threads[0] !== undefined && threads[0].descriptor.status === 'waiting-question';
-        });
-
-        await hub.kill();
-        await until(() => fixture.controller.state === 'backoff');
-        expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'question', upstreamId: 'q-1' }]);
-
-        const hub2 = await startHubOnPort(hub.port);
-        try {
-          await until(() => fixture.controller.state === 'published');
-          const threads = await getThreads(hub2.baseUrl);
-          expect(threads).toHaveLength(1);
-          const threadId = threads[0]!.id;
-          expect(threads[0]!.descriptor.status).toBe('waiting-question');
-
-          await postAction(hub2.baseUrl, {
-            type: 'answer-question',
-            target: threadId,
-            cardId: 'c1',
-            answer: '选项B',
-          });
-
-          await vi.waitFor(async () => {
-            await expect(shown).resolves.toEqual({ answers: ['选项B'] });
-          });
-          expect(fixture.controller.openCards).toEqual([]);
-        } finally {
-          await hub2.kill();
-        }
-      } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
-      }
-    },
-  );
-
-  it.skipIf(!HUB_BUILT)(
-    'X1 backoff 丢帧重注册覆盖：断连期间本地作答，重注册帧天然携带迁移后状态',
-    { timeout: 30000 },
-    async () => {
-      const hub = await startHub();
-      const fixture = makeController();
-      try {
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        fixture.session.emit(turnStarted());
-        const shown = fixture.questionController.show(questionPayload('q-1'));
-
-        await until(async () => {
-          const threads = await getThreads(hub.baseUrl);
-          return threads[0] !== undefined && threads[0].descriptor.status === 'waiting-question';
-        });
-
-        await hub.kill();
-        await until(() => fixture.controller.state === 'backoff');
-
-        fixture.questionController.respond({ answers: ['选项A'] });
-        await expect(shown).resolves.toEqual({ answers: ['选项A'] });
-        expect(fixture.controller.openCards).toEqual([]);
-        expect(fixture.frames).toContainEqual({
-          type: 'entry',
-          entry: { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
-        });
-        expect(fixture.frames).toContainEqual({ type: 'entry', entry: { kind: 'status-marker', status: 'running' } });
-
-        const hub2 = await startHubOnPort(hub.port);
-        try {
-          await until(() => fixture.controller.state === 'published');
-          const threads = await getThreads(hub2.baseUrl);
-          expect(threads).toHaveLength(1);
-          expect(threads[0]!.descriptor.status).toBe('running');
-        } finally {
-          await hub2.kill();
-        }
-      } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
-      }
-    },
-  );
-});
-
-describe('Layer4 真发布 — 断链恢复（CP5 / V-3 Checkpoint / A10 部分）', () => {
-  it.skipIf(!HUB_BUILT)(
-    'hub 进程死亡进入 backoff，同端口重启后恢复 published 并重注册新线程',
-    { timeout: 30000 },
-    async () => {
-      const hub = await startHub();
-      const fixture = makeController();
-      try {
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        expect(fixture.controller.state).toBe('published');
-        const firstThreads = await getThreads(hub.baseUrl);
-        expect(firstThreads).toHaveLength(1);
-        const firstThreadId = firstThreads[0]!.id;
-
-        fixture.session.emit(turnStarted());
-        await until(async () => {
-          const threads = await getThreads(hub.baseUrl);
-          return threads[0] !== undefined && threads[0].descriptor.status === 'running';
-        });
-
-        await hub.kill();
-        await until(() => fixture.controller.state === 'backoff');
-
-        const hub2 = await startHubOnPort(hub.port);
-        try {
-          await until(() => fixture.controller.state === 'published');
-          const lastBackoff = fixture.states.lastIndexOf('backoff');
-          const lastConnecting = fixture.states.lastIndexOf('connecting');
-          const lastPublished = fixture.states.lastIndexOf('published');
-          expect(lastBackoff).toBeGreaterThan(-1);
-          expect(lastConnecting).toBeGreaterThan(lastBackoff);
-          expect(lastPublished).toBeGreaterThan(lastConnecting);
-
-          const recoveredThreads = await getThreads(hub2.baseUrl);
-          expect(recoveredThreads).toHaveLength(1);
-          expect(recoveredThreads[0]!.descriptor.sessionId).toBe(SESSION_ID);
-          expect(recoveredThreads[0]!.descriptor.status).toBe('running');
-          expect(recoveredThreads[0]!.id).not.toBe(firstThreadId);
-
-          fixture.session.emit(promptSubmitted('after recovery'));
-          fixture.session.emit(turnStarted());
-          fixture.session.emit(turnEnded('completed'));
-          const threadId = recoveredThreads[0]!.id;
-          let snapshot = await getSnapshot(hub2.baseUrl, threadId);
-          await until(async () => {
-            snapshot = await getSnapshot(hub2.baseUrl, threadId);
-            return messageTexts(snapshot, 'user').includes('after recovery');
-          });
-          expect(messageTexts(snapshot, 'user')).toEqual(['after recovery']);
-        } finally {
-          await hub2.kill();
-        }
-      } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
-      }
-    },
-  );
-});
-
-describe('Layer4 真发布 — 断线重连身份收敛（CP5 / A2）', () => {
-  it.skipIf(!HUB_BUILT)(
-    'A2 重连身份收敛：发布 s1 → 切换 s2 原地更新 → 断线重连，新线程 sessionId 为 s2',
-    { timeout: 30000 },
-    async () => {
-      const hub = await startHub();
-      const fixture = makeController();
-      try {
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        await until(async () => {
-          const threads = await getThreads(hub.baseUrl);
-          return threads[0] !== undefined;
-        });
-        const firstThreads = await getThreads(hub.baseUrl);
-        expect(firstThreads).toHaveLength(1);
-        const firstThreadId = firstThreads[0]!.id;
-        expect(firstThreads[0]!.descriptor.sessionId).toBe(SESSION_ID);
-
-        const next = makeSession('layer4-session-2');
-        fixture.controller.onSessionChanged(next.session);
-        await until(async () => {
-          const threads = await getThreads(hub.baseUrl);
-          return threads[0] !== undefined && threads[0].descriptor.sessionId === 'layer4-session-2';
-        });
-        const switchedThreads = await getThreads(hub.baseUrl);
-        expect(switchedThreads).toHaveLength(1);
-        expect(switchedThreads[0]!.id).toBe(firstThreadId);
-        expect(switchedThreads[0]!.descriptor.sessionId).toBe('layer4-session-2');
-
-        await hub.kill();
-        await until(() => fixture.controller.state === 'backoff');
-
-        const hub2 = await startHubOnPort(hub.port);
-        try {
-          await until(() => fixture.controller.state === 'published');
-          const recoveredThreads = await getThreads(hub2.baseUrl);
-          expect(recoveredThreads).toHaveLength(1);
-          expect(recoveredThreads[0]!.descriptor.sessionId).toBe('layer4-session-2');
-          expect(recoveredThreads[0]!.id).not.toBe(firstThreadId);
-        } finally {
-          await hub2.kill();
-        }
-      } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
-      }
-    },
-  );
-});
-
-describe('Layer4 真发布 — 零监听审计（CP5 / V-3 A1 / I9）', () => {
-  it.skipIf(!HUB_BUILT)(
-    'Link/Controller 源码无监听调用，发布期间测试进程零新增 Server 句柄',
-    { timeout: 20000 },
-    async () => {
-      expect(readFileSync(LINK_SOURCE, 'utf8')).not.toMatch(/createServer|\.listen\(/);
-      expect(readFileSync(CONTROLLER_SOURCE, 'utf8')).not.toMatch(/createServer|\.listen\(/);
-
-      const hub = await startHub();
-      const fixture = makeController();
-      try {
-        const before = serverHandleCount();
-        await fixture.controller.start({ url: hub.baseUrl, password: PASSWORD });
-        expect(fixture.controller.state).toBe('published');
-        fixture.session.emit(promptSubmitted('zero listen'));
-        fixture.session.emit(turnStarted());
-        fixture.session.emit(turnEnded('completed'));
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        const during = serverHandleCount();
+        await waitForAsync(async () => {
+          const view = await readThread(client, 's1');
+          return view?.receipts.some((entry) => entry.opId === receipt.opId && entry.state === "applied") === true;
+        }, 'applied receipt on the thread');
+        await waitForAsync(
+          () => streamEvents(stream).some((event) => event.event === 'card.settled'),
+          'card.settled fanout',
+        );
+        await waitForAsync(async () => {
+          const view = await readThread(client, 's1');
+          return view !== undefined && view.openCards.length === 0;
+        }, 'no remote card remains after the queue auto-resolve');
+        stream.close();
         await fixture.controller.stop();
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        const after = serverHandleCount();
-        if (before !== undefined && during !== undefined && after !== undefined) {
-          expect(during).toBe(before);
-          expect(after).toBe(before);
+      } finally {
+        await hub.stop();
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'G-A3: card settlement syncs to both clients and closed cards reject further ops',
+    { timeout: E2E_TIMEOUT_MS },
+    async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'forum-link-e2e-a3-'));
+      const hub = await spawnHub(dataDir);
+      try {
+        const tokens = await issueTokens(hub.baseUrl, dataDir);
+        const fixture = makeE2EController();
+        await fixture.controller.start({ url: hub.baseUrl, token: tokens.machineSecret });
+        await waitFor(() => fixture.controller.state === 'published');
+        const client1 = new BrowserClient(hub.baseUrl, tokens.deviceSecret);
+        const client2 = new BrowserClient(hub.baseUrl, tokens.device2Secret);
+        const stream1 = await client1.openStream();
+        const stream2 = await client2.openStream();
+
+        const shownLocal = fixture.showApproval(shellApprovalData('local-1', 'run a command'));
+        await waitForAsync(async () => {
+          const thread = await readThread(client1, 's1');
+          return thread?.openCards.length === 1;
+        }, 'local card visible');
+        const localCardId = (await readThread(client1, 's1'))!.openCards[0]!.cardId;
+
+        fixture.approvalController.respond({ decision: 'approved' });
+        await expect(shownLocal).resolves.toEqual({ decision: 'approved' });
+        await waitForAsync(
+          () => streamEvents(stream1).some((event) => event.event === 'card.settled'),
+          'client1 card.settled after local answer',
+        );
+        await waitForAsync(
+          () => streamEvents(stream2).some((event) => event.event === 'card.settled'),
+          'client2 card.settled after local answer',
+        );
+
+        const shownRemote = fixture.showApproval(shellApprovalData('remote-1', 'run a command'));
+        await waitForAsync(async () => {
+          const thread = await readThread(client1, 's1');
+          return thread?.openCards.some((card) => card.cardId !== localCardId) === true;
+        }, 'remote card visible');
+        const remoteCardId = (await readThread(client1, 's1'))!.openCards.find(
+          (card) => card.cardId !== localCardId,
+        )!.cardId;
+
+        await client1.postOps('s1', {
+          type: 'approve',
+          sessionId: 's1',
+          cardId: remoteCardId,
+          optionIndex: 0,
+        });
+        await expect(shownRemote).resolves.toEqual({ decision: 'approved' });
+        await waitForAsync(async () => {
+          const thread = await readThread(client1, 's1');
+          return thread !== undefined && thread.openCards.length === 0;
+        }, 'local panel closed after remote answer');
+        await waitForAsync(
+          () => streamEvents(stream2).some((event) => event.event === 'card.settled'),
+          'client2 card.settled after remote answer',
+        );
+
+        const stale = await client2.postOps('s1', {
+          type: 'approve',
+          sessionId: 's1',
+          cardId: remoteCardId,
+          optionIndex: 0,
+        });
+        await waitForAsync(async () => {
+          const thread = await readThread(client1, 's1');
+          return (
+            thread?.receipts.some(
+              (entry) => entry.opId === stale.opId && entry.state === 'rejected' && entry.reason === 'card-closed',
+            ) === true
+          );
+        }, 'stale op rejected as card-closed');
+
+        stream1.close();
+        stream2.close();
+        await fixture.controller.stop();
+      } finally {
+        await hub.stop();
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'V3-A1: worker-driven timeline entries fan out to the browser stream as timeline.append',
+    { timeout: E2E_TIMEOUT_MS },
+    async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'forum-link-e2e-v3a1-'));
+      const hub = await spawnHub(dataDir);
+      try {
+        const tokens = await issueTokens(hub.baseUrl, dataDir);
+        const fixture = makeE2EController();
+        await fixture.controller.start({ url: hub.baseUrl, token: tokens.machineSecret });
+        await waitFor(() => fixture.controller.state === 'published');
+        const client = new BrowserClient(hub.baseUrl, tokens.deviceSecret);
+        const stream = await client.openStream();
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's1');
+          return thread?.descriptor.sessionId === 's1';
+        }, 'initial thread visible');
+
+        fixture.controller.onTranscriptEntry({
+          id: 'u1',
+          kind: 'user',
+          renderMode: 'plain',
+          content: 'timeline via batch frames',
+        });
+        fixture.controller.onSessionEvent({
+          type: 'turn.started',
+          turnId: 1,
+          origin: { kind: 'user' },
+          agentId: 'main',
+          sessionId: 's1',
+        } as never);
+        fixture.controller.onSessionEvent({
+          type: 'assistant.delta',
+          turnId: 1,
+          delta: 'answer line',
+          agentId: 'main',
+          sessionId: 's1',
+        } as never);
+        fixture.controller.onSessionEvent({
+          type: 'turn.ended',
+          turnId: 1,
+          reason: 'completed',
+          agentId: 'main',
+          sessionId: 's1',
+        } as never);
+
+        await waitForAsync(
+          () =>
+            streamEvents(stream).some(
+              (event) =>
+                event.event === 'timeline.append' &&
+                (event.data as { entries?: { kind: string }[] }).entries?.some(
+                  (entry) => entry.kind === 'user-message',
+                ) === true,
+            ),
+          'timeline.append with the user message',
+        );
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's1');
+          const kinds = thread?.timeline.map((entry) => entry.kind) ?? [];
+          return kinds.includes('user-message') && kinds.includes('assistant-turn');
+        }, 'thread timeline carries the entries');
+        const thread = await readThread(client, 's1');
+        expect(thread?.timeline.map((entry) => entry.seq)).toEqual([1, 2]);
+        stream.close();
+        await fixture.controller.stop();
+      } finally {
+        await hub.stop();
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'G-A4: hub restart reconciles browser state with the TUI and ntfy is not re-notified',
+    { timeout: E2E_TIMEOUT_MS },
+    async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'forum-link-e2e-a4-'));
+      const hubPort = await new Promise<number>((resolve) => {
+        const probe = createServer();
+        probe.listen(0, '127.0.0.1', () => {
+          const port = (probe.address() as { port: number }).port;
+          probe.close(() => {
+            resolve(port);
+          });
+        });
+      });
+      const fixedPortArgs = ['--port', String(hubPort)];
+      const ntfyRequests: unknown[] = [];
+      const ntfyServer = createServer((req, res) => {
+        req.resume();
+        req.on('end', () => {
+          ntfyRequests.push(req.url);
+          res.writeHead(200);
+          res.end();
+        });
+      });
+      await new Promise<void>((resolve) => {
+        ntfyServer.listen(0, '127.0.0.1', resolve);
+      });
+      const ntfyPort = (ntfyServer.address() as { port: number }).port;
+      const ntfyArgs = ['--ntfy-url', `http://127.0.0.1:${ntfyPort}`, '--ntfy-topic', 'e2e-a4'];
+      try {
+        const hub = await spawnHub(dataDir, [...fixedPortArgs, ...ntfyArgs]);
+        const tokens = await issueTokens(hub.baseUrl, dataDir);
+        const fixture = makeE2EController();
+        await fixture.controller.start({ url: hub.baseUrl, token: tokens.machineSecret });
+        await waitFor(() => fixture.controller.state === 'published');
+        const client = new BrowserClient(hub.baseUrl, tokens.deviceSecret);
+
+        const shown = fixture.showApproval(shellApprovalData('restart-1', 'run a command'));
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's1');
+          return thread?.openCards.length === 1;
+        }, 'card visible before restart');
+        const openReceipt = await client.postOps('s1', {
+          type: 'send',
+          sessionId: 's1',
+          text: 'ping before restart',
+        });
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's1');
+          return (
+            thread?.receipts.some(
+              (entry) => entry.opId === openReceipt.opId && (entry.state === 'delivered' || entry.state === 'applied'),
+            ) === true
+          );
+        }, 'receipt delivered before restart');
+        await waitForAsync(() => ntfyRequests.length === 1, 'ntfy notified once');
+        await waitForAsync(
+          () => existsSync(join(dataDir, 'state.json')) && (() => {
+            try {
+              const persisted = JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as {
+                threads: { openCards: unknown[] }[];
+                receipts: { opId: string }[];
+              };
+              return (
+                persisted.threads.length === 1 &&
+                persisted.threads[0]!.openCards.length === 1 &&
+                persisted.receipts.some((entry) => entry.opId === openReceipt.opId)
+              );
+            } catch {
+              return false;
+            }
+          })(),
+          'state persisted before restart',
+        );
+
+        await hub.stop();
+        await waitFor(() => fixture.controller.state === 'backoff' || fixture.controller.state === 'connecting', 9000);
+
+        const revived = await spawnHub(dataDir, [...fixedPortArgs, ...ntfyArgs]);
+        const revivedClient = new BrowserClient(revived.baseUrl, tokens.deviceSecret);
+        try {
+          await waitForAsync(async () => {
+            const thread = await readThread(revivedClient, 's1');
+            return thread !== undefined && !thread.online && thread.openCards.length === 1;
+          }, 'thread visible offline after restart');
+          const offline = (await readThread(revivedClient, 's1'))!;
+          expect(offline.receipts.some((entry) => entry.opId === openReceipt.opId)).toBe(true);
+
+          await waitFor(() => fixture.controller.state === 'published');
+          await waitForAsync(async () => {
+            const thread = await readThread(revivedClient, 's1');
+            return thread?.online === true;
+          }, 'thread back online after re-registration');
+
+          const tuiSnapshot = fixture.controller.getSnapshot();
+          const tuiThread = tuiSnapshot.threads[0]!;
+          const browserThread = (await readThread(revivedClient, 's1'))!;
+          expect(browserThread.openCards.map((card) => card.cardId)).toEqual(
+            tuiThread.openCards.map((card) => card.cardId),
+          );
+          expect(browserThread.timeline.map((entry) => entry.kind)).toEqual(
+            tuiThread.timeline.map((entry) => entry.kind),
+          );
+
+          fixture.approvalController.respond({ decision: 'approved' });
+          await expect(shown).resolves.toEqual({ decision: 'approved' });
+          await waitForAsync(async () => {
+            const thread = await readThread(revivedClient, 's1');
+            return thread !== undefined && thread.openCards.length === 0;
+          }, 'card settled after restart');
+
+          await new Promise((resolve) => {
+            setTimeout(resolve, 300);
+          });
+          expect(ntfyRequests).toHaveLength(1);
+          await fixture.controller.stop();
+        } finally {
+          await revived.stop();
         }
       } finally {
-        await fixture.controller.stop().catch(() => {});
-        await hub.kill();
+        ntfyServer.close();
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'G-A6: remote new-session and goal-set update the inbox; busy and stale-thread semantics hold',
+    { timeout: E2E_TIMEOUT_MS },
+    async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'forum-link-e2e-a6-'));
+      const hub = await spawnHub(dataDir);
+      try {
+        const tokens = await issueTokens(hub.baseUrl, dataDir);
+        const fixture = makeE2EController();
+        await fixture.controller.start({ url: hub.baseUrl, token: tokens.machineSecret });
+        await waitFor(() => fixture.controller.state === 'published');
+        const client = new BrowserClient(hub.baseUrl, tokens.deviceSecret);
+        const stream = await client.openStream();
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's1');
+          return thread?.descriptor.sessionId === 's1';
+        }, 'initial thread visible');
+
+        const newSessionReceipt = await client.postOps('s1', { type: 'new-session', sessionId: 's1' });
+        expect(newSessionReceipt.state).toBe('accepted');
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's2');
+          return thread !== undefined;
+        }, 'new thread appears');
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's1');
+          return thread === undefined;
+        }, 'old thread removed');
+        await waitForAsync(
+          () =>
+            streamEvents(stream).some(
+              (event) =>
+                event.event === 'receipt' &&
+                (event.data as { receipt?: { opId?: string; state?: string } }).receipt?.opId ===
+                  newSessionReceipt.opId &&
+                (event.data as { receipt?: { state?: string } }).receipt?.state === 'applied',
+            ),
+          'new-session receipt applied after thread removal',
+        );
+
+        const goalObjective = 'Ship the remote decision feature';
+        const goalReceipt = await client.postOps('s2', {
+          type: 'goal-set',
+          sessionId: 's2',
+          objective: goalObjective,
+          replace: false,
+        });
+        expect(goalReceipt.state).toBe('accepted');
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's2');
+          return thread?.receipts.some((entry) => entry.opId === goalReceipt.opId && entry.state === "applied") === true;
+        }, 'goal-set applied');
+        expect(fixture.sent).toContain(goalObjective);
+
+        fixture.setGoal({ goalId: 'g1', objective: goalObjective, status: 'active' });
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's2');
+          const overview = (thread as unknown as { overview?: { goal?: { objective: string } | null } }).overview;
+          return overview?.goal?.objective === goalObjective;
+        }, 'goal overview sampled to the inbox');
+
+        fixture.setStreamingPhase('thinking');
+        const busyReceipt = await client.postOps('s2', { type: 'new-session', sessionId: 's2' });
+        await waitForAsync(async () => {
+          const thread = await readThread(client, 's2');
+          return (
+            thread?.receipts.some(
+              (entry) => entry.opId === busyReceipt.opId && entry.state === 'rejected' && entry.reason === 'session-busy',
+            ) === true
+          );
+        }, 'busy new-session rejected');
+        fixture.setStreamingPhase('idle');
+
+        stream.close();
+        await fixture.controller.stop();
+      } finally {
+        await hub.stop();
+        rmSync(dataDir, { recursive: true, force: true });
       }
     },
   );
 });
-
-function serverHandleCount(): number | undefined {
-  const getActiveHandles = (process as unknown as { _getActiveHandles?: () => unknown[] })._getActiveHandles;
-  if (getActiveHandles === undefined) return undefined;
-  return getActiveHandles.call(process).filter((handle) => constructorNameOf(handle) === 'Server').length;
-}
-
-function constructorNameOf(value: unknown): string | undefined {
-  if (typeof value !== 'object' || value === null) return undefined;
-  return (value as { constructor?: { name?: string } }).constructor?.name;
-}

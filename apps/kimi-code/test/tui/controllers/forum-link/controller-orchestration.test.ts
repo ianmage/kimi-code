@@ -1,806 +1,566 @@
-import { describe, expect, it, vi } from 'vitest';
+import { createServer, type Server } from 'node:http';
 
-import type { Event, Session, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
-import type { ActionFrame, Descriptor, UplinkFrame } from '@moonshot-ai/forum-link';
+import { describe, expect, it } from 'vitest';
+
+import type { Session } from '@moonshot-ai/kimi-code-sdk';
+import type { ReceiptReport, UplinkFrame } from '@moonshot-ai/forum-link';
 
 import { ForumLinkController } from '#/tui/controllers/forum-link';
-import { resolveEndSessionMode } from '#/tui/controllers/forum-link/end-session';
-import type { Link } from '#/tui/controllers/forum-link/link';
+import { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
+import { QuestionController } from '#/tui/reverse-rpc/question/controller';
 import type { ApprovalPanelData, QuestionPanelData } from '#/tui/reverse-rpc/types';
-import type { AppState } from '#/tui/types';
 
-interface SessionFixture {
-  session: Session;
-  cancel: ReturnType<typeof vi.fn>;
-  cancelCompaction: ReturnType<typeof vi.fn>;
-  /** Captured session.onEvent listener; call to emit an event into the session. */
-  emit(event: Event): void;
-  hasListener(): boolean;
-}
+const TEST_TIMING = {
+  heartbeatTimeoutMs: 5_000,
+  backoffBaseMs: 10,
+  backoffCapMs: 40,
+  batchIntervalMs: 5,
+};
 
-function makeSession(id: string): SessionFixture {
-  const cancel = vi.fn(async () => {});
-  const cancelCompaction = vi.fn(async () => {});
-  let listener: ((event: Event) => void) | undefined;
-  const session = {
-    id,
-    onEvent: (l: (event: Event) => void): Unsubscribe => {
-      listener = l;
-      return () => {
-        listener = undefined;
-      };
-    },
-    cancel,
-    cancelCompaction,
-  } as unknown as Session;
-  return {
-    session,
-    cancel,
-    cancelCompaction,
-    emit: (event) => {
-      listener?.(event);
-    },
-    hasListener: () => listener !== undefined,
-  };
-}
+const APPROVAL_CHOICES: ApprovalPanelData['choices'] = [
+  { label: 'Approve once', response: 'approved' },
+  { label: 'Approve for this session', response: 'approved_for_session' },
+  { label: 'Reject', response: 'rejected' },
+];
 
-function makeAppState(
-  isCompacting = false,
-  streamingPhase: AppState['streamingPhase'] = 'thinking',
-): AppState {
-  return { isCompacting, streamingPhase } as AppState;
-}
-
-function approvalPayload(id: string): ApprovalPanelData {
+function approvalData(id: string, action = 'run a command'): ApprovalPanelData {
   return {
     id,
-    tool_call_id: `tc-${id}`,
+    tool_call_id: id,
     tool_name: 'Bash',
-    action: 'run command',
-    description: 'run a command',
+    action,
+    description: '',
     display: [],
-    choices: [],
+    choices: APPROVAL_CHOICES,
   };
 }
 
-function questionPayload(id: string): QuestionPanelData {
+function questionData(id: string): QuestionPanelData {
   return {
     id,
-    tool_call_id: `tc-${id}`,
-    questions: [{ question: 'Continue?', multi_select: false, options: [{ label: 'yes' }] }],
+    tool_call_id: id,
+    questions: [{ question: 'Pick one?', multi_select: false, options: [{ label: 'A' }, { label: 'B' }] }],
   };
 }
 
-function makeDescriptor(sessionId: string): Omit<Descriptor, 'status'> {
-  return {
-    sessionId,
-    machineName: 'machine-1',
-    projectName: 'forum-link',
-    title: 'test title',
-  };
+function makeSession(id: string): Session {
+  return { id, onEvent: () => () => {} } as never as Session;
 }
 
-function turnEnded(turnId = 1): Event {
-  return { type: 'turn.ended', turnId, reason: 'cancelled', agentId: 'main', sessionId: 's1' };
+interface RecordedRequest {
+  method: string;
+  path: string;
+  body: unknown;
 }
 
-function compactionCancelled(): Event {
-  return { type: 'compaction.cancelled', agentId: 'main', sessionId: 's1' };
-}
+class OrchestrationFakeHub {
+  readonly requests: RecordedRequest[] = [];
+  readonly registerSnapshots: unknown[] = [];
+  readonly unregisterBodies: unknown[] = [];
+  readonly receiptBodies: unknown[] = [];
+  readonly batches: { frames: UplinkFrame[] }[] = [];
+  private server: Server | undefined;
+  private readonly streamControllers = new Set<{ write: (chunk: string) => void; close: () => void }>();
 
-interface ControllerFixture {
-  controller: ForumLinkController;
-  frames: UplinkFrame[];
-  statuses: string[];
-  order: string[];
-  stateAtCreate: string[];
-  createNewSession: ReturnType<typeof vi.fn>;
-  buildDescriptor: ReturnType<typeof vi.fn>;
-  approvalRespond: ReturnType<typeof vi.fn>;
-  questionRespond: ReturnType<typeof vi.fn>;
-  sendNormalUserInput: ReturnType<typeof vi.fn>;
-  onDroppedAction: ReturnType<typeof vi.fn>;
-}
+  get url(): string {
+    const address = this.server?.address();
+    if (address === undefined || address === null || typeof address === 'string') {
+      throw new Error('hub not listening');
+    }
+    return `http://127.0.0.1:${address.port}`;
+  }
 
-interface FixtureOptions {
-  session?: Session;
-  appState?: AppState;
-  endSessionTiming?: { idleWaitTimeoutMs?: number };
-}
+  get registerCount(): number {
+    return this.requests.filter((request) => request.path === '/api/worker/register').length;
+  }
 
-function makeController(options: FixtureOptions = {}): ControllerFixture {
-  const frames: UplinkFrame[] = [];
-  const statuses: string[] = [];
-  const order: string[] = [];
-  const stateAtCreate: string[] = [];
-  const createNewSession = vi.fn(async () => {
-    order.push('createNewSession');
-    stateAtCreate.push(controller.state);
-  });
-  const buildDescriptor = vi.fn((session: Session) => makeDescriptor(session.id));
-  const approvalRespond = vi.fn();
-  const questionRespond = vi.fn();
-  const sendNormalUserInput = vi.fn(async () => {});
-  const onDroppedAction = vi.fn();
-  const controller = new ForumLinkController({
-    onProjectorFrame: (frame) => {
-      frames.push(frame);
-    },
-    onStatus: (message) => {
-      statuses.push(message);
-      if (message === 'Forum Link: unpublished') order.push('stop');
-    },
-    getAppState: () => options.appState ?? makeAppState(),
-    approvalController: { respond: approvalRespond } as never,
-    questionController: { respond: questionRespond } as never,
-    sendNormalUserInput,
-    createNewSession,
-    onDroppedAction,
-    buildDescriptor,
-    endSessionTiming: options.endSessionTiming,
-  });
-  if (options.session !== undefined) controller.onSessionChanged(options.session);
-  return {
-    controller,
-    frames,
-    statuses,
-    order,
-    stateAtCreate,
-    createNewSession,
-    buildDescriptor,
-    approvalRespond,
-    questionRespond,
-    sendNormalUserInput,
-    onDroppedAction,
-  };
-}
+  pushToStreams(text: string): void {
+    for (const controller of this.streamControllers) controller.write(`${text}\n\n`);
+  }
 
-describe('resolveEndSessionMode — 终止模式判定（O-1）', () => {
-  it.each([
-    { isCompacting: false, streamingPhase: 'idle', expected: 'immediate' },
-    { isCompacting: false, streamingPhase: 'waiting', expected: 'turn' },
-    { isCompacting: false, streamingPhase: 'thinking', expected: 'turn' },
-    { isCompacting: false, streamingPhase: 'composing', expected: 'turn' },
-    { isCompacting: false, streamingPhase: 'shell', expected: 'immediate' },
-    { isCompacting: true, streamingPhase: 'idle', expected: 'compaction' },
-    { isCompacting: true, streamingPhase: 'waiting', expected: 'compaction' },
-    { isCompacting: true, streamingPhase: 'thinking', expected: 'compaction' },
-    { isCompacting: true, streamingPhase: 'composing', expected: 'compaction' },
-    { isCompacting: true, streamingPhase: 'shell', expected: 'compaction' },
-  ])('契约表全组合（isCompacting × streamingPhase → 模式）: %j', (row) => {
-    const appState = {
-      isCompacting: row.isCompacting,
-      streamingPhase: row.streamingPhase,
-    } as AppState;
-    expect(resolveEndSessionMode(appState)).toBe(row.expected);
-  });
-
-  it.each(['idle', 'waiting', 'thinking', 'composing', 'shell'] as const)(
-    '压缩优先：isCompacting=true 时 streamingPhase=%s 恒为 compaction',
-    (streamingPhase) => {
-      expect(resolveEndSessionMode({ isCompacting: true, streamingPhase } as AppState)).toBe(
-        'compaction',
-      );
-    },
-  );
-
-  it('undefined 入参 → immediate', () => {
-    expect(resolveEndSessionMode(undefined)).toBe('immediate');
-  });
-
-  it('纯函数性：同一输入连续两次调用输出一致', () => {
-    const appState = { isCompacting: false, streamingPhase: 'thinking' } as AppState;
-    expect(resolveEndSessionMode(appState)).toBe(resolveEndSessionMode(appState));
-  });
-
-  it('未知相位（部分注入 AppState）→ 保守视为 turn', () => {
-    expect(resolveEndSessionMode({ isCompacting: false } as AppState)).toBe('turn');
-  });
-});
-
-describe('Controller 编排 — end-session 定序（M-2 A3/A4/A5）', () => {
-  it('取消 → 等 turn.ended → stop 解除发布 → createNewSession，顺序不可乱', async () => {
-    const fixture = makeSession('s1');
-    const wired = makeController({
-      session: fixture.session,
-      appState: makeAppState(false, 'thinking'),
-      endSessionTiming: { idleWaitTimeoutMs: 50 },
+  async start(): Promise<void> {
+    this.server = createServer((req, res) => {
+      void this.handle(req, res);
     });
-    wired.controller.setLinkState('published');
-
-    const pending = wired.controller.runEndSession();
-    await Promise.resolve();
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-    expect(wired.createNewSession).not.toHaveBeenCalled();
-    expect(wired.controller.state).toBe('detached');
-    expect(wired.order).toEqual(['stop']);
-
-    fixture.emit(turnEnded());
-    await pending;
-
-    expect(wired.createNewSession).toHaveBeenCalledTimes(1);
-    expect(wired.order).toEqual(['stop', 'createNewSession']);
-    expect(wired.stateAtCreate).toEqual(['detached']);
-    expect(wired.controller.state).toBe('detached');
-  });
-
-  it('idle 等待超时：放弃新建、保持已解除发布并本地提示', async () => {
-    const fixture = makeSession('s1');
-    const wired = makeController({
-      session: fixture.session,
-      appState: makeAppState(false, 'thinking'),
-      endSessionTiming: { idleWaitTimeoutMs: 50 },
+    await new Promise<void>((resolve) => {
+      this.server!.listen(0, '127.0.0.1', resolve);
     });
-    wired.controller.setLinkState('published');
+  }
 
-    await wired.controller.runEndSession();
-
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-    expect(wired.createNewSession).not.toHaveBeenCalled();
-    expect(wired.controller.state).toBe('detached');
-    expect(wired.statuses).toContain(
-      'Forum Link: end-session timed out waiting for idle; staying unpublished',
-    );
-  });
-
-  it('isCompacting 时分派 cancelCompaction 而非 cancel', async () => {
-    const fixture = makeSession('s1');
-    const wired = makeController({
-      session: fixture.session,
-      appState: makeAppState(true),
-      endSessionTiming: { idleWaitTimeoutMs: 50 },
-    });
-
-    const pending = wired.controller.runEndSession();
-    fixture.emit(compactionCancelled());
-    await pending;
-
-    expect(fixture.cancelCompaction).toHaveBeenCalledTimes(1);
-    expect(fixture.cancel).not.toHaveBeenCalled();
-    expect(wired.createNewSession).toHaveBeenCalledTimes(1);
-  });
-
-  it('未注入 createNewSession 时：取消与解除发布照常完成，新建跳过', async () => {
-    const fixture = makeSession('s1');
-    const frames: UplinkFrame[] = [];
-    const controller = new ForumLinkController({
-      onProjectorFrame: (frame) => {
-        frames.push(frame);
-      },
-      getAppState: () => makeAppState(false, 'thinking'),
-      approvalController: { respond: vi.fn() } as never,
-      questionController: { respond: vi.fn() } as never,
-      sendNormalUserInput: vi.fn(async () => {}),
-      endSessionTiming: { idleWaitTimeoutMs: 50 },
-    });
-    controller.onSessionChanged(fixture.session);
-    controller.setLinkState('published');
-
-    await controller.runEndSession();
-
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-    expect(controller.state).toBe('detached');
-    expect(controller.session).toBe(fixture.session);
-  });
-});
-
-describe('Controller 编排 — end-session immediate 路径（M-1 A1/A2/A6）', () => {
-  it.each(['idle', 'shell'] as const)(
-    'streamingPhase=%s：零 cancel、零等待、stop → createNewSession 收敛',
-    async (streamingPhase) => {
-      const fixture = makeSession('s1');
-      const wired = makeController({
-        session: fixture.session,
-        appState: makeAppState(false, streamingPhase),
-        endSessionTiming: { idleWaitTimeoutMs: 60_000 },
+  async close(): Promise<void> {
+    for (const controller of this.streamControllers) controller.close();
+    this.streamControllers.clear();
+    await new Promise<void>((resolve) => {
+      this.server!.close(() => {
+        resolve();
       });
-      wired.controller.setLinkState('published');
-
-      await wired.controller.runEndSession();
-
-      expect(fixture.cancel).not.toHaveBeenCalled();
-      expect(fixture.cancelCompaction).not.toHaveBeenCalled();
-      expect(wired.createNewSession).toHaveBeenCalledTimes(1);
-      expect(wired.order).toEqual(['stop', 'createNewSession']);
-      expect(wired.stateAtCreate).toEqual(['detached']);
-      expect(wired.statuses).not.toContain(
-        'Forum Link: end-session timed out waiting for idle; staying unpublished',
-      );
-      expect(fixture.hasListener()).toBe(false);
-    },
-  );
-
-  it('无当前会话时直接返回：不抛异常、不新建会话', async () => {
-    const wired = makeController({});
-
-    await wired.controller.runEndSession();
-
-    expect(wired.createNewSession).not.toHaveBeenCalled();
-    expect(wired.controller.state).toBe('detached');
-  });
-});
-
-describe('Controller 编排 — Injector 接线', () => {
-  it('dispatchAction 经 Injector 转发 approve 到 approvalController.respond', () => {
-    const wired = makeController({ session: makeSession('s1').session });
-    wired.controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
-
-    wired.controller.dispatchAction({ type: 'approve', target: 't', cardId: 'c1' });
-
-    expect(wired.approvalRespond).toHaveBeenCalledTimes(1);
-    expect(wired.controller.openCards).toEqual([]);
-  });
-
-  it('dispatchAction 转发 end-session 到 runEndSession 编排', async () => {
-    const fixture = makeSession('s1');
-    const wired = makeController({
-      session: fixture.session,
-      endSessionTiming: { idleWaitTimeoutMs: 50 },
+      this.server!.closeAllConnections?.();
     });
+  }
 
-    wired.controller.dispatchAction({ type: 'end-session', target: 't' });
-    await Promise.resolve();
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-
-    fixture.emit(turnEnded());
-    await vi.waitFor(() => {
-      expect(wired.createNewSession).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  it('无会话时 pause 分派为空操作，不抛异常', () => {
-    const wired = makeController({});
-    expect(() => {
-      wired.controller.dispatchAction({ type: 'pause', target: 't' });
-    }).not.toThrow();
-  });
-
-  it('部分接线（缺 approvalController）不构造 Injector：dispatchAction 为空操作', () => {
-    const controller = new ForumLinkController({
-      getAppState: () => makeAppState(),
-      sendNormalUserInput: vi.fn(async () => {}),
-    });
-    controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
-    expect(() => {
-      controller.dispatchAction({ type: 'approve', target: 't', cardId: 'c1' });
-      controller.dispatchAction({ type: 'send-message', target: 't', text: 'x' });
-    }).not.toThrow();
-    expect(controller.openCards).toEqual([{ cardId: 'c1', kind: 'approval', upstreamId: 'up-1' }]);
-  });
-});
-
-describe('Controller 编排 — stop 升级为真实实现', () => {
-  it('连调两次 stop 不抛：openCards 清空、projector detach、状态 detached', async () => {
-    const wired = makeController({ session: makeSession('s1').session });
-    wired.controller.setLinkState('published');
-    wired.controller.onCardOpened('question', 'up-1', questionPayload('up-1'));
-
-    await wired.controller.stop();
-    await wired.controller.stop();
-
-    expect(wired.controller.openCards).toEqual([]);
-    expect(wired.controller.state).toBe('detached');
-  });
-});
-
-describe('Controller 编排 — 会话切换原地更新（M-2 A1/A2）', () => {
-  it('published 状态切换：结算开放卡片并上行 register 帧（同线程新属性）', () => {
-    const first = makeSession('s1');
-    const fixture = makeController({ session: first.session });
-    fixture.controller.setLinkState('published');
-    fixture.controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
-    fixture.controller.onCardOpened('question', 'up-2', questionPayload('up-2'));
-
-    const next = makeSession('s2');
-    fixture.controller.onSessionChanged(next.session);
-
-    expect(fixture.frames).toContainEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'cancelled' },
-    });
-    expect(fixture.frames).toContainEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c2', outcome: 'cancelled' },
-    });
-    expect(fixture.frames).toContainEqual({
-      type: 'register',
-      descriptor: { ...makeDescriptor('s2'), status: 'idle' },
-    });
-    expect(fixture.controller.openCards).toEqual([]);
-    expect(fixture.controller.session).toBe(next.session);
-  });
-
-  it('未发布切换不上行 register 帧', () => {
-    const fixture = makeController({ session: makeSession('s1').session });
-    const next = makeSession('s2');
-    fixture.controller.onSessionChanged(next.session);
-    expect(fixture.frames.filter((frame) => frame.type === 'register')).toEqual([]);
-    expect(fixture.controller.state).toBe('detached');
-  });
-
-  it('published 但无 buildDescriptor 时跳过上行 register', () => {
-    const frames: UplinkFrame[] = [];
-    const controller = new ForumLinkController({
-      onProjectorFrame: (frame) => {
-        frames.push(frame);
-      },
-    });
-    controller.setLinkState('published');
-    controller.onSessionChanged(makeSession('s2').session);
-    expect(frames.filter((frame) => frame.type === 'register')).toEqual([]);
-  });
-
-  it('切换时无开放卡片：零 card-settled 帧，register 帧仍在', () => {
-    const fixture = makeController({ session: makeSession('s1').session });
-    fixture.controller.setLinkState('published');
-    fixture.controller.onSessionChanged(makeSession('s2').session);
-    const settled = fixture.frames.filter(
-      (frame) => frame.type === 'entry' && frame.entry.kind === 'card-settled',
-    );
-    expect(settled).toEqual([]);
-    expect(fixture.frames).toContainEqual({
-      type: 'register',
-      descriptor: { ...makeDescriptor('s2'), status: 'idle' },
-    });
-  });
-
-  it('已发布切换重挂 Projector：旧会话去订阅、新会话事件被投影', () => {
-    const first = makeSession('s1');
-    const wired = makeController({ session: first.session });
-    wired.controller.setLinkState('published');
-
-    const next = makeSession('s2');
-    wired.controller.onSessionChanged(next.session);
-
-    expect(first.hasListener()).toBe(false);
-    expect(next.hasListener()).toBe(true);
-
-    next.emit({ type: 'turn.started', turnId: 1, origin: { kind: 'user' }, agentId: 'main', sessionId: 's2' });
-    next.emit({ type: 'assistant.delta', turnId: 1, delta: '新会话内容', agentId: 'main', sessionId: 's2' });
-    next.emit({ type: 'turn.ended', turnId: 1, reason: 'completed', agentId: 'main', sessionId: 's2' });
-
-    const texts = wired.frames
-      .filter((frame) => frame.type === 'entry' && frame.entry.kind === 'message')
-      .map((frame) => (frame.type === 'entry' && frame.entry.kind === 'message' ? frame.entry.text : ''));
-    expect(texts).toContain('新会话内容');
-
-    first.emit({ type: 'assistant.delta', turnId: 1, delta: '旧会话幽灵', agentId: 'main', sessionId: 's1' });
-    expect(wired.frames.some((frame) => JSON.stringify(frame).includes('旧会话幽灵'))).toBe(false);
-  });
-
-  it('未发布切换不挂订阅：Projector 保持 idle', () => {
-    const first = makeSession('s1');
-    const wired = makeController({ session: first.session });
-    const next = makeSession('s2');
-    wired.controller.onSessionChanged(next.session);
-    expect(first.hasListener()).toBe(false);
-    expect(next.hasListener()).toBe(false);
-  });
-});
-
-interface FakeLinkFixture {
-  controller: ForumLinkController;
-  fakeLink: FakeLink;
-  frames: UplinkFrame[];
-  statuses: string[];
-  buildDescriptor: ReturnType<typeof vi.fn>;
-  session: Session;
-  cancel: ReturnType<typeof vi.fn>;
-  cancelCompaction: ReturnType<typeof vi.fn>;
-  emit(event: Event): void;
-  hasListener(): boolean;
-  setState(next: AppState): void;
-}
-
-class FakeLink {
-  readonly connect = vi.fn(async (_credential: unknown, _registerSource: () => Descriptor) => {});
-  readonly send = vi.fn();
-  readonly close = vi.fn();
-  onStateChange: ((state: Link['state']) => void) | undefined;
-  onAction: ((frame: ActionFrame) => void) | undefined;
-
-  registerDescriptor(): Descriptor {
-    const source = this.connect.mock.calls[0]?.[1];
-    if (source === undefined) throw new Error('connect was not called');
-    return source();
+  private async handle(
+    req: import('node:http').IncomingMessage,
+    res: import('node:http').ServerResponse,
+  ): Promise<void> {
+    const path = (req.url ?? '').split('?')[0] ?? '';
+    const body = await readBody(req);
+    this.requests.push({ method: req.method ?? '', path, body });
+    if (req.method === 'GET' && path === '/api/worker/stream') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': connected\n\n');
+      const controller = {
+        write: (chunk: string) => res.write(chunk),
+        close: () => res.destroy(),
+      };
+      this.streamControllers.add(controller);
+      res.on('close', () => {
+        this.streamControllers.delete(controller);
+      });
+      return;
+    }
+    if (req.method === 'POST' && path === '/api/worker/register') {
+      this.registerSnapshots.push(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ workerId: 'w1', threads: [] }));
+      return;
+    }
+    if (req.method === 'POST' && path === '/api/worker/batch') {
+      this.batches.push(body as { frames: UplinkFrame[] });
+    }
+    if (req.method === 'POST' && path === '/api/worker/receipt') {
+      this.receiptBodies.push(body);
+    }
+    if (req.method === 'POST' && path === '/api/worker/unregister') {
+      this.unregisterBodies.push(body);
+    }
+    res.writeHead(204);
+    res.end();
   }
 }
 
-function makeStartFixture(options: { isCompacting?: boolean } = {}): FakeLinkFixture {
-  const fakeLink = new FakeLink();
-  const frames: UplinkFrame[] = [];
-  const statuses: string[] = [];
-  const buildDescriptor = vi.fn((session: Session) => makeDescriptor(session.id));
-  const fixture = makeSession('s1');
-  let state: AppState = { isCompacting: options.isCompacting ?? false } as AppState;
+async function readBody(req: import('node:http').IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (text.length === 0) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    if (condition()) return;
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timeout');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+interface OrchestrationFixture {
+  controller: ForumLinkController;
+  approvalController: ApprovalController;
+  questionController: QuestionController;
+  showApproval(payload: ApprovalPanelData): void;
+  hideApproval(): void;
+  showQuestion(payload: QuestionPanelData): void;
+  hideQuestion(): void;
+}
+
+function makeController(): OrchestrationFixture {
+  const approvalController = new ApprovalController();
+  const questionController = new QuestionController();
   const controller = new ForumLinkController({
-    onProjectorFrame: (frame) => {
-      frames.push(frame);
+    host: {
+      appState: () =>
+        ({
+          streamingPhase: 'idle',
+          isCompacting: false,
+          model: 'k2',
+          thinkingEffort: 'high',
+          permissionMode: 'auto',
+          planMode: false,
+          contextUsage: 0,
+          goal: null,
+          availableModels: {},
+        }) as never,
+      approvalController,
+      questionController,
+      sendNormalUserInput: async () => {},
+      createNewSession: async () => {},
+      showStatus: () => {},
+      steerMessage: () => {},
+      slashHost: {} as never,
+      getTodos: () => [],
+      getPlan: async () => null,
+      cancelForeground: () => {},
+      session: () => undefined,
+      workDir: () => '/tmp/proj',
+      sessionTitle: () => null,
     },
-    onStatus: (message) => {
-      statuses.push(message);
-    },
-    getAppState: () => state,
-    approvalController: { respond: vi.fn() } as never,
-    questionController: { respond: vi.fn() } as never,
-    sendNormalUserInput: vi.fn(async () => {}),
-    buildDescriptor,
-    createLink: (handlers) => {
-      fakeLink.onStateChange = handlers.onStateChange;
-      fakeLink.onAction = handlers.onAction;
-      return fakeLink as unknown as Link;
-    },
+    linkTiming: TEST_TIMING,
+    overviewIntervalMs: 20,
   });
-  controller.onSessionChanged(fixture.session);
+  const hooks = {
+    showApprovalPanel: (payload: ApprovalPanelData) => {
+      controller.onCardOpened('approval', payload.id, payload);
+    },
+    hideApprovalPanel: () => {
+      controller.onCardClosed('approval', lastApprovalId());
+    },
+    showQuestionDialog: (payload: QuestionPanelData) => {
+      controller.onCardOpened('question', payload.id, payload);
+    },
+    hideQuestionDialog: () => {
+      controller.onCardClosed('question', lastQuestionId());
+    },
+  };
+  let approvalId: string | undefined;
+  let questionId: string | undefined;
+  function lastApprovalId(): string {
+    const id = approvalId;
+    approvalId = undefined;
+    return id ?? '';
+  }
+  function lastQuestionId(): string {
+    const id = questionId;
+    questionId = undefined;
+    return id ?? '';
+  }
+  const originalShowApproval = hooks.showApprovalPanel;
+  const originalShowQuestion = hooks.showQuestionDialog;
   return {
     controller,
-    fakeLink,
-    frames,
-    statuses,
-    buildDescriptor,
-    session: fixture.session,
-    cancel: fixture.cancel,
-    cancelCompaction: fixture.cancelCompaction,
-    emit: fixture.emit,
-    hasListener: fixture.hasListener,
-    setState: (next: AppState) => {
-      state = next;
+    approvalController,
+    questionController,
+    showApproval: (payload) => {
+      approvalId = payload.id;
+      originalShowApproval(payload);
     },
+    hideApproval: hooks.hideApprovalPanel,
+    showQuestion: (payload) => {
+      questionId = payload.id;
+      originalShowQuestion(payload);
+    },
+    hideQuestion: hooks.hideQuestionDialog,
   };
 }
 
-describe('Controller — start() 发布编排（M-1）', () => {
-  it('start 接线 Link：connect 收到 credential 与 descriptor 源函数，projector 挂当前会话', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: 'secret' });
-
-    expect(fixture.fakeLink.connect).toHaveBeenCalledTimes(1);
-    expect(fixture.fakeLink.connect).toHaveBeenCalledWith(
-      { url: 'http://127.0.0.1:8787', password: 'secret' },
-      expect.any(Function),
-    );
-    expect(fixture.fakeLink.registerDescriptor()).toEqual({ ...makeDescriptor('s1'), status: 'idle' });
-    expect(fixture.buildDescriptor).toHaveBeenCalledWith(fixture.session);
-    expect(fixture.hasListener()).toBe(true);
+describe('controller orchestration', () => {
+  it('start reports no-session before any session is wired', async () => {
+    const controller = new ForumLinkController({});
+    const result = await controller.start({ url: 'http://127.0.0.1:8787', token: 't' });
+    expect(result).toEqual({ ok: false, reason: 'no-session' });
   });
 
-  it('link onStateChange 驱动 controller 状态：published 后 projector 帧经 link.send 投递', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    expect(fixture.controller.state).toBe('detached');
-
-    fixture.fakeLink.onStateChange?.('connecting');
-    expect(fixture.controller.state).toBe('connecting');
-
-    fixture.fakeLink.onStateChange?.('published');
-    expect(fixture.controller.state).toBe('published');
-    expect(fixture.statuses).toEqual([
-      'Forum Link: connecting...',
-      'Forum Link: published',
-    ]);
-
-    fixture.emit({ type: 'turn.started', turnId: 1, origin: { kind: 'user' }, agentId: 'main', sessionId: 's1' });
-    fixture.emit({ type: 'assistant.delta', turnId: 1, delta: '发布后内容', agentId: 'main', sessionId: 's1' });
-    fixture.emit({ type: 'turn.ended', turnId: 1, reason: 'completed', agentId: 'main', sessionId: 's1' });
-
-    expect(fixture.fakeLink.send).toHaveBeenCalledTimes(5);
-    const sentText = fixture.fakeLink.send.mock.calls
-      .map((call) => call[0] as UplinkFrame)
-      .find((frame) => frame.type === 'entry' && frame.entry.kind === 'message');
-    expect(sentText).toEqual({
-      type: 'entry',
-      entry: { kind: 'message', role: 'assistant', text: '发布后内容' },
-    });
+  it('start reports already-active when not detached', async () => {
+    const controller = new ForumLinkController({});
+    controller.onSessionChanged(makeSession('s1'));
+    await controller.start({ url: 'http://127.0.0.1:1', token: 't' });
+    const again = await controller.start({ url: 'http://127.0.0.1:1', token: 't' });
+    expect(again).toEqual({ ok: false, reason: 'already-active' });
+    await controller.stop();
   });
 
-  it('未发布时 projector 帧丢弃：link.send 未被调用', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
+  it('publishes over a fake hub, registers once, and unregisters on stop', async () => {
+    const hub = new OrchestrationFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      const started = await fixture.controller.start({ url: hub.url, token: 't' });
+      expect(started.ok).toBe(true);
+      await waitFor(() => fixture.controller.state === 'published');
+      expect(hub.registerSnapshots).toHaveLength(1);
+      const snapshot = hub.registerSnapshots[0] as {
+        workerId: string;
+        threads: { descriptor: { sessionId: string; kind: string } }[];
+      };
+      expect(snapshot.threads).toHaveLength(1);
+      expect(snapshot.threads[0]!.descriptor.sessionId).toBe('s1');
+      expect(snapshot.threads[0]!.descriptor.kind).toBe('interactive');
 
-    fixture.emit({ type: 'turn.started', turnId: 1, origin: { kind: 'user' }, agentId: 'main', sessionId: 's1' });
-    fixture.emit({ type: 'assistant.delta', turnId: 1, delta: '未发布内容', agentId: 'main', sessionId: 's1' });
-    fixture.emit({ type: 'turn.ended', turnId: 1, reason: 'completed', agentId: 'main', sessionId: 's1' });
-
-    expect(fixture.fakeLink.send).not.toHaveBeenCalled();
-    expect(fixture.controller.state).toBe('detached');
-  });
-
-  it('stop 关闭 link 并回到 detached：published → stop → fakeLink.close 调用', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('published');
-
-    await fixture.controller.stop();
-
-    expect(fixture.fakeLink.close).toHaveBeenCalledTimes(1);
-    expect(fixture.controller.state).toBe('detached');
-    expect(fixture.hasListener()).toBe(false);
-  });
-
-  it('start 重入守卫：非 detached 状态下再次 start 直接返回不重连', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('backoff');
-
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-
-    expect(fixture.fakeLink.connect).toHaveBeenCalledTimes(1);
-  });
-
-  it('start 失败（401）：connect-failed 结果携带错误，供命令层 showError', async () => {
-    const fixture = makeStartFixture();
-    fixture.fakeLink.connect.mockRejectedValueOnce(new Error('unauthorized'));
-
-    const result = await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: 'bad' });
-    expect(result).toEqual({ ok: false, reason: 'connect-failed', error: expect.any(Error) });
-  });
-
-  it('getAppState 注入可变容器：pause 在 isCompacting 变更后读到最新值', async () => {
-    const fixture = makeStartFixture();
-    fixture.setState({ isCompacting: true } as AppState);
-
-    fixture.controller.dispatchAction({ type: 'pause', target: 't' });
-    await Promise.resolve();
-
-    expect(fixture.cancelCompaction).toHaveBeenCalledTimes(1);
-    expect(fixture.cancel).not.toHaveBeenCalled();
-
-    fixture.setState({ isCompacting: false } as AppState);
-    fixture.controller.dispatchAction({ type: 'pause', target: 't' });
-    await Promise.resolve();
-
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-  });
-
-  it('onStateChange detached 通知 unpublished', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('connecting');
-    fixture.fakeLink.onStateChange?.('detached');
-
-    expect(fixture.controller.state).toBe('detached');
-    expect(fixture.statuses).toEqual(['Forum Link: connecting...', 'Forum Link: unpublished']);
-  });
-});
-
-describe('Controller — descriptor 组合与状态迁移（M1 / D3）', () => {
-  function turnStartedEvent(sessionId = 's1'): Event {
-    return { type: 'turn.started', turnId: 1, origin: { kind: 'user' }, agentId: 'main', sessionId };
-  }
-
-  function turnEndedEvent(sessionId = 's1'): Event {
-    return { type: 'turn.ended', turnId: 1, reason: 'completed', agentId: 'main', sessionId };
-  }
-
-  it('M1 帧序：published 后状态迁移经 observers 观察 descriptor 帧，身份逐字段对齐 buildDescriptor', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('published');
-
-    fixture.emit(turnStartedEvent());
-    let descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
-    expect(descriptorFrames).toEqual([
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
-    ]);
-
-    fixture.controller.onCardOpened('question', 'up-1', questionPayload('up-1'));
-    descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
-    expect(descriptorFrames).toEqual([
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'waiting-question' } },
-    ]);
-
-    fixture.controller.onCardClosed('question', 'up-1');
-    descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
-    expect(descriptorFrames).toEqual([
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'waiting-question' } },
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
-    ]);
-
-    fixture.emit(turnEndedEvent());
-    descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
-    expect(descriptorFrames).toEqual([
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'waiting-question' } },
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'running' } },
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s1'), status: 'idle' } },
-    ]);
-  });
-
-  it('发布中途 running：start 时 projector 已 running，connect 源函数求值为 running', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('published');
-    fixture.emit(turnStartedEvent());
-
-    const source = fixture.fakeLink.connect.mock.calls[0]?.[1];
-    expect(source).toBeTypeOf('function');
-    expect(source?.()).toEqual({ ...makeDescriptor('s1'), status: 'running' });
-  });
-
-  it('重连注册源活读当前会话：backoff 中切换 s2 后再求值，身份为新会话', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('backoff');
-    fixture.controller.onSessionChanged(makeSession('s2').session);
-
-    expect(fixture.fakeLink.registerDescriptor()).toEqual({ ...makeDescriptor('s2'), status: 'idle' });
-  });
-
-  it('重连注册源活读当前会话：切换 s2 并迁移后求值，status 为 running', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('published');
-
-    const next = makeSession('s2');
-    fixture.controller.onSessionChanged(next.session);
-    next.emit(turnStartedEvent('s2'));
-
-    expect(fixture.fakeLink.registerDescriptor()).toEqual({ ...makeDescriptor('s2'), status: 'running' });
-  });
-
-  it('门控丢弃：connecting/backoff 状态下迁移不进 link.send，observers 仍收到 descriptor 帧', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('connecting');
-
-    fixture.emit(turnStartedEvent());
-
-    expect(fixture.fakeLink.send).not.toHaveBeenCalled();
-    expect(fixture.frames).toContainEqual({
-      type: 'descriptor',
-      descriptor: { ...makeDescriptor('s1'), status: 'running' },
-    });
-
-    fixture.fakeLink.onStateChange?.('backoff');
-    fixture.emit(turnEndedEvent());
-
-    expect(fixture.fakeLink.send).not.toHaveBeenCalled();
-    expect(fixture.frames).toContainEqual({
-      type: 'descriptor',
-      descriptor: { ...makeDescriptor('s1'), status: 'idle' },
-    });
-  });
-
-  it('会话切换组合：register 帧身份为新会话、status idle，旧会话 open 卡以 cancelled 结算在前', () => {
-    const fixture = makeStartFixture();
-    fixture.controller.setLinkState('published');
-    fixture.controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
-
-    const next = makeSession('s2');
-    fixture.controller.onSessionChanged(next.session);
-
-    const registerFrames = fixture.frames.filter((frame) => frame.type === 'register');
-    expect(registerFrames).toEqual([
-      { type: 'register', descriptor: { ...makeDescriptor('s2'), status: 'idle' } },
-    ]);
-    const settledIndex = fixture.frames.findIndex(
-      (frame) => frame.type === 'entry' && frame.entry.kind === 'card-settled',
-    );
-    expect(settledIndex).toBeGreaterThanOrEqual(0);
-    expect(fixture.frames[settledIndex]).toEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'cancelled' },
-    });
-    for (let i = 0; i < settledIndex; i += 1) {
-      expect(fixture.frames[i]?.type).not.toBe('register');
+      await fixture.controller.stop();
+      expect(fixture.controller.state).toBe('detached');
+      expect(hub.unregisterBodies).toHaveLength(1);
+    } finally {
+      await hub.close();
     }
   });
 
-  it('切换后迁移：descriptor 帧身份为新会话、status 为迁移后值，无旧会话残留', async () => {
-    const fixture = makeStartFixture();
-    await fixture.controller.start({ url: 'http://127.0.0.1:8787', password: '' });
-    fixture.fakeLink.onStateChange?.('published');
+  it('M4-A3: session switch triggers exactly one re-registration with only the new session', async () => {
+    const hub = new OrchestrationFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+      const registersBefore = hub.registerCount;
 
-    const next = makeSession('s2');
-    fixture.controller.onSessionChanged(next.session);
+      fixture.controller.onSessionChanged(makeSession('s2'));
 
-    next.emit(turnStartedEvent('s2'));
+      await waitFor(() => hub.registerCount === registersBefore + 1);
+      await waitFor(() => fixture.controller.state === 'published');
+      expect(hub.registerCount).toBe(registersBefore + 1);
+      const lastRegister = hub.registerSnapshots.at(-1) as {
+        threads: { descriptor: { sessionId: string } }[];
+      };
+      expect(lastRegister.threads.map((thread) => thread.descriptor.sessionId)).toEqual(['s2']);
+      await fixture.controller.stop();
+    } finally {
+      await hub.close();
+    }
+  });
 
-    const descriptorFrames = fixture.frames.filter((frame) => frame.type === 'descriptor');
-    expect(descriptorFrames).toEqual([
-      { type: 'descriptor', descriptor: { ...makeDescriptor('s2'), status: 'running' } },
-    ]);
+  it('M4-A2: local answer uplinks a card-settled entry the hub receives as a batch frame', async () => {
+    const hub = new OrchestrationFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+
+      const shown = fixture.approvalController.show(approvalData('a-1'));
+      fixture.showApproval(approvalData('a-1'));
+      const cardId = fixture.controller.openCards[0]!.cardId;
+      await waitFor(() =>
+        hub.registerSnapshots.some((snapshot) =>
+          (snapshot as { threads?: { timeline?: { kind: string }[] }[] })
+            .threads?.some((thread) =>
+              thread.timeline?.some((entry) => entry.kind === 'card-opened'),
+            ),
+        ),
+      );
+
+      fixture.approvalController.respond({ decision: 'rejected' });
+      await expect(shown).resolves.toEqual({ decision: 'rejected' });
+      fixture.hideApproval();
+
+      await waitFor(() =>
+        hub.registerSnapshots.some((snapshot) =>
+          (snapshot as { threads?: { timeline?: { kind: string; cardId?: string }[] }[] })
+            .threads?.some((thread) =>
+              thread.timeline?.some(
+                (entry) => entry.kind === 'card-settled' && entry.cardId === cardId,
+              ),
+            ),
+        ),
+      );
+      const lastRegister = hub.registerSnapshots.at(-1) as {
+        threads: { openCards: { cardId: string }[] }[];
+      };
+      expect(lastRegister.threads[0]!.openCards.map((card) => card.cardId)).toEqual([]);
+      await fixture.controller.stop();
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('M1/V2: timeline entries stream up as batch frames without waiting for card events', async () => {
+    const hub = new OrchestrationFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+
+      fixture.controller.onTranscriptEntry({ id: 'u1', kind: 'user', renderMode: 'plain', content: 'run the deploy' });
+      fixture.controller.onSessionEvent({ type: 'turn.started', turnId: 1, origin: { kind: 'user' }, agentId: 'main', sessionId: 's1' } as never);
+      fixture.controller.onSessionEvent({ type: 'assistant.delta', turnId: 1, delta: 'deploying', agentId: 'main', sessionId: 's1' } as never);
+      fixture.controller.onSessionEvent({ type: 'turn.ended', turnId: 1, reason: 'completed', agentId: 'main', sessionId: 's1' } as never);
+      fixture.controller.onSessionEvent({ type: 'tool.call.started', turnId: 1, toolCallId: 'tc1', name: 'Bash', args: { command: 'ls' }, agentId: 'main', sessionId: 's1' } as never);
+
+      await waitFor(() => {
+        const entries = hub.batches.flatMap((batch) =>
+          batch.frames.filter((frame) => frame.kind === 'timeline').flatMap((frame) => (frame as { entries: { kind: string; seq: number }[] }).entries),
+        );
+        return entries.length >= 3;
+      });
+      const entries = hub.batches.flatMap((batch) =>
+        batch.frames.filter((frame) => frame.kind === 'timeline').flatMap((frame) => (frame as { entries: { kind: string; seq: number }[] }).entries),
+      );
+      expect(entries.map((entry) => entry.seq)).toEqual([1, 2, 3]);
+      expect(entries.map((entry) => entry.kind)).toEqual(['user-message', 'assistant-turn', 'tool-call']);
+      for (const batch of hub.batches) {
+        for (const frame of batch.frames) {
+          if (frame.kind !== 'timeline') continue;
+          expect(frame.sessionId).toBe('s1');
+        }
+      }
+      await fixture.controller.stop();
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('V2: incremental uplink + mid-flight resync + continued increments stay hole-free', async () => {
+    const hub = new OrchestrationFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+
+      const uplinkedSeqs = (): number[] =>
+        hub.batches.flatMap((batch) =>
+          batch.frames
+            .filter((frame) => frame.kind === 'timeline')
+            .flatMap((frame) => (frame as { entries: { seq: number }[] }).entries.map((entry) => entry.seq)),
+        );
+      const emitUser = (index: number) => {
+        fixture.controller.onTranscriptEntry({ id: `u${index}`, kind: 'user', renderMode: 'plain', content: `m${index}` });
+      };
+
+      emitUser(1);
+      emitUser(2);
+      await waitFor(() => uplinkedSeqs().length === 2);
+      expect(uplinkedSeqs()).toEqual([1, 2]);
+
+      const registersBefore = hub.registerCount;
+      (fixture.controller as unknown as { link?: { resync(): void } }).link!.resync();
+      await waitFor(() => hub.registerCount === registersBefore + 1);
+      const midRegister = hub.registerSnapshots.at(-1) as {
+        threads: { timeline: { seq: number }[] }[];
+      };
+      const midSeqs = midRegister.threads[0]!.timeline.map((entry) => entry.seq);
+      expect(midSeqs).toEqual([1, 2]);
+
+      emitUser(3);
+      emitUser(4);
+      await waitFor(() => uplinkedSeqs().length === 4);
+      const allUplinked = uplinkedSeqs();
+      expect(allUplinked).toEqual([1, 2, 3, 4]);
+      expect(new Set(allUplinked).size).toBe(allUplinked.length);
+
+      const finalSnapshot = fixture.controller.getSnapshot();
+      expect(finalSnapshot.threads[0]!.timeline.map((entry) => entry.seq)).toEqual([1, 2, 3, 4]);
+      await fixture.controller.stop();
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('P6-6.3: attached switch settles S cards into S and registers S2 with a fresh snapshot', async () => {
+    const hub = new OrchestrationFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+
+      fixture.showApproval(approvalData('a-1'));
+      const cardId = fixture.controller.openCards[0]!.cardId;
+      fixture.controller.onTranscriptEntry({ id: 'u1', kind: 'user', renderMode: 'plain', content: 'message of s1' });
+      await waitFor(() =>
+        hub.registerSnapshots.some((snapshot) =>
+          (snapshot as { threads?: { timeline?: { kind: string; card?: { cardId?: string } }[] }[] })
+            .threads?.some((thread) =>
+              thread.timeline?.some(
+                (entry) => entry.kind === 'card-opened' && entry.card?.cardId === cardId,
+              ),
+            ),
+        ),
+      );
+
+      const settledFrames: { sessionId: string; entries: { kind: string; cardId?: string; outcome?: string }[] }[] = [];
+      const realLink = (fixture.controller as unknown as {
+        link?: { enqueue(frame: unknown): void; resync(): void; stop(): Promise<void> };
+      }).link;
+      expect(realLink).toBeDefined();
+      (fixture.controller as unknown as { link?: unknown }).link = {
+        enqueue: (frame: { kind: string; sessionId?: string }) => {
+          if (frame.kind === 'timeline') {
+            settledFrames.push(
+              frame as unknown as { sessionId: string; entries: { kind: string; cardId?: string; outcome?: string }[] },
+            );
+          }
+        },
+        resync: () => {
+          realLink!.resync();
+        },
+        stop: () => {
+          void realLink!.stop();
+        },
+      };
+
+      fixture.controller.onSessionChanged(makeSession('s2'));
+
+      expect(settledFrames).toHaveLength(1);
+      expect(settledFrames[0]!.sessionId).toBe('s1');
+      expect(settledFrames[0]!.entries).toHaveLength(1);
+      expect(settledFrames[0]!.entries[0]).toMatchObject({
+        kind: 'card-settled',
+        cardId,
+        outcome: 'cancelled',
+      });
+      expect(fixture.controller.openCards).toEqual([]);
+
+      await waitFor(() =>
+        hub.registerSnapshots.some((snapshot) =>
+          (snapshot as { threads?: { descriptor?: { sessionId: string }; timeline?: { kind: string; seq?: number }[] }[] })
+            .threads?.some((thread) => thread.descriptor?.sessionId === 's2'),
+        ),
+      );
+      const s2Register = hub.registerSnapshots
+        .map((snapshot) => snapshot as { threads: { descriptor: { sessionId: string }; timeline: { kind: string; seq: number; text?: string }[] }[] })
+        .find((snapshot) => snapshot.threads.some((thread) => thread.descriptor.sessionId === 's2'))!;
+      const s2Thread = s2Register.threads.find((thread) => thread.descriptor.sessionId === 's2')!;
+      expect(s2Thread.timeline).toEqual([]);
+      expect(hub.registerSnapshots.every((snapshot) =>
+        (snapshot as { threads: { descriptor: { sessionId: string }; timeline: { kind: string; seq: number }[] }[] })
+          .threads.every((thread) =>
+            thread.descriptor.sessionId !== 's2' ||
+            thread.timeline.every((entry) => entry.kind !== 'card-settled'),
+          ),
+      )).toBe(true);
+      await waitFor(() => fixture.controller.state === 'published');
+      await fixture.controller.stop();
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('remote approve via the downlink resolves the panel and reports the receipt through the link', async () => {
+    const hub = new OrchestrationFakeHub();
+    await hub.start();
+    try {
+      const fixture = makeController();
+      fixture.controller.onSessionChanged(makeSession('s1'));
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+
+      const shown = fixture.approvalController.show(approvalData('a-1'));
+      fixture.showApproval(approvalData('a-1'));
+      const cardId = fixture.controller.openCards[0]!.cardId;
+      await waitFor(() => fixture.controller.getSnapshot().threads[0]!.openCards.length === 1);
+      await waitFor(() => fixture.controller.state === 'published');
+
+      hub.pushToStreams(
+        `event: op\ndata: ${JSON.stringify({
+          opId: 'opA',
+          sessionId: 's1',
+          intent: { type: 'approve', sessionId: 's1', cardId, optionIndex: 0 },
+        })}`,
+      );
+
+      await expect(shown).resolves.toEqual({ decision: 'approved' });
+      await waitFor(() => {
+        const posts = hub.receiptBodies as { receipts: ReceiptReport[] }[];
+        return posts.some((body) =>
+          body.receipts.some((report) => report.opId === 'opA' && report.state === 'applied'),
+        );
+      });
+      fixture.hideApproval();
+      await fixture.controller.stop();
+    } finally {
+      await hub.close();
+    }
   });
 });

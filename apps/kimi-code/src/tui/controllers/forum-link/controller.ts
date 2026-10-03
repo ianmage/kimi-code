@@ -1,32 +1,31 @@
 import { basename } from 'node:path';
 import { hostname } from 'node:os';
+import { randomUUID } from 'node:crypto';
 
-import type { Session } from '@moonshot-ai/kimi-code-sdk';
-import type { ActionFrame, Descriptor, UplinkFrame } from '@moonshot-ai/forum-link';
+import type { Session, SessionPlan } from '@moonshot-ai/kimi-code-sdk';
+import type { Card, Descriptor, OpType, Overview, TimelineEntry, WorkerSnapshot } from '@moonshot-ai/forum-link';
 
+import type { TodoItem } from '#/tui/components/chrome/todo-panel';
 import type { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
 import type { QuestionController } from '#/tui/reverse-rpc/question/controller';
+import type { SlashCommandHost } from '#/tui/commands/dispatch';
+import type { SteerInputItem } from '#/tui/types';
 import type { ReverseRPCUIHooks } from '../../reverse-rpc/index';
 import type { ApprovalPanelData, QuestionPanelData } from '../../reverse-rpc/types';
 import type { AppState, TranscriptEntry } from '../../types';
 import { resolveEndSessionMode } from './end-session';
-import { Injector } from './injector';
-import { Link, type LinkCredential } from './link';
-import { Projector, type CardSettlementOutcome } from './projector';
-
-export interface OpenCard {
-  readonly cardId: string;
-  readonly kind: 'question' | 'approval';
-  readonly upstreamId: string;
-}
+import { Injector, type OpenCardView } from './injector';
+import type { SessionControlHostView } from './session-control';
+import { Link, type LinkOptions, type LinkTiming } from './link';
+import { Projector } from './projector';
 
 export type ForumLinkState = 'detached' | 'connecting' | 'published' | 'backoff';
 
 export type ForumLinkStartResult =
   | { ok: true }
-  | { ok: false; reason: 'already-active' | 'no-session' | 'no-descriptor' | 'connect-failed'; error?: unknown };
+  | { ok: false; reason: 'already-active' | 'no-session' | 'connect-failed'; error?: unknown };
 
-export type ForumLinkCardKind = OpenCard['kind'];
+export type ForumLinkCardKind = 'approval' | 'question';
 
 export interface ForumLinkHostFace {
   readonly appState: () => AppState;
@@ -35,79 +34,45 @@ export interface ForumLinkHostFace {
   readonly sendNormalUserInput: (text: string) => Promise<void>;
   readonly createNewSession: () => Promise<void>;
   readonly showStatus: (message: string) => void;
+  readonly steerMessage: (session: Session, input: readonly SteerInputItem[]) => void;
+  readonly slashHost: SlashCommandHost;
+  readonly getTodos: () => readonly TodoItem[];
+  readonly getPlan: () => Promise<SessionPlan | null>;
+  readonly cancelForeground: () => void;
   session(): Session | undefined;
   workDir(): string;
   sessionTitle(): string | null;
 }
 
-/**
- * Assembly factory for the TUI wiring: keeps the KimiTUI call site to a
- * single line and the descriptor-building knowledge inside this module.
- */
-export function createForumLinkController(host: ForumLinkHostFace): ForumLinkController {
-  return new ForumLinkController({
-    getAppState: host.appState,
-    approvalController: host.approvalController,
-    questionController: host.questionController,
-    sendNormalUserInput: host.sendNormalUserInput,
-    createNewSession: host.createNewSession,
-    onStatus: host.showStatus,
-    buildDescriptor: (session) => ({
-      sessionId: session.id,
-      machineName: hostname(),
-      projectName: basename(host.workDir()),
-      title: host.sessionTitle() ?? '',
-    }),
-  });
-}
+export const FORUM_LINK_CAPABILITIES: readonly OpType[] = [
+  'approve',
+  'approve-cancel',
+  'answer',
+  'answer-cancel',
+  'send',
+  'steer',
+  'pause',
+  'end-session',
+  'set-permission-mode',
+  'switch-model',
+  'new-session',
+  'goal-set',
+  'goal-pause',
+  'goal-resume',
+  'goal-cancel',
+];
 
-/**
- * Dependency surface of the controller. Every field is optional so the
- * unwired skeleton can be constructed with an empty object; the downlink
- * injector is only wired when the four host faces (appState plus the two
- * responders and the input sender) are all present.
- */
 export interface ForumLinkControllerDeps {
-  /** Receives every frame the internal projector derives; absent means drop. */
-  onProjectorFrame?: (frame: UplinkFrame) => void;
-  /** Receives one-line link state notices; absent means silent. */
-  onStatus?: (message: string) => void;
-  /**
-   * Reads the current app state on every access; present only when the
-   * injector host is wired. A getter (not a captured object) so mutations
-   * like isCompacting flips are always observed live.
-   */
-  getAppState?: () => AppState;
-  /** Reverse-rpc responder faces for downlink card actions. */
-  approvalController?: ApprovalController;
-  questionController?: QuestionController;
-  /** Sends a user message into the current session. */
-  sendNormalUserInput?: (text: string) => Promise<void>;
-  /** Creates a fresh session; the end-session orchestration's final step. */
-  createNewSession?: () => Promise<void>;
-  /** Notified when a downlink card action no longer matches an open card. */
-  onDroppedAction?: (frame: ActionFrame) => void;
-  /**
-   * Assembles the thread descriptor identity; the controller composes the
-   * projector's live status on top at send time. The publish command injects
-   * the real one.
-   */
-  buildDescriptor?: (session: Session) => Omit<Descriptor, 'status'>;
-  /** Bounded idle wait before end-session gives up; sub-second in tests. */
-  endSessionTiming?: { idleWaitTimeoutMs?: number };
-  /** Link factory; injectable for tests, defaults to the real Link. */
-  createLink?: (handlers: LinkHandlers) => Link;
+  readonly host?: ForumLinkHostFace;
+  readonly linkTiming?: LinkTiming;
+  readonly overviewIntervalMs?: number;
+  readonly endSessionTiming?: { idleWaitTimeoutMs?: number };
+  readonly newCardId?: () => string;
+  readonly fetchImpl?: typeof fetch;
 }
 
-export interface LinkHandlers {
-  onStateChange: (state: ForumLinkState) => void;
-  onAction: (frame: ActionFrame) => void;
-}
-
-const DEFAULT_CARD_OUTCOME: Record<ForumLinkCardKind, CardSettlementOutcome> = {
-  question: 'answered',
-  approval: 'approved',
-};
+const DEFAULT_IDLE_WAIT_TIMEOUT_MS = 5000;
+const DEFAULT_OVERVIEW_INTERVAL_MS = 2000;
 
 const LINK_STATE_NOTICES: Partial<Record<ForumLinkState, string>> = {
   connecting: 'Forum Link: connecting...',
@@ -118,78 +83,70 @@ const LINK_STATE_NOTICES: Partial<Record<ForumLinkState, string>> = {
 
 const RECONNECTING_NOTICE = 'Forum Link: reconnecting...';
 
-const END_SESSION_TIMEOUT_NOTICE =
-  'Forum Link: end-session timed out waiting for idle; staying unpublished';
-
-const DEFAULT_IDLE_WAIT_TIMEOUT_MS = 5000;
-
 const END_SESSION_IDLE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'turn.ended',
   'compaction.completed',
   'compaction.cancelled',
 ]);
 
-/**
- * One-line notice per state transition, with backoff debounce: only the first
- * backoff entry notifies, and recovering to connecting says "reconnecting"
- * instead of "connecting". Same-state transitions and initial detached stay
- * silent.
- */
-function linkStateNotice(previous: ForumLinkState, next: ForumLinkState): string | undefined {
-  if (previous === next) return undefined;
-  if (previous === 'backoff' && next === 'connecting') return RECONNECTING_NOTICE;
-  return LINK_STATE_NOTICES[next];
+const DEFAULT_CARD_OUTCOME: Record<ForumLinkCardKind, string> = {
+  approval: 'approved',
+  question: 'answered',
+};
+
+interface CardEntry {
+  readonly kind: ForumLinkCardKind;
+  readonly panelData: ApprovalPanelData | QuestionPanelData;
+  readonly panelRef: ApprovalController | QuestionController;
+}
+
+export function createForumLinkController(host: ForumLinkHostFace): ForumLinkController {
+  return new ForumLinkController({ host });
 }
 
 export class ForumLinkController {
   private linkState: ForumLinkState = 'detached';
-  private readonly openCardsList: OpenCard[] = [];
-  private nextCardNumber = 0;
-  private readonly projector: Projector;
-  private readonly injector?: Injector;
-  private link?: Link;
   private currentSession?: Session;
+  private sessionUnsubscribe?: () => void;
+  private projector!: Projector;
+  private link?: Link;
+  private injector?: Injector;
+  private readonly openCardsMap = new Map<string, CardEntry>();
+  private readonly deps: ForumLinkControllerDeps;
+  private overviewDirty = false;
+  private overviewTimer: ReturnType<typeof setTimeout> | undefined;
+  private currentOverview?: Overview;
+  private readonly host: ForumLinkHostFace | undefined;
 
-  constructor(private readonly deps: ForumLinkControllerDeps) {
-    this.projector = new Projector({
-      emit: (frame) => {
-        this.handleProjectorFrame(frame);
-      },
-      onStatusChange: () => {
-        const session = this.currentSession;
-        if (session === undefined) return;
-        const descriptor = this.composeDescriptor(session);
-        if (descriptor === undefined) return;
-        this.handleProjectorFrame({ type: 'descriptor', descriptor });
-      },
-    });
-    if (
-      deps.getAppState === undefined ||
-      deps.approvalController === undefined ||
-      deps.questionController === undefined ||
-      deps.sendNormalUserInput === undefined
-    ) {
-      this.injector = undefined;
-      return;
+  constructor(deps: ForumLinkControllerDeps) {
+    this.deps = deps;
+    this.host = deps.host;
+    this.resetProjector();
+    if (this.host !== undefined) {
+      const hostView: SessionControlHostView = {
+        slashHost: this.host.slashHost,
+        sendNormalUserInput: this.host.sendNormalUserInput,
+        steerMessage: this.host.steerMessage,
+        cancelForeground: this.host.cancelForeground,
+        createNewSession: this.host.createNewSession,
+        runEndSession: (opts?: { beforeStop?: () => void }) => this.runEndSession(opts),
+        session: () => this.currentSession,
+      };
+      this.injector = new Injector(
+        {
+          reportReceipt: (report) => this.link?.reportReceipt(report),
+          getOpenCard: (cardId) => this.getOpenCardView(cardId),
+          isCurrentPanel: (cardId) => this.openCardsMap.has(cardId),
+          respondApproval: (cardId, response) => this.respondCard(cardId, 'approval', () => {
+            (this.openCardsMap.get(cardId)!.panelRef as ApprovalController).respond(response);
+          }),
+          respondQuestion: (cardId, response) => this.respondCard(cardId, 'question', () => {
+            (this.openCardsMap.get(cardId)!.panelRef as QuestionController).respond(response);
+          }),
+        },
+        hostView,
+      );
     }
-    const currentSession = (): Session | undefined => this.currentSession;
-    this.injector = new Injector({
-      get session() {
-        return currentSession();
-      },
-      get appState() {
-        return deps.getAppState!();
-      },
-      approvalController: deps.approvalController,
-      questionController: deps.questionController,
-      sendNormalUserInput: deps.sendNormalUserInput,
-      endSession: () => this.runEndSession(),
-      getOpenCards: () => this.openCardsList,
-      onCardClosed: (kind, upstreamId, outcome) => {
-        this.onCardClosed(kind, upstreamId, outcome);
-      },
-      onDroppedAction: (frame) => deps.onDroppedAction?.(frame),
-    });
   }
 
   get state(): ForumLinkState {
@@ -200,122 +157,310 @@ export class ForumLinkController {
     return this.currentSession;
   }
 
-  /** Downlink entry — forwards a validated action frame to the injector. */
-  dispatchAction(frame: ActionFrame): void {
-    this.injector?.dispatch(frame);
+  get openCards(): readonly { cardId: string; kind: ForumLinkCardKind }[] {
+    return [...this.openCardsMap.entries()].map(([cardId, entry]) => ({
+      cardId,
+      kind: entry.kind,
+    }));
   }
 
-  /** Link state transition entry point; notifies at most one line per change. */
-  setLinkState(next: ForumLinkState): void {
-    const notice = linkStateNotice(this.linkState, next);
-    this.linkState = next;
-    if (notice !== undefined) this.deps.onStatus?.(notice);
+  async start(credential: Pick<LinkOptions, 'url' | 'token'>): Promise<ForumLinkStartResult> {
+    if (this.linkState !== 'detached') return { ok: false, reason: 'already-active' };
+    const session = this.currentSession;
+    if (session === undefined) return { ok: false, reason: 'no-session' };
+    this.resetProjector();
+    this.attachSession(session);
+    this.link = new Link({
+      url: credential.url,
+      token: credential.token,
+      getSnapshot: () => this.getSnapshot(),
+      onOp: (op) => {
+        void this.injector?.handle(op);
+      },
+      onStateChange: (next) => {
+        this.setLinkState(next);
+      },
+      onFatal: (message) => {
+        this.clearOverviewTimer();
+        this.setLinkState('detached');
+        this.host?.showStatus(message);
+      },
+      timing: this.deps.linkTiming,
+      fetchImpl: this.deps.fetchImpl,
+    });
+    this.link.start();
+    return { ok: true };
   }
 
-  /** The controller is the single owner of card open/close state. */
-  get openCards(): readonly OpenCard[] {
-    return this.openCardsList;
+  async stop(): Promise<void> {
+    this.clearOverviewTimer();
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = undefined;
+    await this.link?.stop();
+    this.link = undefined;
+    this.openCardsMap.clear();
+    this.overviewDirty = false;
+    this.setLinkState('detached');
   }
 
-  /** S1 observation seam — wired in `KimiTUI.appendTranscriptEntry`. */
-  onTranscriptEntry(_entry: TranscriptEntry): void {}
+  getSnapshot(): Omit<WorkerSnapshot, 'recentReceipts'> {
+    const session = this.currentSession;
+    const sessionId = session?.id ?? 'unattached';
+    return {
+      workerId: this.workerId(),
+      threads: [
+        {
+          descriptor: this.buildDescriptor(sessionId),
+          overview: this.currentOverview ?? this.sampleOverviewNow(),
+          timeline: this.projector.snapshotTimeline(),
+          openCards: this.snapshotOpenCards(),
+        },
+      ],
+    };
+  }
 
-  /** S2 observation seam — wired in `KimiTUI.setSession`. */
-  onSessionChanged(session: Session): void {
-    for (const card of this.openCardsList.splice(0)) {
-      this.projector.onCardClosed(card.kind, card.cardId, 'cancelled');
+  onTranscriptEntry(entry: TranscriptEntry): void {
+    this.enqueueTimelineEntry(this.projector.onTranscriptEntry(entry));
+    if (entry.kind === 'user') this.markOverviewDirty();
+  }
+
+  onSessionEvent(event: Parameters<Projector['handleEvent']>[0]): void {
+    const type = event.type as string;
+    if (
+      type === 'tool.result' ||
+      type.startsWith('subagent.') ||
+      type.startsWith('background.task.')
+    ) {
+      this.markOverviewDirty();
     }
-    this.currentSession = session;
-    if (this.linkState === 'detached') return;
-    this.projector.detach();
-    this.projector.attach(session);
-    const descriptor = this.composeDescriptor(session);
-    if (descriptor === undefined) return;
-    this.projector.emitRegister(descriptor);
+    if (type === 'assistant.delta') this.markOverviewDirty();
+    this.enqueueTimelineEntry(this.projector.handleEvent(event));
   }
 
-  /** S3 observation seam — a card opened (approval panel / question dialog). */
+  onSessionChanged(session: Session): void {
+    this.settleAllOpenCards('cancelled');
+    this.resetProjector();
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = undefined;
+    this.currentSession = session;
+    this.attachSession(session);
+    if (this.linkState === 'detached') return;
+    this.link?.resync();
+  }
+
+  onAppStateChanged(): void {
+    this.markOverviewDirty();
+  }
+
   onCardOpened(
     kind: ForumLinkCardKind,
     upstreamId: string,
     payload: ApprovalPanelData | QuestionPanelData,
   ): void {
-    this.nextCardNumber += 1;
-    const cardId = `c${String(this.nextCardNumber)}`;
-    this.openCardsList.push({ cardId, kind, upstreamId });
-    this.projector.onCardOpened(kind, cardId, payload);
+    if (this.host === undefined) return;
+    if (this.findByUpstreamId(kind, upstreamId) !== undefined) return;
+    const cardId = this.mintCardId(kind);
+    const panelRef =
+      kind === 'approval' ? this.host.approvalController : this.host.questionController;
+    this.openCardsMap.set(cardId, { kind, panelData: payload, panelRef });
+    this.enqueueTimelineEntry(this.projector.onCardOpened(kind, cardId, payload));
+    this.syncCardLifecycle();
   }
 
-  /** S3 observation seam — the tracked card settled. Unknown ids are no-ops. */
-  onCardClosed(kind: ForumLinkCardKind, upstreamId: string, outcome?: CardSettlementOutcome): void {
-    const index = this.openCardsList.findIndex(
-      (card) => card.kind === kind && card.upstreamId === upstreamId,
+  onCardClosed(kind: ForumLinkCardKind, upstreamId: string, outcome?: string): void {
+    const entry = this.findByUpstreamId(kind, upstreamId);
+    if (entry === undefined) return;
+    this.openCardsMap.delete(entry.cardId);
+    this.enqueueTimelineEntry(
+      this.projector.onCardSettled(entry.cardId, outcome ?? DEFAULT_CARD_OUTCOME[kind]),
     );
-    const card = index >= 0 ? this.openCardsList[index] : undefined;
-    if (card === undefined) return;
-    this.openCardsList.splice(index, 1);
-    this.projector.onCardClosed(kind, card.cardId, outcome ?? DEFAULT_CARD_OUTCOME[kind]);
+    this.syncCardLifecycle();
   }
 
-  /**
-   * Publish orchestration (M-1): create the link, attach the projector to the
-   * current session, and connect. The caller pre-validates the session and
-   * resolves the credential; re-entry while not detached is a no-op (toggle
-   * semantics live in the command layer). Frames emitted before the link
-   * reaches published are dropped — no history backfill (D-I).
-   */
-  async start(credential: LinkCredential): Promise<ForumLinkStartResult> {
-    if (this.linkState !== 'detached') return { ok: false, reason: 'already-active' };
-    const session = this.currentSession;
-    if (session === undefined) return { ok: false, reason: 'no-session' };
-    if (this.deps.buildDescriptor?.(session) === undefined) return { ok: false, reason: 'no-descriptor' };
-    if (this.link === undefined) {
-      const handlers: LinkHandlers = {
-        onStateChange: (state) => {
-          this.setLinkState(state);
-        },
-        onAction: (frame) => {
-          this.dispatchAction(frame);
-        },
-      };
-      this.link = this.deps.createLink?.(handlers) ?? new Link(handlers);
-    }
-    this.projector.attach(session);
-    try {
-      await this.link.connect(credential, () => this.composeDescriptor(this.currentSession)!);
-    } catch (error) {
-      return { ok: false, reason: 'connect-failed', error };
-    }
-    return { ok: true };
+  getOpenCardView(cardId: string): OpenCardView | undefined {
+    const entry = this.openCardsMap.get(cardId);
+    if (entry === undefined) return undefined;
+    return {
+      kind: entry.kind,
+      approval: entry.kind === 'approval' ? (entry.panelData as ApprovalPanelData) : undefined,
+      question: entry.kind === 'question' ? (entry.panelData as QuestionPanelData) : undefined,
+    };
   }
 
-  /**
-   * End-session orchestration (M-1): dispatch on the resolved termination
-   * mode. `immediate` skips cancel and the idle wait entirely — an idle or
-   * shell-phase session has nothing to cancel, so waiting would only time
-   * out — and goes straight to stop → createNewSession. `turn` and
-   * `compaction` keep the original sequencing: the idle listener is armed
-   * before the cancel call — a turn.ended racing the cancel's own resolution
-   * must not be lost to a late subscription — and the bounded wait gives up
-   * on timeout, staying unpublished.
-   */
-  async runEndSession(): Promise<void> {
+  isCurrentPanelCard(cardId: string): boolean {
+    return this.openCardsMap.has(cardId);
+  }
+
+  private respondCard(
+    cardId: string,
+    kind: ForumLinkCardKind,
+    respond: () => void,
+  ): void {
+    const entry = this.openCardsMap.get(cardId);
+    if (entry === undefined || entry.kind !== kind) return;
+    respond();
+  }
+
+  async runEndSession(opts?: { beforeStop?: () => void }): Promise<void> {
     const session = this.currentSession;
     if (session === undefined) return;
-    const mode = resolveEndSessionMode(this.deps.getAppState?.());
+    const mode = resolveEndSessionMode(this.host?.appState());
     if (mode === 'immediate') {
+      opts?.beforeStop?.();
       await this.stop();
-      await this.deps.createNewSession?.();
+      await this.host?.createNewSession();
       return;
     }
     const idle = this.waitForIdle(session);
     if (mode === 'compaction') await session.cancelCompaction();
     else await session.cancel();
+    opts?.beforeStop?.();
     await this.stop();
-    if (await idle) await this.deps.createNewSession?.();
-    else this.deps.onStatus?.(END_SESSION_TIMEOUT_NOTICE);
+    if (await idle) await this.host?.createNewSession();
   }
 
+  private resetProjector(): void {
+    this.projector = new Projector({
+      getPlan: this.host === undefined ? undefined : async () => this.host!.getPlan(),
+    });
+    this.currentOverview = undefined;
+    this.overviewDirty = false;
+  }
+
+  private attachSession(session: Session): void {
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = session.onEvent((event) => {
+      this.onSessionEvent(event);
+    });
+  }
+
+  private setLinkState(next: ForumLinkState): void {
+    const previous = this.linkState;
+    if (previous === next) return;
+    this.linkState = next;
+    let notice = LINK_STATE_NOTICES[next];
+    if (previous === 'backoff' && next === 'connecting') notice = RECONNECTING_NOTICE;
+    if (notice !== undefined) this.host?.showStatus(notice);
+    if (next === 'published') {
+      this.markOverviewDirty();
+    }
+  }
+
+  private mintCardId(kind: ForumLinkCardKind): string {
+    const uuid = this.deps.newCardId?.() ?? randomUUID();
+    return `${kind}_${uuid}`;
+  }
+
+  private findByUpstreamId(
+    kind: ForumLinkCardKind,
+    upstreamId: string,
+  ): { cardId: string; entry: CardEntry } | undefined {
+    for (const [cardId, entry] of this.openCardsMap) {
+      if (entry.kind !== kind) continue;
+      if ((entry.panelData as { id?: string }).id === upstreamId) return { cardId, entry };
+    }
+    return undefined;
+  }
+
+  private settleAllOpenCards(outcome: string): void {
+    for (const [cardId] of this.openCardsMap) {
+      this.enqueueTimelineEntry(this.projector.onCardSettled(cardId, outcome));
+    }
+    this.openCardsMap.clear();
+  }
+
+  private appendPlanBodyExtra(cardId: string, card: Card): void {
+    const extras = this.projector.planBodyBlock(cardId);
+    if (extras === undefined) return;
+    const approval = card['approval'] as { display?: unknown[] } | undefined;
+    if (approval === undefined) return;
+    approval.display = [...(approval.display ?? []), extras];
+  }
+
+  private syncCardLifecycle(): void {
+    if (this.linkState === 'detached') return;
+    this.link?.resync();
+  }
+
+  private enqueueTimelineEntry(entry: TimelineEntry | undefined): void {
+    if (entry === undefined || this.linkState === 'detached') return;
+    const session = this.currentSession;
+    if (session === undefined) return;
+    this.link?.enqueue({ sessionId: session.id, kind: 'timeline', entries: [entry] });
+  }
+
+  private markOverviewDirty(): void {
+    if (this.linkState === 'detached') return;
+    this.overviewDirty = true;
+    if (this.overviewTimer !== undefined) return;
+    const interval = this.deps.overviewIntervalMs ?? DEFAULT_OVERVIEW_INTERVAL_MS;
+    this.overviewTimer = setTimeout(() => {
+      this.overviewTimer = undefined;
+      this.flushOverviewIfDirty();
+    }, interval);
+    this.overviewTimer.unref?.();
+  }
+
+  private flushOverviewIfDirty(): void {
+    if (!this.overviewDirty) return;
+    if (this.linkState === 'detached') {
+      this.overviewDirty = false;
+      return;
+    }
+    this.overviewDirty = false;
+    const session = this.currentSession;
+    if (session === undefined) return;
+    const overview = this.sampleOverviewNow();
+    this.link?.enqueue({ sessionId: session.id, kind: 'overview', overview });
+  }
+
+  private sampleOverviewNow(): Overview {
+    const host = this.host;
+    if (host === undefined) {
+      return this.projector.sampleOverview(
+        FALLBACK_APP_STATE,
+        [],
+        this.projector.eventFolds,
+        {},
+        '',
+      );
+    }
+    const appState = host.appState();
+    this.currentOverview = this.projector.sampleOverview(
+      appState,
+      host.getTodos(),
+      this.projector.eventFolds,
+      appState.availableModels,
+      '',
+    );
+    return this.currentOverview;
+  }
+
+  private snapshotOpenCards(): Card[] {
+    return [...this.openCardsMap.entries()].map(([cardId, entry]) => {
+      const card = this.projector.projectCard(cardId, entry.panelData);
+      this.appendPlanBodyExtra(cardId, card);
+      return card;
+    });
+  }
+
+  private buildDescriptor(sessionId: string): Descriptor {
+    const host = this.host;
+    return {
+      sessionId,
+      machine: { tokenName: '', hostname: hostname() },
+      project: host === undefined ? '' : basename(host.workDir()),
+      title: host?.sessionTitle() ?? '',
+      kind: 'interactive',
+      capabilities: [...FORUM_LINK_CAPABILITIES],
+    };
+  }
+
+  private workerId(): string {
+    return this.workerIdValue ?? (this.workerIdValue = `worker_${randomUUID()}`);
+  }
+
+  private workerIdValue: string | undefined;
   private waitForIdle(session: Session): Promise<boolean> {
     const timeoutMs = this.deps.endSessionTiming?.idleWaitTimeoutMs ?? DEFAULT_IDLE_WAIT_TIMEOUT_MS;
     let unsubscribe: (() => void) | undefined;
@@ -336,54 +481,25 @@ export class ForumLinkController {
     });
   }
 
-  /** Idempotent teardown: close the link, detach the projector, drop open cards. */
-  async stop(): Promise<void> {
-    this.link?.close();
-    this.projector.detach();
-    this.openCardsList.length = 0;
-    this.setLinkState('detached');
-  }
-
-  /**
-   * The single composition point of the descriptor: identity from
-   * `deps.buildDescriptor`, status from the projector, evaluated at send time
-   * with no caching. Returns undefined when no identity dep is wired.
-   */
-  private composeDescriptor(session: Session): Descriptor | undefined {
-    const identity = this.deps.buildDescriptor?.(session);
-    if (identity === undefined) return undefined;
-    return { ...identity, status: this.projector.status };
-  }
-
-  /**
-   * Internal projector emit routing: observers (deps.onProjectorFrame) see
-   * every derived frame regardless of state; the link only receives frames
-   * while published — pre-publish output is dropped, never backfilled (D-I).
-   */
-  private handleProjectorFrame(frame: UplinkFrame): void {
-    this.deps.onProjectorFrame?.(frame);
-    if (this.linkState === 'published') this.link?.send(frame);
+  private clearOverviewTimer(): void {
+    if (this.overviewTimer !== undefined) {
+      clearTimeout(this.overviewTimer);
+      this.overviewTimer = undefined;
+    }
   }
 }
 
-/**
- * Wrap the reverse-rpc UI hooks so the forum-link controller observes card
- * open/close without replacing the original panel behavior. `controller` may
- * be a direct reference or a resolver returning the current controller (or
- * undefined before the first `/forum` publish) — resolved on every hook call
- * so a lazily created controller is picked up immediately. The original hook
- * always runs first; the notification is skipped when it throws or when no
- * controller is wired at call time. `hidePanel` carries no payload, so the
- * wrapper tracks the id of the last shown panel per kind and settles that
- * card on hide — a hide without a preceding show notifies nothing. A
- * replacement show of the same kind settles the tracked card first: the
- * reverse-rpc queue advances from a locally answered request straight to
- * `showPanel(next)` with no intervening `hidePanel`, so without this the
- * superseded card would linger open and a late remote action for it would
- * settle the card that replaced it. Always returns a wrapped copy; the
- * per-call resolution makes the wrapper a no-op pass-through until the
- * first `/forum` publish creates the controller.
- */
+const FALLBACK_APP_STATE = {
+  streamingPhase: 'idle',
+  isCompacting: false,
+  model: '',
+  thinkingEffort: 'off',
+  permissionMode: 'auto',
+  planMode: false,
+  contextUsage: 0,
+  goal: null,
+} as const;
+
 export function wrapUiHooksForForumLink(
   original: ReverseRPCUIHooks,
   controller: ForumLinkController | undefined | (() => ForumLinkController | undefined),

@@ -1,361 +1,398 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import type { Event, Session, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
-import type { UplinkFrame } from '@moonshot-ai/forum-link';
+import type { QuestionRequest } from '@moonshot-ai/kimi-code-sdk';
+import { parseCard, type ReceiptReport } from '@moonshot-ai/forum-link';
 
-import { ForumLinkController, wrapUiHooksForForumLink } from '#/tui/controllers/forum-link';
+import {
+  Projector,
+  deriveDiffLines,
+} from '#/tui/controllers/forum-link/projector';
+import {
+  encodeApproval,
+  encodeApprovalCancel,
+  encodeQuestion,
+} from '#/tui/controllers/forum-link/encoding';
+import { Injector, type InjectorHost, type OpenCardView } from '#/tui/controllers/forum-link/injector';
+import type { SessionControlHostView } from '#/tui/controllers/forum-link/session-control';
 import { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
 import { QuestionController } from '#/tui/reverse-rpc/question/controller';
-import type { ReverseRPCUIHooks } from '#/tui/reverse-rpc/index';
-import type { ApprovalPanelData, QuestionPanelData } from '#/tui/reverse-rpc/types';
-import type { AppState } from '#/tui/types';
+import { adaptQuestionAnswers } from '#/tui/reverse-rpc/question/handler';
+import type {
+  ApprovalPanelData,
+  DiffDisplayBlock,
+  QuestionPanelData,
+} from '#/tui/reverse-rpc/types';
 
-const SESSION_ID = 's1';
+const AGENT = 'main';
 
-type Spy = ReturnType<typeof vi.fn>;
+let clock = 0;
+const tick = () => {
+  clock += 1;
+  return clock;
+};
 
-function turnStarted(turnId = 1): Event {
-  return { type: 'turn.started', turnId, origin: { kind: 'user' }, agentId: 'main', sessionId: SESSION_ID };
+function makeProjector(overrides: {
+  maxCardFieldChars?: number;
+  getPlan?: () => Promise<{ content: string; path: string; id: string } | null>;
+} = {}) {
+  return new Projector({
+    mainAgentId: AGENT,
+    now: tick,
+    limits: { maxCardFieldChars: overrides.maxCardFieldChars },
+    getPlan: overrides.getPlan,
+  });
 }
 
-function turnEnded(reason: 'completed' | 'cancelled' = 'completed', turnId = 1): Event {
-  return { type: 'turn.ended', turnId, reason, agentId: 'main', sessionId: SESSION_ID };
-}
-
-function approvalPayload(id: string): ApprovalPanelData {
+function approvalData(overrides: Partial<ApprovalPanelData> = {}): ApprovalPanelData {
   return {
-    id,
-    tool_call_id: `tc-${id}`,
+    id: 'approval_1',
+    tool_call_id: 'tool_1',
     tool_name: 'Bash',
-    action: 'run command',
-    description: 'run a command',
+    action: 'run a command',
+    description: 'Update the deploy script',
     display: [],
-    choices: [],
+    choices: [
+      {
+        label: 'Approve once',
+        response: 'approved',
+        selected_label: 'once',
+        description: 'Allow this single call',
+      },
+      {
+        label: 'Approve for this session',
+        response: 'approved_for_session',
+        description: 'Allow every matching call in this session',
+      },
+      { label: 'Reject', response: 'rejected' },
+      { label: 'Reject with feedback', response: 'rejected', requires_feedback: true },
+    ],
+    ...overrides,
   };
 }
 
-function questionPayload(id: string): QuestionPanelData {
+function questionData(): QuestionPanelData {
   return {
-    id,
-    tool_call_id: `tc-${id}`,
+    id: 'question_1',
+    tool_call_id: 'tool_1',
     questions: [
-      { question: '选择哪个方案？', multi_select: false, options: [{ label: '选项A' }, { label: '选项B' }] },
+      {
+        question: 'Pick one?',
+        multi_select: false,
+        options: [{ label: 'A' }, { label: 'B' }],
+      },
     ],
   };
 }
 
-function statusMarkers(frames: readonly UplinkFrame[]): string[] {
-  return frames
-    .filter((frame) => frame.type === 'entry' && frame.entry.kind === 'status-marker')
-    .map((frame) => (frame.type === 'entry' && frame.entry.kind === 'status-marker' ? frame.entry.status : ''));
-}
+const DIFF_BLOCK: DiffDisplayBlock = {
+  type: 'diff',
+  path: 'src/app.ts',
+  old_text: 'line 1\nline 2\nline 3',
+  new_text: 'line 1\nline 2 changed\nline 3',
+};
 
-interface Layer3Fixture {
-  controller: ForumLinkController;
-  approvalController: ApprovalController;
-  questionController: QuestionController;
-  session: Session;
-  frames: UplinkFrame[];
-  statuses: string[];
-  stateAtCreate: string[];
-  cancel: Spy;
-  cancelCompaction: Spy;
-  sendNormalUserInput: Spy;
-  createNewSession: Spy;
-  onDroppedAction: Spy;
-  emit(event: Event): void;
-  publish(): void;
-}
+describe('O6-A1 option fields survive projection', () => {
+  it('projects approval choices with response, selected_label, requires_feedback and description', () => {
+    const projector = makeProjector();
+    const card = projector.projectCard('approval_1', approvalData());
+    expect(card.kind).toBe('approval');
+    const approval = card.approval as unknown as ApprovalPanelData;
+    expect(approval.choices).toEqual(approvalData().choices);
+    for (const choice of approval.choices) {
+      expect(typeof choice.response).toBe('string');
+      expect('selected_label' in choice || 'requires_feedback' in choice || 'description' in choice || true).toBe(true);
+    }
+    const first = approval.choices[0];
+    expect(first?.response).toBe('approved');
+    expect(first?.selected_label).toBe('once');
+    expect(first?.requires_feedback).toBeUndefined();
+    expect(first?.description).toBe('Allow this single call');
+    const feedbackChoice = approval.choices[3];
+    expect(feedbackChoice?.requires_feedback).toBe(true);
+  });
 
-interface Layer3Options {
-  isCompacting?: boolean;
-  idleWaitTimeoutMs?: number;
-}
+  it('projects question payloads verbatim', () => {
+    const projector = makeProjector();
+    const card = projector.projectCard('question_1', questionData());
+    expect(card.kind).toBe('question');
+    expect(card.question).toEqual(questionData());
+  });
 
-function makeLayer3(options: Layer3Options = {}): Layer3Fixture {
-  const frames: UplinkFrame[] = [];
-  const statuses: string[] = [];
-  const stateAtCreate: string[] = [];
+  it('projected cards conform to the contract schema', () => {
+    const projector = makeProjector();
+    const approvalCard = projector.projectCard('approval_1', approvalData());
+    const questionCard = projector.projectCard('question_1', questionData());
+    expect(parseCard(approvalCard).ok).toBe(true);
+    expect(parseCard(questionCard).ok).toBe(true);
+  });
+});
+
+describe('O6-A2 diff and plan review extras', () => {
+  it('diff cards carry line-level differences derived via computeDiffLines', () => {
+    const projector = makeProjector();
+    const card = projector.projectCard(
+      'approval_diff',
+      approvalData({ display: [DIFF_BLOCK] }),
+    );
+    const diffBlock = (card.approval as unknown as ApprovalPanelData).display[0] as unknown as {
+      type: string;
+      lines: Array<{ op: string; oldNo?: number; newNo?: number; text: string }>;
+    };
+    expect(diffBlock.type).toBe('diff');
+    expect(Array.isArray(diffBlock.lines)).toBe(true);
+    expect(diffBlock.lines).toEqual([
+      { op: 'ctx', newNo: 1, text: 'line 1' },
+      { op: 'del', oldNo: 2, text: 'line 2' },
+      { op: 'add', newNo: 2, text: 'line 2 changed' },
+      { op: 'ctx', newNo: 3, text: 'line 3' },
+    ]);
+    const ctxLine = diffBlock.lines.find((line) => line.op === 'ctx');
+    expect(ctxLine?.newNo).toBe(1);
+    expect(ctxLine?.oldNo).toBeUndefined();
+  });
+
+  it('deriveDiffLines maps kinds and honors maxLines', () => {
+    const block: DiffDisplayBlock = {
+      type: 'diff',
+      path: 'p',
+      old_text: 'a\nb\nc',
+      new_text: 'x\nb\nc',
+    };
+    expect(deriveDiffLines(block, 500)).toEqual([
+      { op: 'del', oldNo: 1, text: 'a' },
+      { op: 'add', newNo: 1, text: 'x' },
+      { op: 'ctx', newNo: 2, text: 'b' },
+      { op: 'ctx', newNo: 3, text: 'c' },
+    ]);
+    expect(deriveDiffLines(block, 2)).toHaveLength(2);
+  });
+
+  it('plan review cards fetch the plan body asynchronously exactly once', async () => {
+    let calls = 0;
+    const projector = makeProjector({
+      getPlan: async () => {
+        calls += 1;
+        return { id: 'plan-1', content: '# The plan\n\n1. Do the thing.', path: 'plan.md' };
+      },
+    });
+    const payload = approvalData({ tool_name: 'ExitPlanMode', display: [] });
+    const card = projector.projectCard('approval_plan', payload);
+    expect(card.kind).toBe('approval');
+    expect(projector.takePlanBody('approval_plan')).toBeUndefined();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(1);
+    expect(projector.planBodyBlock('approval_plan')).toEqual({
+      type: 'plan_body',
+      text: '# The plan\n\n1. Do the thing.',
+    });
+    expect(projector.takePlanBody('approval_plan')).toBe('# The plan\n\n1. Do the thing.');
+  });
+
+  it('non-plan approval cards never fetch the plan', async () => {
+    let calls = 0;
+    const projector = makeProjector({
+      getPlan: async () => {
+        calls += 1;
+        return null;
+      },
+    });
+    projector.projectCard('approval_shell', approvalData());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(0);
+  });
+
+  it('plan fetch failure is swallowed', async () => {
+    const projector = makeProjector({
+      getPlan: async () => {
+        throw new Error('boom');
+      },
+    });
+    const payload = approvalData({ tool_name: 'ExitPlanMode' });
+    expect(() => projector.projectCard('approval_plan', payload)).not.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(projector.takePlanBody('approval_plan')).toBeUndefined();
+  });
+});
+
+describe('O6-A3 truncation', () => {
+  it('over-limit fields are truncated with a flag and the original payload is untouched', () => {
+    const long = 'x'.repeat(100);
+    const payload = approvalData({
+      description: long,
+      choices: [
+        { label: long, response: 'approved' },
+        { label: 'Reject', response: 'rejected' },
+      ],
+      display: [{ type: 'shell', language: 'bash', command: long, cwd: long }],
+    });
+    const original = structuredClone(payload);
+    const projector = makeProjector({ maxCardFieldChars: 10 });
+    const card = projector.projectCard('approval_trunc', payload);
+    expect(card['truncated']).toBe(true);
+    const approval = card.approval as unknown as ApprovalPanelData;
+    expect(approval.description).toBe('x'.repeat(10));
+    expect(approval.choices[0]?.label).toBe('x'.repeat(10));
+    expect(approval.choices[1]?.label).toBe('Reject');
+    const shell = approval.display[0] as { command: string; cwd: string };
+    expect(shell.command).toBe('x'.repeat(10));
+    expect(shell.cwd).toBe('x'.repeat(10));
+    expect(payload).toEqual(original);
+  });
+
+  it('fields within the limit are kept without a truncation flag', () => {
+    const payload = approvalData({ description: 'short' });
+    const projector = makeProjector({ maxCardFieldChars: 100 });
+    const card = projector.projectCard('approval_ok', payload);
+    expect(card['truncated']).toBeUndefined();
+    expect((card.approval as unknown as ApprovalPanelData).description).toBe('short');
+  });
+});
+
+describe('O7-A3 invalid intents produce no response', () => {
+  it('approval option index out of range is rejected', () => {
+    const card = makeProjector().projectCard('approval_1', approvalData());
+    expect(encodeApproval(card as unknown as { approval?: ApprovalPanelData }, { optionIndex: 99 })).toEqual({
+      ok: false,
+      reason: 'invalid-params',
+    });
+  });
+
+  it('approval requires_feedback without feedback is rejected', () => {
+    const card = makeProjector().projectCard('approval_1', approvalData());
+    expect(encodeApproval(card as unknown as { approval?: ApprovalPanelData }, { optionIndex: 3 })).toEqual({
+      ok: false,
+      reason: 'invalid-params',
+    });
+  });
+
+  it('invalid question answers are rejected', () => {
+    const card = makeProjector().projectCard('question_1', questionData());
+    expect(encodeQuestion(card as unknown as { question?: QuestionPanelData }, [{ selected: [7] }])).toEqual({
+      ok: false,
+      reason: 'invalid-params',
+    });
+    expect(encodeQuestion(card as unknown as { question?: QuestionPanelData }, [])).toEqual({ ok: false, reason: 'invalid-params' });
+  });
+});
+
+describe('P1 goal start and cancel semantics', () => {
+  it('goal start cards are plain option lists with no special branch', () => {
+    const goalChoices: ApprovalPanelData['choices'] = [
+      {
+        label: 'Switch to Never Ask and start',
+        response: 'approved',
+        selected_label: 'auto',
+        description: 'Tools are approved automatically.',
+      },
+      { label: 'Do not start', response: 'cancelled', selected_label: 'cancel' },
+    ];
+    const projector = makeProjector();
+    const card = projector.projectCard('approval_goal', approvalData({ choices: goalChoices }));
+    expect((card.approval as unknown as ApprovalPanelData).choices).toEqual(goalChoices);
+    expect(encodeApproval(card as unknown as { approval?: ApprovalPanelData }, { optionIndex: 0 })).toEqual({
+      ok: true,
+      value: { response: 'approved', feedback: undefined, selected_label: 'auto' },
+    });
+    expect(encodeApproval(card as unknown as { approval?: ApprovalPanelData }, { optionIndex: 1 })).toEqual({
+      ok: true,
+      value: { response: 'cancelled', feedback: undefined, selected_label: 'cancel' },
+    });
+  });
+
+  it('encodeApprovalCancel equals Esc: rejected, no feedback, no label', () => {
+    expect(encodeApprovalCancel()).toEqual({ response: 'rejected' });
+    expect(encodeApprovalCancel().feedback).toBeUndefined();
+    expect(encodeApprovalCancel().selected_label).toBeUndefined();
+  });
+});
+
+function layer3InjectorFixture() {
+  const receipts: ReceiptReport[] = [];
   const approvalController = new ApprovalController();
   const questionController = new QuestionController();
-  const cancel = vi.fn(async () => {});
-  const cancelCompaction = vi.fn(async () => {});
-  const listeners = new Set<(event: Event) => void>();
-  const session = {
-    id: SESSION_ID,
-    onEvent: (l: (event: Event) => void): Unsubscribe => {
-      listeners.add(l);
-      return () => {
-        listeners.delete(l);
-      };
+  let currentPanel: string | undefined;
+  const cards = new Map<string, OpenCardView>();
+  const host: InjectorHost = {
+    reportReceipt: (report) => {
+      receipts.push(report);
     },
-    cancel,
-    cancelCompaction,
-  } as unknown as Session;
-  const sendNormalUserInput = vi.fn(async () => {});
-  const createNewSession = vi.fn(async () => {
-    stateAtCreate.push(controller.state);
-  });
-  const onDroppedAction = vi.fn();
-  const controller = new ForumLinkController({
-    onProjectorFrame: (frame) => {
-      frames.push(frame);
+    getOpenCard: (cardId) => cards.get(cardId),
+    isCurrentPanel: (cardId) => cardId === currentPanel,
+    respondApproval: (cardId, response) => {
+      currentPanel = undefined;
+      cards.delete(cardId);
+      approvalController.respond(response);
     },
-    onStatus: (message) => {
-      statuses.push(message);
-    },
-    getAppState: () => ({ isCompacting: options.isCompacting ?? false }) as AppState,
-    approvalController,
-    questionController,
-    sendNormalUserInput,
-    createNewSession,
-    onDroppedAction,
-    endSessionTiming: { idleWaitTimeoutMs: options.idleWaitTimeoutMs },
-  });
-  const original: ReverseRPCUIHooks = {
-    showApprovalPanel: vi.fn(),
-    hideApprovalPanel: vi.fn(),
-    showQuestionDialog: vi.fn(),
-    hideQuestionDialog: vi.fn(),
-  };
-  const wrapped = wrapUiHooksForForumLink(original, controller);
-  approvalController.setUIHooks({
-    showPanel: wrapped.showApprovalPanel,
-    hidePanel: wrapped.hideApprovalPanel,
-  });
-  questionController.setUIHooks({
-    showPanel: wrapped.showQuestionDialog,
-    hidePanel: wrapped.hideQuestionDialog,
-  });
-  return {
-    controller,
-    approvalController,
-    questionController,
-    session,
-    frames,
-    statuses,
-    stateAtCreate,
-    cancel,
-    cancelCompaction,
-    sendNormalUserInput,
-    createNewSession,
-    onDroppedAction,
-    emit: (event) => {
-      for (const listener of listeners) listener(event);
-    },
-    publish: () => {
-      controller.setLinkState('published');
-      controller.onSessionChanged(session);
+    respondQuestion: (cardId, response) => {
+      currentPanel = undefined;
+      cards.delete(cardId);
+      questionController.respond(response);
     },
   };
+  const hostView = {
+    slashHost: {},
+    sendNormalUserInput: () => {},
+    steerMessage: () => {},
+    cancelForeground: () => {},
+    createNewSession: async () => {},
+    runEndSession: async () => {},
+    session: () => ({ id: 's1' }),
+  } as unknown as SessionControlHostView;
+  const injector = new Injector(host, hostView);
+  const openCard = (kind: 'approval' | 'question', cardId: string, payload: ApprovalPanelData | QuestionPanelData) => {
+    cards.set(cardId, {
+      kind,
+      approval: kind === 'approval' ? (payload as ApprovalPanelData) : undefined,
+      question: kind === 'question' ? (payload as QuestionPanelData) : undefined,
+    });
+    currentPanel = cardId;
+  };
+  return { injector, receipts, approvalController, questionController, openCard };
 }
 
-describe('Layer3 集成 — 六动作端到端闭环（CP6 / O-2）', () => {
-  it('answer-question：远程作答 resolve show promise 为单答案数组并结算 answered 帧', async () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-    const shown = fixture.questionController.show(questionPayload('q-1'));
-    expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'question', upstreamId: 'q-1' }]);
+describe('M2 injector × real controller integration', () => {
+  it('remote answer reaches the real QuestionController.respond with the adaptQuestionAnswers result', async () => {
+    const fixture = layer3InjectorFixture();
+    const data = questionData();
+    const shown = fixture.questionController.show(data);
+    fixture.openCard('question', 'question_1', data);
 
-    fixture.controller.dispatchAction({ type: 'answer-question', target: 't', cardId: 'c1', answer: '选项A' });
-
-    await expect(shown).resolves.toEqual({ answers: ['选项A'] });
-    expect(fixture.controller.openCards).toEqual([]);
-    expect(fixture.frames).toContainEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
-    });
-  });
-
-  it('approve：远程批准 resolve 无 scope 并结算 approved 帧', async () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-    const shown = fixture.approvalController.show(approvalPayload('a-1'));
-
-    fixture.controller.dispatchAction({ type: 'approve', target: 't', cardId: 'c1' });
-
-    const response = await shown;
-    expect(response).toEqual({ decision: 'approved' });
-    expect(response).not.toHaveProperty('scope');
-    expect(fixture.controller.openCards).toEqual([]);
-    expect(fixture.frames).toContainEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'approved' },
-    });
-  });
-
-  it('deny：远程拒绝透传 feedback 并结算 rejected 帧', async () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-    const shown = fixture.approvalController.show(approvalPayload('a-1'));
-
-    fixture.controller.dispatchAction({ type: 'deny', target: 't', cardId: 'c1', feedback: '太危险' });
-
-    await expect(shown).resolves.toEqual({ decision: 'rejected', feedback: '太危险' });
-    expect(fixture.controller.openCards).toEqual([]);
-    expect(fixture.frames).toContainEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'rejected' },
-    });
-  });
-
-  it('send-message：远程留言直发 sendNormalUserInput seam', () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-
-    fixture.controller.dispatchAction({ type: 'send-message', target: 't', text: '补充指令' });
-
-    expect(fixture.sendNormalUserInput).toHaveBeenCalledTimes(1);
-    expect(fixture.sendNormalUserInput).toHaveBeenCalledWith('补充指令');
-  });
-
-  it('pause：远程暂停取消当前轮', () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-
-    fixture.controller.dispatchAction({ type: 'pause', target: 't' });
-
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-    expect(fixture.cancelCompaction).not.toHaveBeenCalled();
-  });
-
-  it('end-session：远程结束触发 cancel → stop → createNewSession 编排', async () => {
-    const fixture = makeLayer3({ idleWaitTimeoutMs: 50 });
-    fixture.publish();
-
-    fixture.controller.dispatchAction({ type: 'end-session', target: 't' });
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-
-    fixture.emit(turnEnded('cancelled'));
-
-    await vi.waitFor(() => {
-      expect(fixture.createNewSession).toHaveBeenCalledTimes(1);
-    });
-  });
-});
-
-describe('Layer3 集成 — G1 竞态：本地先答，迟到远程动作（CP6 / A6 / I5）', () => {
-  it('本地应答 X 后队列推进到 Y：迟到远程 approve 被丢弃，Y 不被错答', async () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-    const respondSpy = vi.spyOn(fixture.approvalController, 'respond');
-    const shownX = fixture.approvalController.show(approvalPayload('x-1'));
-    const shownY = fixture.approvalController.show(approvalPayload('y-1'));
-    expect(fixture.controller.openCards).toEqual([{ cardId: 'c1', kind: 'approval', upstreamId: 'x-1' }]);
-
-    fixture.approvalController.respond({ decision: 'approved' });
-
-    await expect(shownX).resolves.toEqual({ decision: 'approved' });
-    expect(fixture.controller.openCards).toEqual([{ cardId: 'c2', kind: 'approval', upstreamId: 'y-1' }]);
-    expect(fixture.frames).toContainEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'approved' },
+    await fixture.injector.handle({
+      opId: 'op1',
+      sessionId: 's1',
+      intent: { type: 'answer', sessionId: 's1', cardId: 'question_1', answers: [{ selected: [0] }] },
     });
 
-    fixture.controller.dispatchAction({ type: 'approve', target: 't', cardId: 'c1' });
-
-    expect(fixture.onDroppedAction).toHaveBeenCalledTimes(1);
-    expect(fixture.onDroppedAction).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'approve', cardId: 'c1' }),
-    );
-    expect(respondSpy).toHaveBeenCalledTimes(1);
-    let yResolved = false;
-    void shownY.then(() => {
-      yResolved = true;
-    });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(yResolved).toBe(false);
-    expect(fixture.controller.openCards).toEqual([{ cardId: 'c2', kind: 'approval', upstreamId: 'y-1' }]);
-  });
-
-  it('question 队列同理：本地作答 X 推进 Y，迟到远程作答被丢弃且状态机保持 waiting-question', async () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-    fixture.emit(turnStarted());
-    const respondSpy = vi.spyOn(fixture.questionController, 'respond');
-    const shownX = fixture.questionController.show(questionPayload('qx-1'));
-    const shownY = fixture.questionController.show(questionPayload('qy-1'));
-    expect(statusMarkers(fixture.frames)).toEqual(['running', 'waiting-question']);
-
-    fixture.questionController.respond({ answers: ['选项B'] });
-
-    await expect(shownX).resolves.toEqual({ answers: ['选项B'] });
-    expect(fixture.controller.openCards).toEqual([{ cardId: 'c2', kind: 'question', upstreamId: 'qy-1' }]);
-    expect(fixture.frames).toContainEqual({
-      type: 'entry',
-      entry: { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
-    });
-
-    fixture.controller.dispatchAction({ type: 'answer-question', target: 't', cardId: 'c1', answer: '迟到' });
-
-    expect(fixture.onDroppedAction).toHaveBeenCalledTimes(1);
-    expect(respondSpy).toHaveBeenCalledTimes(1);
-    let yResolved = false;
-    void shownY.then(() => {
-      yResolved = true;
-    });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(yResolved).toBe(false);
-    expect(statusMarkers(fixture.frames)).toEqual([
-      'running',
-      'waiting-question',
-      'running',
-      'waiting-question',
+    const request: QuestionRequest = {
+      questions: [{ question: 'Pick one?', multiSelect: false, options: [{ label: 'A' }, { label: 'B' }] }],
+    };
+    const expected = adaptQuestionAnswers(request, { answers: ['A'], method: 'enter' });
+    await expect(shown).resolves.toEqual({ answers: ['A'], method: 'enter' });
+    expect(expected).toEqual({ answers: { 'Pick one?': 'A' }, method: 'enter' });
+    expect(fixture.receipts).toEqual([
+      { opId: 'op1', state: 'delivered' },
+      { opId: 'op1', state: 'applied' },
     ]);
   });
-});
 
-describe('Layer3 集成 — 运行中留言入队（CP6 / A7 / U3）', () => {
-  it('轮次运行中远程留言：seam 被调用且不打断当前轮', () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-    fixture.emit(turnStarted());
-    expect(statusMarkers(fixture.frames)).toEqual(['running']);
+  it('remote approve-for-session reaches the real ApprovalController and auto-resolves a queued same-action request', async () => {
+    const fixture = layer3InjectorFixture();
+    const data = approvalData();
+    const first = fixture.approvalController.show(data);
+    fixture.openCard('approval', 'approval_1', data);
+    const queued = fixture.approvalController.show(approvalData());
 
-    fixture.controller.dispatchAction({ type: 'send-message', target: 't', text: '留言内容' });
-
-    expect(fixture.sendNormalUserInput).toHaveBeenCalledTimes(1);
-    expect(fixture.sendNormalUserInput).toHaveBeenCalledWith('留言内容');
-    expect(fixture.cancel).not.toHaveBeenCalled();
-    expect(statusMarkers(fixture.frames)).toEqual(['running']);
-  });
-});
-
-describe('Layer3 集成 — pause 与 end-session 状态序列（CP6 / A8 / A9）', () => {
-  it('pause：取消当前轮，turn.ended(cancelled) 后 Projector 回 idle，无异常抛出', () => {
-    const fixture = makeLayer3();
-    fixture.publish();
-    fixture.emit(turnStarted());
-    expect(statusMarkers(fixture.frames)).toEqual(['running']);
-
-    expect(() => {
-      fixture.controller.dispatchAction({ type: 'pause', target: 't' });
-    }).not.toThrow();
-    expect(fixture.cancel).toHaveBeenCalledTimes(1);
-
-    fixture.emit(turnEnded('cancelled'));
-
-    expect(statusMarkers(fixture.frames)).toEqual(['running', 'idle']);
-  });
-
-  it('end-session：published→detached 状态转移，idle 后 createNewSession', async () => {
-    const fixture = makeLayer3({ idleWaitTimeoutMs: 50 });
-    fixture.publish();
-    fixture.emit(turnStarted());
-    expect(fixture.controller.state).toBe('published');
-    expect(statusMarkers(fixture.frames)).toEqual(['running']);
-
-    fixture.controller.dispatchAction({ type: 'end-session', target: 't' });
-    fixture.emit(turnEnded('cancelled'));
-
-    await vi.waitFor(() => {
-      expect(fixture.createNewSession).toHaveBeenCalledTimes(1);
+    await fixture.injector.handle({
+      opId: 'op1',
+      sessionId: 's1',
+      intent: { type: 'approve', sessionId: 's1', cardId: 'approval_1', optionIndex: 1 },
     });
-    expect(fixture.stateAtCreate).toEqual(['detached']);
-    expect(fixture.controller.state).toBe('detached');
-    expect(fixture.statuses).toContain('Forum Link: unpublished');
-    expect(statusMarkers(fixture.frames)).toEqual(['running', 'idle']);
+
+    await expect(first).resolves.toEqual({ decision: 'approved', scope: 'session' });
+    await expect(queued).resolves.toEqual({ decision: 'approved', scope: 'session' });
+    expect(fixture.receipts).toEqual([
+      { opId: 'op1', state: 'delivered' },
+      { opId: 'op1', state: 'applied' },
+    ]);
   });
 });

@@ -3,15 +3,16 @@ import { existsSync, readFileSync } from 'node:fs';
 import { getRemoteKeyFile } from '#/utils/paths';
 
 export type CredentialResult =
-  | { ok: true; url: string; password: string }
+  | { ok: true; url: string; token: string }
   | { ok: false; reason: 'missing' | 'malformed' | 'invalid-url'; hint: string };
 
 /**
  * Parse the forum-link credential file (`<dataDir>/remote_key`) read-only.
  * Line format is `key=value`; `#` comment lines and blank lines are skipped,
- * and lines without `=` are ignored leniently. `url` is required and must be
- * an absolute http(s) URL; `password` is optional (empty string means the
- * hub's open mode). Every failure carries a one-shot actionable hint.
+ * and lines without `=` are ignored leniently. `url` and `token` are both
+ * required (`url` must be an absolute http(s) URL; an empty `token` is not a
+ * credential). The legacy `password` key is not recognized. Every failure
+ * carries a one-shot actionable hint.
  */
 export function loadCredential(): CredentialResult {
   const file = getRemoteKeyFile();
@@ -19,16 +20,18 @@ export function loadCredential(): CredentialResult {
     return {
       ok: false,
       reason: 'missing',
-      hint: `Create ${file} with:\nurl=http://127.0.0.1:8787\npassword=your-secret`,
+      hint: `Create ${file} with:\nurl=http://127.0.0.1:8787\ntoken=your-machine-token`,
     };
   }
   const values = parseKeyValueFile(readFileSync(file, 'utf-8'));
   const url = values.get('url');
-  if (url === undefined) {
+  const token = values.get('token');
+  if (url === undefined || token === undefined || token.length === 0) {
+    const missingKey = url === undefined ? 'url' : 'token';
     return {
       ok: false,
       reason: 'malformed',
-      hint: `Missing "url" in ${file}. Expected: url=http://host:port and optionally password=your-secret`,
+      hint: `Missing "${missingKey}" in ${file}. Expected: url=http://host:port and token=your-machine-token`,
     };
   }
   if (!isAbsoluteHttpUrl(url)) {
@@ -38,7 +41,7 @@ export function loadCredential(): CredentialResult {
       hint: `Invalid url "${url}" in ${file}: must be an absolute http(s) URL`,
     };
   }
-  return { ok: true, url, password: values.get('password') ?? '' };
+  return { ok: true, url, token };
 }
 
 function parseKeyValueFile(content: string): Map<string, string> {

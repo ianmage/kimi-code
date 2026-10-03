@@ -1,620 +1,409 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import type { Event, Session } from '@moonshot-ai/kimi-code-sdk';
-import type { Entry, UplinkFrame } from '@moonshot-ai/forum-link';
+import type { Event, GoalSnapshot, ModelAlias } from '@moonshot-ai/kimi-code-sdk';
 
-import {
-  ForumLinkController,
-  Projector,
-  type ProjectorOptions,
-} from '#/tui/controllers/forum-link';
-import type { ApprovalPanelData, QuestionPanelData } from '#/tui/reverse-rpc/types';
+import { Projector } from '#/tui/controllers/forum-link/projector';
+import type { SampleAppState } from '#/tui/controllers/forum-link/projector';
+import type { TodoItem } from '#/tui/components/chrome/todo-panel';
 import type { TranscriptEntry } from '#/tui/types';
 
-function makeProjector(
-  overrides: Pick<ProjectorOptions, 'limits' | 'mainAgentId' | 'onStatusChange'> = {},
-) {
-  const frames: UplinkFrame[] = [];
-  const projector = new Projector({
-    emit: (frame) => {
-      frames.push(frame);
+const AGENT = 'main';
+const SESSION = 's1';
+
+let clock = 0;
+const tick = () => {
+  clock += 1;
+  return clock;
+};
+
+function makeProjector(overrides: { ringLength?: number; maxTextChars?: number; maxFoldLength?: number } = {}) {
+  return new Projector({
+    limits: {
+      timelineRingLength: overrides.ringLength,
+      maxTextChars: overrides.maxTextChars,
+      maxFoldLength: overrides.maxFoldLength,
     },
-    limits: overrides.limits,
-    mainAgentId: overrides.mainAgentId,
-    onStatusChange: overrides.onStatusChange,
+    mainAgentId: AGENT,
+    now: tick,
   });
-  return { frames, projector };
 }
 
-type MessageEntry = Extract<Entry, { kind: 'message' }>;
-
-function entries(frames: readonly UplinkFrame[]): Entry[] {
-  return frames.filter((frame) => frame.type === 'entry').map((frame) => frame.entry);
+function userEntry(content: string): TranscriptEntry {
+  return { id: 'e1', kind: 'user', renderMode: 'plain', content };
 }
 
-function messageEntries(frames: readonly UplinkFrame[]): MessageEntry[] {
-  return entries(frames).filter((entry): entry is MessageEntry => entry.kind === 'message');
+function turnStarted(turnId = 1, agentId = AGENT): Event {
+  return { type: 'turn.started', turnId, origin: { kind: 'user' }, agentId, sessionId: SESSION } as Event;
 }
 
-function turnStarted(turnId = 1, agentId = 'main'): Event {
-  return { type: 'turn.started', turnId, origin: { kind: 'user' }, agentId, sessionId: 's1' };
+function turnEnded(reason: 'completed' | 'cancelled' = 'completed', turnId = 1, agentId = AGENT): Event {
+  return { type: 'turn.ended', turnId, reason, agentId, sessionId: SESSION } as Event;
 }
 
-function turnEnded(
-  reason: 'completed' | 'cancelled' | 'failed' | 'blocked' = 'completed',
-  turnId = 1,
-  agentId = 'main',
-): Event {
-  return { type: 'turn.ended', turnId, reason, agentId, sessionId: 's1' };
+function assistantDelta(delta: string, turnId = 1, agentId = AGENT): Event {
+  return { type: 'assistant.delta', turnId, delta, agentId, sessionId: SESSION } as Event;
 }
 
-function assistantDelta(delta: string, turnId = 1, agentId = 'main'): Event {
-  return { type: 'assistant.delta', turnId, delta, agentId, sessionId: 's1' };
+function thinkingDelta(delta: string, turnId = 1, agentId = AGENT): Event {
+  return { type: 'thinking.delta', turnId, delta, agentId, sessionId: SESSION } as Event;
 }
 
-function promptSubmitted(
-  content: ReadonlyArray<{ type: 'text'; text: string }>,
-  status: 'running' | 'queued' | 'blocked' = 'running',
-  agentId = 'main',
-): Event {
-  return {
-    type: 'prompt.submitted',
-    promptId: 'p1',
-    userMessageId: 'um1',
-    status,
-    content,
-    createdAt: '2025-01-01T00:00:00.000Z',
-    agentId,
-    sessionId: 's1',
-  };
-}
-
-function foreignEvent(type: string): Event {
-  return { type, agentId: 'main', sessionId: 's1' } as Event;
-}
-
-function thinkingDelta(delta: string, turnId = 1, agentId = 'main'): Event {
-  return { type: 'thinking.delta', turnId, delta, agentId, sessionId: 's1' };
-}
-
-function toolCallStarted(agentId = 'main'): Event {
+function toolCallStarted(overrides: { toolCallId?: string; name?: string; args?: unknown; agentId?: string } = {}): Event {
   return {
     type: 'tool.call.started',
     turnId: 1,
-    toolCallId: 'tc1',
-    name: 'Bash',
-    args: {},
-    agentId,
-    sessionId: 's1',
-  };
+    toolCallId: overrides.toolCallId ?? 'tc1',
+    name: overrides.name ?? 'Bash',
+    args: overrides.args ?? { command: 'rm -rf /important && echo done', secret: 'hunter2' },
+    agentId: overrides.agentId ?? AGENT,
+    sessionId: SESSION,
+  } as Event;
 }
 
-
-function approvalPayload(id: string): ApprovalPanelData {
-  return {
-    id,
-    tool_call_id: `tc-${id}`,
-    tool_name: 'Bash',
-    action: 'rm -rf',
-    description: '危险操作',
-    display: [],
-    choices: [
-      { label: 'Approve', response: 'approved' },
-      { label: 'Approve for session', response: 'approved_for_session' },
-      { label: 'Reject', response: 'rejected' },
-    ],
-  };
+function toolCallDelta(agentId = AGENT): Event {
+  return { type: 'tool.call.delta', turnId: 1, toolCallId: 'tc1', delta: 'x', agentId, sessionId: SESSION } as Event;
 }
 
-function questionPayload(id: string): QuestionPanelData {
+function toolResult(overrides: { toolCallId?: string; output?: unknown; isError?: boolean; agentId?: string } = {}): Event {
   return {
-    id,
-    tool_call_id: `tc-${id}`,
-    questions: [
-      {
-        question: '选哪个?',
-        multi_select: true,
-        other_label: '其他',
-        options: [{ label: 'A' }, { label: 'B', description: 'second option' }],
+    type: 'tool.result',
+    turnId: 1,
+    toolCallId: overrides.toolCallId ?? 'tc1',
+    output: overrides.output ?? 'ok',
+    isError: overrides.isError,
+    agentId: overrides.agentId ?? AGENT,
+    sessionId: SESSION,
+  } as Event;
+}
+
+function foreignEvent(type: string, agentId = AGENT): Event {
+  return { type, agentId, sessionId: SESSION } as Event;
+}
+
+function subagentEvent(type: string, subagentId = 'sub-1', agentId = AGENT): Event {
+  return { type, subagentId, agentId, sessionId: SESSION } as Event;
+}
+
+function backgroundTaskEvent(type: string, taskId = 'task-1', agentId = AGENT): Event {
+  return { type, taskId, agentId, sessionId: SESSION } as Event;
+}
+
+const BASE_APP_STATE: SampleAppState = {
+  streamingPhase: 'idle',
+  isCompacting: false,
+  model: 'kimi',
+  thinkingEffort: 'high',
+  permissionMode: 'auto',
+  planMode: false,
+  contextUsage: 0.25,
+  goal: null,
+};
+
+const TODOS: readonly TodoItem[] = [
+  { title: 'first', status: 'pending' },
+  { title: 'second', status: 'done' },
+];
+
+const MODEL: ModelAlias = {
+  provider: 'kimi',
+  model: 'kimi-for-coding',
+  maxContextSize: 262144,
+  displayName: 'Kimi for Coding',
+  supportEfforts: ['low', 'high'],
+  capabilities: ['thinking'],
+};
+
+const AVAILABLE_MODELS: Record<string, ModelAlias> = { kimi: MODEL };
+
+function sample(projector: Projector, overrides: Partial<SampleAppState> = {}, lastLine = '') {
+  const appState = { ...BASE_APP_STATE, ...overrides };
+  return projector.sampleOverview(appState, TODOS, projector.eventFolds, AVAILABLE_MODELS, lastLine);
+}
+
+describe('O4 timeline ring', () => {
+  it('A1: local user transcript entry produces user-message', () => {
+    const projector = makeProjector();
+    projector.onTranscriptEntry(userEntry('hello world'));
+    const snapshot = projector.snapshotTimeline();
+    expect(snapshot).toHaveLength(1);
+    expect(snapshot[0]).toMatchObject({ kind: 'user-message', text: 'hello world' });
+  });
+
+  it('A1: strips ANSI and drops empty user text', () => {
+    const projector = makeProjector();
+    projector.onTranscriptEntry(userEntry('\u001B[31mred\u001B[0m text'));
+    projector.onTranscriptEntry(userEntry('   \u001B[2m\u001B[0m  '));
+    const snapshot = projector.snapshotTimeline();
+    expect(snapshot).toHaveLength(1);
+    expect(snapshot[0]).toMatchObject({ kind: 'user-message', text: 'red text' });
+  });
+
+  it('A2: seq strictly increments by 1 across mixed entries', () => {
+    const projector = makeProjector();
+    projector.onTranscriptEntry(userEntry('q'));
+    projector.handleEvent(turnStarted());
+    projector.handleEvent(assistantDelta('partial'));
+    projector.handleEvent(toolCallStarted({}));
+    projector.handleEvent(toolResult({}));
+    projector.handleEvent(turnEnded());
+    const snapshot = projector.snapshotTimeline();
+    expect(snapshot.map((entry) => entry.seq)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('A2: ring overflow keeps the newest N entries as a hole-free suffix', () => {
+    const projector = makeProjector({ ringLength: 3 });
+    for (let index = 0; index < 6; index += 1) {
+      projector.onTranscriptEntry(userEntry(`m${String(index)}`));
+    }
+    const snapshot = projector.snapshotTimeline();
+    expect(snapshot).toHaveLength(3);
+    expect(snapshot.map((entry) => (entry as { text: string }).text)).toEqual(['m3', 'm4', 'm5']);
+    expect(snapshot.map((entry) => entry.seq)).toEqual([4, 5, 6]);
+  });
+
+  it('A3: non-whitelisted events produce no entries', () => {
+    const projector = makeProjector();
+    projector.handleEvent(thinkingDelta('secret reasoning'));
+    projector.handleEvent(toolCallDelta());
+    projector.handleEvent(subagentEvent('assistant.delta', 'sub-1'));
+    projector.handleEvent(foreignEvent('usage.updated'));
+    projector.handleEvent(foreignEvent('session.meta.updated'));
+    expect(projector.snapshotTimeline()).toEqual([]);
+  });
+
+  it('A3: tool-call entry carries keyArg but not raw arguments', () => {
+    const projector = makeProjector();
+    const rawArgs = { command: 'echo preamble; do-the-thing --with=flags; cleanup', secret: 'hunter2' };
+    projector.handleEvent(toolCallStarted({ args: rawArgs }));
+    const [entry] = projector.snapshotTimeline();
+    expect(entry).toMatchObject({ kind: 'tool-call', toolCallId: 'tc1', name: 'Bash' });
+    const serialized = JSON.stringify(entry);
+    expect(serialized).not.toContain('hunter2');
+    expect(entry).not.toHaveProperty('args');
+  });
+
+  it('A3: tool-result carries chip but not output text', () => {
+    const projector = makeProjector();
+    projector.handleEvent(toolCallStarted({ name: 'Read', args: { path: 'a.txt' } }));
+    projector.handleEvent(toolResult({ output: 'line1\nline2\nline3\nline4\nline5\n' }));
+    const entries = projector.snapshotTimeline();
+    const result = entries.find((entry) => entry.kind === 'tool-result');
+    expect(result).toMatchObject({ kind: 'tool-result', toolCallId: 'tc1', ok: true });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('line1');
+  });
+
+  it('assistant turn accumulates deltas and flushes on turn.ended with truncation flag', () => {
+    const projector = makeProjector({ maxTextChars: 10 });
+    projector.handleEvent(turnStarted());
+    projector.handleEvent(assistantDelta('abcdef'));
+    projector.handleEvent(assistantDelta('ghijklm'));
+    expect(projector.snapshotTimeline()).toHaveLength(0);
+    projector.handleEvent(turnEnded());
+    const [entry] = projector.snapshotTimeline();
+    expect(entry).toMatchObject({ kind: 'assistant-turn', text: 'abcdefghij', truncated: true });
+  });
+
+  it('status entries are emitted only on value change', () => {
+    const projector = makeProjector();
+    projector.onStatusPhase('thinking');
+    projector.onStatusPhase('thinking');
+    projector.onStatusPhase('composing');
+    projector.onStatusPhase('composing');
+    const snapshot = projector.snapshotTimeline();
+    expect(snapshot).toHaveLength(2);
+    expect(snapshot.map((entry) => (entry as { phase: string }).phase)).toEqual(['thinking', 'composing']);
+  });
+
+  it('card open/settle entries round-trip through the entry points', () => {
+    const projector = makeProjector();
+    projector.onCardOpened('approval', 'approval_1', {} as never);
+    projector.onCardSettled('approval_1', 'approved');
+    const snapshot = projector.snapshotTimeline();
+    expect(snapshot[0]).toMatchObject({
+      kind: 'card-opened',
+      card: { cardId: 'approval_1', kind: 'approval' },
+    });
+    expect(snapshot[1]).toMatchObject({ kind: 'card-settled', cardId: 'approval_1', outcome: 'approved' });
+  });
+});
+
+describe('O4 entry production returns', () => {
+  it('producer methods return the freshly pushed entry', () => {
+    const projector = makeProjector();
+    const user = projector.onTranscriptEntry(userEntry('hello'));
+    expect(user).toMatchObject({ seq: 1, kind: 'user-message', text: 'hello' });
+
+    const turnStart = projector.handleEvent(turnStarted());
+    expect(turnStart).toBeUndefined();
+    const delta = projector.handleEvent(assistantDelta('partial'));
+    expect(delta).toBeUndefined();
+    const turnEnd = projector.handleEvent(turnEnded());
+    expect(turnEnd).toMatchObject({ seq: 2, kind: 'assistant-turn', text: 'partial', truncated: false });
+
+    const toolCall = projector.handleEvent(toolCallStarted({}));
+    expect(toolCall).toMatchObject({ seq: 3, kind: 'tool-call', toolCallId: 'tc1' });
+    const toolRes = projector.handleEvent(toolResult({}));
+    expect(toolRes).toMatchObject({ seq: 4, kind: 'tool-result', toolCallId: 'tc1' });
+
+    const opened = projector.onCardOpened('approval', 'approval_1', {} as never);
+    expect(opened).toMatchObject({ seq: 5, kind: 'card-opened' });
+    const settled = projector.onCardSettled('approval_1', 'approved');
+    expect(settled).toMatchObject({ seq: 6, kind: 'card-settled', cardId: 'approval_1' });
+
+    const status = projector.onStatusPhase('thinking');
+    expect(status).toMatchObject({ seq: 7, kind: 'status', phase: 'thinking' });
+    expect(projector.onStatusPhase('thinking')).toBeUndefined();
+  });
+
+  it('returned entries match the ring snapshot and stay undefined when nothing is produced', () => {
+    const projector = makeProjector();
+    const produced = projector.onTranscriptEntry(userEntry('one'));
+    const snapshot = projector.snapshotTimeline();
+    expect(snapshot).toHaveLength(1);
+    expect(produced).toEqual(snapshot[0]);
+
+    expect(projector.onTranscriptEntry({ id: 'e2', kind: 'assistant', renderMode: 'plain', content: 'x' })).toBeUndefined();
+    expect(projector.onTranscriptEntry(userEntry('   '))).toBeUndefined();
+    expect(projector.handleEvent(foreignEvent('usage.updated'))).toBeUndefined();
+    expect(projector.handleEvent(turnEnded())).toBeUndefined();
+    expect(projector.snapshotTimeline()).toHaveLength(1);
+  });
+
+  it('an empty-turn flush returns undefined and clears the turn state', () => {
+    const projector = makeProjector();
+    projector.handleEvent(turnStarted());
+    expect(projector.handleEvent(turnEnded())).toBeUndefined();
+    expect(projector.snapshotTimeline()).toEqual([]);
+  });
+});
+
+describe('O5 overview sampling', () => {
+  it('A1: rev strictly increases on consecutive samples', () => {
+    const projector = makeProjector();
+    const first = sample(projector);
+    const second = sample(projector);
+    const third = sample(projector);
+    expect(second.rev).toBeGreaterThan(first.rev);
+    expect(third.rev).toBeGreaterThan(second.rev);
+  });
+
+  it('A2: GoalSnapshot passes through unchanged', () => {
+    const projector = makeProjector();
+    const goal: GoalSnapshot = {
+      goalId: 'g1',
+      objective: 'ship the feature',
+      completionCriterion: 'tests green',
+      status: 'active',
+      turnsUsed: 3,
+      tokensUsed: 12345,
+      wallClockMs: 6789,
+      budget: {
+        tokenBudget: 50000,
+        turnBudget: null,
+        wallClockBudgetMs: null,
+        remainingTokens: 37655,
+        remainingTurns: null,
+        remainingWallClockMs: null,
+        tokenBudgetReached: false,
+        turnBudgetReached: false,
+        wallClockBudgetReached: false,
+        overBudget: false,
       },
-    ],
-  };
-}
-
-function userEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
-  return { id: 'e1', kind: 'user', renderMode: 'markdown', content: 'hi', ...overrides };
-}
-
-describe('Projector — agentId 闸门先于类型判别', () => {
-  it('子代理事件零投影：无帧且状态不变', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted(1, 'sub-1'));
-    projector.handleEvent(assistantDelta('sub text', 1, 'sub-1'));
-    projector.handleEvent(turnEnded('completed', 1, 'sub-1'));
-    expect(frames).toEqual([]);
-    expect(projector.status).toBe('idle');
-  });
-
-  it('mainAgentId 可注入', () => {
-    const { frames, projector } = makeProjector({ mainAgentId: 'primary' });
-    projector.handleEvent(turnStarted(1, 'main'));
-    projector.handleEvent(turnStarted(1, 'primary'));
-    expect(entries(frames)).toEqual([{ kind: 'status-marker', status: 'running' }]);
-  });
-});
-
-describe('Projector — 事件类型白名单', () => {
-  it('白名单外的主代理事件零帧', () => {
-    const types = [
-      'thinking.delta',
-      'tool.call.started',
-      'tool.progress',
-      'tool.result',
-      'shell.output',
-      'shell.started',
-      'subagent.spawned',
-      'subagent.completed',
-      'turn.step.started',
-      'session.meta.updated',
-      'error',
-    ];
-    for (const type of types) {
-      const { frames, projector } = makeProjector();
-      projector.handleEvent(foreignEvent(type));
-      expect(frames, `event type ${type} must produce zero frames`).toEqual([]);
-    }
-  });
-});
-
-describe('Projector — 单轮单帧', () => {
-  it('累积 delta 在轮末产出恰一个 assistant 消息帧，中途无增量帧', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(assistantDelta('a'));
-    projector.handleEvent(assistantDelta('b'));
-    projector.handleEvent(assistantDelta('c'));
-    projector.handleEvent(turnEnded('completed'));
-    expect(entries(frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'message', role: 'assistant', text: 'abc' },
-      { kind: 'status-marker', status: 'idle' },
-    ]);
-  });
-
-  it('注入 maxTextChars 截断并标记 truncated', () => {
-    const { frames, projector } = makeProjector({ limits: { maxTextChars: 10 } });
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(assistantDelta('a'.repeat(10)));
-    projector.handleEvent(assistantDelta('b'.repeat(10)));
-    projector.handleEvent(assistantDelta('c'.repeat(5)));
-    projector.handleEvent(turnEnded('completed'));
-    expect(messageEntries(frames)).toEqual([
-      { kind: 'message', role: 'assistant', text: 'a'.repeat(10), truncated: true },
-    ]);
-  });
-
-  it('cancelled 轮仍 flush 部分文本', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(assistantDelta('x'));
-    projector.handleEvent(assistantDelta('y'));
-    projector.handleEvent(turnEnded('cancelled'));
-    expect(entries(frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'message', role: 'assistant', text: 'xy' },
-      { kind: 'status-marker', status: 'idle' },
-    ]);
-  });
-
-  it('无 delta 的轮不产消息帧，仅状态帧', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(turnEnded('completed'));
-    expect(entries(frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'status-marker', status: 'idle' },
-    ]);
-  });
-
-  it('默认 maxTextChars=4000', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    for (let i = 0; i < 5; i += 1) {
-      projector.handleEvent(assistantDelta('x'.repeat(1000)));
-    }
-    projector.handleEvent(turnEnded('completed'));
-    expect(messageEntries(frames)).toEqual([
-      { kind: 'message', role: 'assistant', text: 'x'.repeat(4000), truncated: true },
-    ]);
-  });
-});
-
-describe('Projector — prompt.submitted 用户消息', () => {
-  it('从 TextPart 拼接用户消息文本', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(
-      promptSubmitted([
-        { type: 'text', text: '你好' },
-        { type: 'text', text: '世界' },
-      ]),
-    );
-    expect(messageEntries(frames)).toEqual([{ kind: 'message', role: 'user', text: '你好世界' }]);
-  });
-
-  it('blocked 状态的提交零帧，queued 正常投影', () => {
-    const blocked = makeProjector();
-    blocked.projector.handleEvent(promptSubmitted([{ type: 'text', text: 'hi' }], 'blocked'));
-    expect(blocked.frames).toEqual([]);
-
-    const queued = makeProjector();
-    queued.projector.handleEvent(promptSubmitted([{ type: 'text', text: 'hi' }], 'queued'));
-    expect(messageEntries(queued.frames)).toEqual([{ kind: 'message', role: 'user', text: 'hi' }]);
-  });
-
-  it('无文本部分的提交零帧', () => {
-    const { frames, projector } = makeProjector();
-    const event: Event = {
-      type: 'prompt.submitted',
-      promptId: 'p1',
-      userMessageId: 'um1',
-      status: 'running',
-      content: [{ type: 'tool_result', tool_call_id: 'tc1', output: 'o' }],
-      createdAt: '2025-01-01T00:00:00.000Z',
-      agentId: 'main',
-      sessionId: 's1',
     };
-    projector.handleEvent(event);
-    expect(frames).toEqual([]);
+    const overview = sample(projector, { goal });
+    expect(overview.goal).toEqual(goal);
   });
-});
 
-describe('Projector — 卡片投影', () => {
-  it('approval 卡帧恰含五个白名单键', () => {
-    const { frames, projector } = makeProjector();
-    projector.onCardOpened('approval', 'c1', approvalPayload('ap-1'));
-    const [entry] = entries(frames);
-    expect(entry).toEqual({
-      kind: 'approval-card',
-      cardId: 'c1',
-      toolName: 'Bash',
-      action: 'rm -rf',
-      summary: '危险操作',
+  it('A2: null goal passes through as null', () => {
+    const projector = makeProjector();
+    expect(sample(projector).goal).toBeNull();
+  });
+
+  it('A3: subagent folds are bounded and keep the newest', () => {
+    const projector = makeProjector({ maxFoldLength: 3 });
+    for (let index = 0; index < 5; index += 1) {
+      projector.handleEvent(subagentEvent('subagent.spawned', `sub-${String(index)}`));
+    }
+    const overview = sample(projector);
+    expect(overview.subagents).toHaveLength(3);
+    expect(overview.subagents.map((fold) => fold['subagentId'])).toEqual(['sub-2', 'sub-3', 'sub-4']);
+  });
+
+  it('A3: background task folds are bounded and keep the newest', () => {
+    const projector = makeProjector({ maxFoldLength: 2 });
+    projector.handleEvent(backgroundTaskEvent('background.task.started', 't1'));
+    projector.handleEvent(backgroundTaskEvent('background.task.terminated', 't1'));
+    projector.handleEvent(backgroundTaskEvent('background.task.started', 't2'));
+    projector.handleEvent(backgroundTaskEvent('background.task.terminated', 't2'));
+    const overview = sample(projector);
+    expect(overview.backgroundTasks).toHaveLength(2);
+    expect(overview.backgroundTasks.map((fold) => fold['taskId'])).toEqual(['t2', 't2']);
+  });
+
+  it('A3: fold payloads keep H1 event fields verbatim', () => {
+    const projector = makeProjector();
+    projector.handleEvent(subagentEvent('subagent.completed', 'sub-9'));
+    const [fold] = projector.eventFolds;
+    expect(fold).toMatchObject({ category: 'subagent', type: 'subagent.completed', subagentId: 'sub-9' });
+  });
+
+  it('models carry alias, displayName and segmentsFor efforts', () => {
+    const projector = makeProjector();
+    const overview = sample(projector);
+    expect(overview.models).toEqual([
+      { alias: 'kimi', displayName: 'Kimi for Coding', efforts: ['off', 'low', 'high'] },
+    ]);
+  });
+
+  it('P1: lastLine uses accumulated turn text while a turn is running', () => {
+    const projector = makeProjector();
+    projector.handleEvent(turnStarted());
+    projector.handleEvent(assistantDelta('first line\nsecond line\n\n'));
+    const overview = sample(projector);
+    expect(overview.lastLine).toBe('second line');
+  });
+
+  it('P1: lastLine falls back to the previous assistant message after the turn ends', () => {
+    const projector = makeProjector();
+    projector.handleEvent(turnStarted());
+    projector.handleEvent(assistantDelta('answer line'));
+    projector.handleEvent(turnEnded());
+    const overview = sample(projector);
+    expect(overview.lastLine).toBe('answer line');
+  });
+
+  it('P1: lastLine truncates overlong text', () => {
+    const projector = makeProjector({ maxTextChars: 8 });
+    projector.handleEvent(turnStarted());
+    projector.handleEvent(assistantDelta('a-very-long-final-line'));
+    const overview = sample(projector);
+    expect(overview.lastLine).toBe('a-very-l');
+  });
+
+  it('carries app-state fields verbatim', () => {
+    const projector = makeProjector();
+    const overview = sample(projector, {
+      streamingPhase: 'thinking',
+      isCompacting: true,
+      model: 'other',
+      thinkingEffort: 'low',
+      permissionMode: 'yolo',
+      planMode: true,
+      contextUsage: 0.75,
     });
-    expect(Object.keys(entry ?? {}).toSorted()).toEqual([
-      'action',
-      'cardId',
-      'kind',
-      'summary',
-      'toolName',
-    ]);
-  });
-
-  it('question 卡帧恰含四个白名单键，多问只取第一问', () => {
-    const { frames, projector } = makeProjector();
-    projector.onCardOpened('question', 'c1', questionPayload('qp-1'));
-    const [entry] = entries(frames);
-    expect(entry).toEqual({
-      kind: 'question-card',
-      cardId: 'c1',
-      question: '选哪个?',
-      options: ['A', 'B'],
+    expect(overview).toMatchObject({
+      phase: 'thinking',
+      isCompacting: true,
+      model: 'other',
+      thinkingEffort: 'low',
+      permissionMode: 'yolo',
+      planMode: true,
+      contextUsage: 0.75,
     });
-    expect(Object.keys(entry ?? {}).toSorted()).toEqual(['cardId', 'kind', 'options', 'question']);
-  });
-
-  it('onCardClosed 产 card-settled 帧，未知 cardId 零帧', () => {
-    const { frames, projector } = makeProjector();
-    projector.onCardOpened('question', 'c1', questionPayload('qp-1'));
-    projector.onCardClosed('question', 'c1', 'answered');
-    projector.onCardClosed('question', 'c9', 'answered');
-    expect(entries(frames)).toEqual([
-      { kind: 'question-card', cardId: 'c1', question: '选哪个?', options: ['A', 'B'] },
-      { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
-    ]);
-  });
-
-  it('turn.ended(cancelled) 结算本轮开放卡', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.onCardOpened('approval', 'c1', approvalPayload('ap-1'));
-    projector.handleEvent(turnEnded('cancelled'));
-    expect(entries(frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'approval-card', cardId: 'c1', toolName: 'Bash', action: 'rm -rf', summary: '危险操作' },
-      { kind: 'card-settled', cardId: 'c1', outcome: 'cancelled' },
-      { kind: 'status-marker', status: 'idle' },
-    ]);
-  });
-
-  it('turn.ended(completed) 不结算开放卡', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.onCardOpened('approval', 'c1', approvalPayload('ap-1'));
-    projector.handleEvent(turnEnded('completed'));
-    expect(entries(frames).some((entry) => entry.kind === 'card-settled')).toBe(false);
-  });
-});
-
-describe('Projector — 状态位去抖', () => {
-  it('重复 turn.started / turn.ended 只发一次帧，两轮共四次状态帧', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(turnEnded('completed'));
-    projector.handleEvent(turnEnded('completed'));
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(turnEnded('completed'));
-    expect(entries(frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'status-marker', status: 'idle' },
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'status-marker', status: 'idle' },
-    ]);
-  });
-
-  it('question 卡开关驱动 waiting-question 状态往返', () => {
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.onCardOpened('question', 'c1', questionPayload('qp-1'));
-    projector.onCardClosed('question', 'c1', 'answered');
-    expect(entries(frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'question-card', cardId: 'c1', question: '选哪个?', options: ['A', 'B'] },
-      { kind: 'status-marker', status: 'waiting-question' },
-      { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
-      { kind: 'status-marker', status: 'running' },
+    expect(overview.todos).toEqual([
+      { title: 'first', status: 'pending' },
+      { title: 'second', status: 'done' },
     ]);
   });
 });
-
-describe('Projector — attach / detach', () => {
-  it('独立订阅一次，detach 幂等且复位状态', () => {
-    const { frames, projector } = makeProjector();
-    expect(projector.subscriptionCount).toBe(0);
-
-    const unsubscribe = vi.fn();
-    const listeners: Array<(event: Event) => void> = [];
-    const session = {
-      onEvent: (listener: (event: Event) => void) => {
-        listeners.push(listener);
-        return unsubscribe;
-      },
-    } as unknown as Session;
-
-    projector.attach(session);
-    expect(projector.subscriptionCount).toBe(1);
-
-    listeners[0]?.(turnStarted());
-    expect(entries(frames)).toEqual([{ kind: 'status-marker', status: 'running' }]);
-    expect(projector.status).toBe('running');
-
-    projector.detach();
-    expect(unsubscribe).toHaveBeenCalledTimes(1);
-    expect(projector.subscriptionCount).toBe(0);
-    expect(projector.status).toBe('idle');
-
-    projector.detach();
-    expect(unsubscribe).toHaveBeenCalledTimes(1);
-    expect(projector.subscriptionCount).toBe(0);
-
-    projector.attach(session);
-    expect(projector.subscriptionCount).toBe(1);
-    expect(unsubscribe).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('Projector — onStatusChange seam', () => {
-  function runFullTransitionSequence(projector: Projector) {
-    projector.handleEvent(turnStarted());
-    projector.onCardOpened('question', 'c1', questionPayload('qp-1'));
-    projector.onCardClosed('question', 'c1', 'answered');
-    projector.handleEvent(turnEnded('completed'));
-  }
-
-  it('状态实际迁移时回调恰一次，重复事件短路不回调', () => {
-    const onStatusChange = vi.fn();
-    const { projector } = makeProjector({ onStatusChange });
-    projector.handleEvent(turnStarted());
-    expect(onStatusChange).toHaveBeenCalledTimes(1);
-    expect(onStatusChange).toHaveBeenLastCalledWith('running');
-    projector.handleEvent(turnStarted());
-    expect(onStatusChange).toHaveBeenCalledTimes(1);
-  });
-
-  it('全迁移序列回调参数为 [running, waiting-question, running, idle]', () => {
-    const statuses: string[] = [];
-    const { projector } = makeProjector({
-      onStatusChange: (status) => {
-        statuses.push(status);
-      },
-    });
-    runFullTransitionSequence(projector);
-    expect(statuses).toEqual(['running', 'waiting-question', 'running', 'idle']);
-  });
-
-  it('detach 复位 idle 静默：零回调、零新帧', () => {
-    const onStatusChange = vi.fn();
-    const { frames, projector } = makeProjector({ onStatusChange });
-    projector.handleEvent(turnStarted());
-    onStatusChange.mockClear();
-    const frameCountBefore = frames.length;
-    projector.detach();
-    expect(projector.status).toBe('idle');
-    expect(onStatusChange).not.toHaveBeenCalled();
-    expect(frames.length).toBe(frameCountBefore);
-  });
-
-  it('注入回调不改变 entry 帧流：与不注入时逐项相等', () => {
-    const bare = makeProjector();
-    runFullTransitionSequence(bare.projector);
-
-    const withCallback = makeProjector({ onStatusChange: () => {} });
-    runFullTransitionSequence(withCallback.projector);
-
-    expect(entries(withCallback.frames)).toEqual(entries(bare.frames));
-    expect(withCallback.projector.status).toBe(bare.projector.status);
-    expect(entries(bare.frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'question-card', cardId: 'c1', question: '选哪个?', options: ['A', 'B'] },
-      { kind: 'status-marker', status: 'waiting-question' },
-      { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'status-marker', status: 'idle' },
-    ]);
-  });
-
-  it('缺省回调零行为差：未注入时帧流与终态与注入时一致', () => {
-    const withCallbackStatuses: string[] = [];
-    const withCallback = makeProjector({
-      onStatusChange: (status) => {
-        withCallbackStatuses.push(status);
-      },
-    });
-    runFullTransitionSequence(withCallback.projector);
-
-    const bare = makeProjector();
-    runFullTransitionSequence(bare.projector);
-
-    expect(entries(bare.frames)).toEqual(entries(withCallback.frames));
-    expect(bare.projector.status).toBe(withCallback.projector.status);
-    expect(withCallbackStatuses).toEqual(['running', 'waiting-question', 'running', 'idle']);
-  });
-});
-
-describe('ForumLinkController — Projector 最小接线', () => {
-  function makeController() {
-    const frames: UplinkFrame[] = [];
-    const controller = new ForumLinkController({
-      onProjectorFrame: (frame) => {
-        frames.push(frame);
-      },
-    });
-    return { controller, frames };
-  }
-
-  it('onCardOpened 经内部 projector 产 approval-card 帧', () => {
-    const { controller, frames } = makeController();
-    controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
-    expect(entries(frames)).toEqual([
-      {
-        kind: 'approval-card',
-        cardId: 'c1',
-        toolName: 'Bash',
-        action: 'rm -rf',
-        summary: '危险操作',
-      },
-    ]);
-  });
-
-  it('onCardClosed 缺省 outcome 按卡片类型补全', () => {
-    const { controller, frames } = makeController();
-    controller.onCardOpened('question', 'up-1', questionPayload('up-1'));
-    controller.onCardClosed('question', 'up-1');
-    expect(entries(frames)).toEqual([
-      { kind: 'question-card', cardId: 'c1', question: '选哪个?', options: ['A', 'B'] },
-      { kind: 'card-settled', cardId: 'c1', outcome: 'answered' },
-    ]);
-  });
-
-  it('显式 outcome 原样透传', () => {
-    const { controller, frames } = makeController();
-    controller.onCardOpened('approval', 'up-1', approvalPayload('up-1'));
-    controller.onCardClosed('approval', 'up-1', 'rejected');
-    expect(entries(frames)).toEqual([
-      {
-        kind: 'approval-card',
-        cardId: 'c1',
-        toolName: 'Bash',
-        action: 'rm -rf',
-        summary: '危险操作',
-      },
-      { kind: 'card-settled', cardId: 'c1', outcome: 'rejected' },
-    ]);
-  });
-
-  it('未知卡片关闭零帧', () => {
-    const { controller, frames } = makeController();
-    controller.onCardClosed('approval', 'ghost');
-    expect(frames).toEqual([]);
-  });
-
-  it('回放 transcript 条目不产生 user 帧（用户消息唯一源是 prompt.submitted）', () => {
-    const { controller, frames } = makeController();
-    controller.onTranscriptEntry(userEntry({ turnId: 'replay:t1' }));
-    controller.onTranscriptEntry(userEntry({ id: 'e2', turnId: 't2' }));
-    expect(frames).toEqual([]);
-  });
-});
-
-describe('Projector — 调试分桶计数（K-3 可观测性）', () => {
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it('开关关闭：零开销——getStats 为 undefined，投影不受影响', () => {
-    vi.stubEnv('KIMI_CODE_FORUM_LINK_DEBUG', undefined);
-    const { frames, projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(thinkingDelta('thought'));
-    projector.handleEvent(toolCallStarted());
-    projector.handleEvent(assistantDelta('a'));
-    projector.handleEvent(turnEnded('completed'));
-    expect(projector.getStats()).toBeUndefined();
-    expect(entries(frames)).toEqual([
-      { kind: 'status-marker', status: 'running' },
-      { kind: 'message', role: 'assistant', text: 'a' },
-      { kind: 'status-marker', status: 'idle' },
-    ]);
-  });
-
-  it('开关开启：按事件类型分桶计数 seen/projected/dropped', () => {
-    vi.stubEnv('KIMI_CODE_FORUM_LINK_DEBUG', '1');
-    const { projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(thinkingDelta('thought'));
-    projector.handleEvent(toolCallStarted());
-    projector.handleEvent(assistantDelta('SECRET-TOKEN-XYZ'));
-    projector.handleEvent(assistantDelta('SECRET-TOKEN-XYZ', 1, 'sub'));
-    projector.handleEvent(turnEnded('completed'));
-
-    const stats = projector.getStats();
-    expect(stats).toBeDefined();
-    expect(stats?.get('thinking.delta')).toEqual({ seen: 1, projected: 0, dropped: 1 });
-    expect(stats?.get('tool.call.started')).toEqual({ seen: 1, projected: 0, dropped: 1 });
-    expect(stats?.get('turn.started')).toEqual({ seen: 1, projected: 1, dropped: 0 });
-    expect(stats?.get('assistant.delta')).toEqual({ seen: 2, projected: 1, dropped: 1 });
-    expect(stats?.get('turn.ended')).toEqual({ seen: 1, projected: 1, dropped: 0 });
-  });
-
-  it('卡片路径计入 card.opened / card.closed 桶', () => {
-    vi.stubEnv('KIMI_CODE_FORUM_LINK_DEBUG', '1');
-    const { frames, projector } = makeProjector();
-    projector.onCardOpened('approval', 'c1', approvalPayload('ap-1'));
-    projector.onCardClosed('approval', 'c1', 'approved');
-    projector.onCardClosed('approval', 'ghost', 'approved');
-    expect(projector.getStats()?.get('card.opened')).toEqual({ seen: 1, projected: 1, dropped: 0 });
-    expect(projector.getStats()?.get('card.closed')).toEqual({ seen: 2, projected: 1, dropped: 1 });
-    expect(entries(frames)).toEqual([
-      {
-        kind: 'approval-card',
-        cardId: 'c1',
-        toolName: 'Bash',
-        action: 'rm -rf',
-        summary: '危险操作',
-      },
-      { kind: 'card-settled', cardId: 'c1', outcome: 'approved' },
-    ]);
-  });
-
-  it('计数器不记录事件内容——序列化后不含注入的文本', () => {
-    vi.stubEnv('KIMI_CODE_FORUM_LINK_DEBUG', '1');
-    const { projector } = makeProjector();
-    projector.handleEvent(turnStarted());
-    projector.handleEvent(assistantDelta('SECRET-TOKEN-XYZ'));
-    projector.handleEvent(promptSubmitted([{ type: 'text', text: 'SECRET-TOKEN-XYZ' }]));
-    projector.handleEvent(turnEnded('completed'));
-    const serialized = JSON.stringify([...(projector.getStats()?.entries() ?? [])]);
-    expect(serialized).not.toContain('SECRET-TOKEN-XYZ');
-  });
-});
-

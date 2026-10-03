@@ -417,6 +417,26 @@ export class KimiTUI {
         sendNormalUserInput: (text) => this.sendNormalUserInput(text),
         createNewSession: () => this.createNewSession(),
         showStatus: (message) => this.showStatus(message),
+        steerMessage: (session, input) => {
+          this.steerMessage(session, input);
+        },
+        slashHost: this,
+        getTodos: () => this.state.todoPanel.getTodos(),
+        getPlan: async () => {
+          const session = this.session;
+          if (session === undefined) return null;
+          return session.getPlan();
+        },
+        cancelForeground: () => {
+          this.cancelRunningShellCommand();
+          if (this.state.appState.isCompacting) {
+            void this.session?.cancelCompaction().catch((error: unknown) => {
+              this.showError(`Failed to cancel compaction: ${formatErrorMessage(error)}`);
+            });
+            return;
+          }
+          void this.session?.cancel();
+        },
         session: () => this.session,
         workDir: () => this.state.appState.workDir,
         sessionTitle: () => this.state.appState.sessionTitle,
@@ -2223,6 +2243,7 @@ export class KimiTUI {
     }
     if (additionalDirsChanged) this.setupAutocomplete();
     this.state.ui.requestRender();
+    this.forumLink?.onAppStateChanged();
   }
 
   patchLivePane(patch: Partial<LivePaneState>): void {
