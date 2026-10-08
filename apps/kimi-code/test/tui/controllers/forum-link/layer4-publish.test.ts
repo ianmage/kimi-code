@@ -206,7 +206,31 @@ interface PublishFixture {
   planContent: string | null;
 }
 
-function makeController(): PublishFixture {
+function makeCapturingSession(id: string): { session: Session; fireIdle(): void } {
+  const listeners: ((event: { type: string }) => void)[] = [];
+  return {
+    session: {
+      id,
+      onEvent: (handler: (event: { type: string }) => void) => {
+        listeners.push(handler);
+        return () => {};
+      },
+      cancel: async () => {},
+      cancelCompaction: async () => {},
+    } as never as Session,
+    fireIdle: () => {
+      for (const listener of listeners) listener({ type: 'turn.ended' });
+    },
+  };
+}
+
+interface MakeControllerOptions {
+  appState?: Partial<AppState>;
+  endSessionTiming?: { idleWaitTimeoutMs?: number };
+  createNewSession?: () => Promise<void>;
+}
+
+function makeController(options: MakeControllerOptions = {}): PublishFixture {
   const approvalController = new ApprovalController();
   const questionController = new QuestionController();
   let planContent: string | null = '# The plan\n\n1. Do the thing.';
@@ -223,11 +247,14 @@ function makeController(): PublishFixture {
           contextUsage: 0,
           goal: null,
           availableModels: {},
+          ...options.appState,
         }) as never,
       approvalController,
       questionController,
       sendNormalUserInput: async () => {},
-      createNewSession: async () => {},
+      createNewSession: async () => {
+        await options.createNewSession?.();
+      },
       showStatus: () => {},
       steerMessage: () => {},
       slashHost: {} as never,
@@ -241,6 +268,7 @@ function makeController(): PublishFixture {
     },
     linkTiming: TEST_TIMING,
     overviewIntervalMs: 20,
+    endSessionTiming: options.endSessionTiming,
   });
   let approvalId: string | undefined;
   let questionId: string | undefined;
@@ -382,22 +410,143 @@ describe('layer4 publish full chain (real controller + fake hub)', () => {
     }
   });
 
-  it('remote end-session stops the link with the terminal receipt in finalReceipts', async () => {
+  it('remote end-session (immediate) ends the session, keeps the link published, and reports applied', async () => {
     const hub = new PublishFakeHub();
     await hub.start();
     try {
-      const fixture = makeController();
-      fixture.controller.onSessionChanged(makeSession('s1'));
+      const order: string[] = [];
+      const first = makeCapturingSession('s1');
+      const second = makeCapturingSession('s2');
+      const fixture = makeController({
+        createNewSession: async () => {
+          order.push('createNewSession');
+          fixture.controller.onSessionChanged(second.session);
+        },
+      });
+      fixture.controller.onSessionChanged(first.session);
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+      const link = (fixture.controller as unknown as { link?: { reportReceipt(report: ReceiptReport): void } })
+        .link!;
+      const originalReport = link.reportReceipt;
+      link.reportReceipt = (report) => {
+        if (report.opId === 'opEnd' && report.state === 'applied') order.push('receipt-applied');
+        originalReport.call(link, report);
+      };
+
+      const registerCountBefore = hub.registerSnapshots.length;
+      hub.pushOp('opEnd', 's1', { type: 'end-session', sessionId: 's1' });
+
+      await waitFor(() => order.includes('createNewSession'));
+      expect(order).toEqual(['receipt-applied', 'createNewSession']);
+      await waitFor(() => {
+        const posts = hub.receiptBodies as { receipts: ReceiptReport[] }[];
+        return posts.some((body) =>
+          body.receipts.some((report) => report.opId === 'opEnd' && report.state === 'applied'),
+        );
+      });
+      await waitFor(() => hub.registerSnapshots.length > registerCountBefore);
+      expect(hub.registerSnapshots.length).toBeGreaterThan(registerCountBefore);
+      const lastRegister = hub.registerSnapshots.at(-1) as {
+        threads: { descriptor: { sessionId: string } }[];
+        recentReceipts: ReceiptReport[];
+      };
+      expect(lastRegister.threads.map((thread) => thread.descriptor.sessionId)).toEqual(['s2']);
+      expect(lastRegister.recentReceipts).toContainEqual({ opId: 'opEnd', state: 'applied' });
+      expect(fixture.controller.session?.id).toBe('s2');
+      expect(hub.unregisterBodies).toHaveLength(0);
+      await waitFor(() => fixture.controller.state === 'published');
+      await fixture.controller.stop();
+      expect(hub.unregisterBodies).toHaveLength(1);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('remote end-session (turn mode) waits for the idle event before creating the new session', async () => {
+    const hub = new PublishFakeHub();
+    await hub.start();
+    try {
+      const order: string[] = [];
+      const first = makeCapturingSession('s1');
+      const second = makeCapturingSession('s2');
+      const fixture = makeController({
+        appState: { streamingPhase: 'thinking' },
+        createNewSession: async () => {
+          order.push('createNewSession');
+          fixture.controller.onSessionChanged(second.session);
+        },
+      });
+      fixture.controller.onSessionChanged(first.session);
+      await fixture.controller.start({ url: hub.url, token: 't' });
+      await waitFor(() => fixture.controller.state === 'published');
+      const link = (fixture.controller as unknown as { link?: { reportReceipt(report: ReceiptReport): void } })
+        .link!;
+      const originalReport = link.reportReceipt;
+      link.reportReceipt = (report) => {
+        if (report.opId === 'opEnd' && report.state === 'applied') order.push('receipt-applied');
+        originalReport.call(link, report);
+      };
+
+      hub.pushOp('opEnd', 's1', { type: 'end-session', sessionId: 's1' });
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+      expect(order).toEqual(['receipt-applied']);
+
+      first.fireIdle();
+
+      await waitFor(() => order.includes('createNewSession'));
+      expect(order).toEqual(['receipt-applied', 'createNewSession']);
+      await waitFor(() => {
+        const posts = hub.receiptBodies as { receipts: ReceiptReport[] }[];
+        return posts.some((body) =>
+          body.receipts.some((report) => report.opId === 'opEnd' && report.state === 'applied'),
+        );
+      });
+      expect(fixture.controller.session?.id).toBe('s2');
+      expect(hub.unregisterBodies).toHaveLength(0);
+      await waitFor(() => fixture.controller.state === 'published');
+      await fixture.controller.stop();
+      expect(hub.unregisterBodies).toHaveLength(1);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('remote end-session timeout keeps the link attached without creating a new session', async () => {
+    const hub = new PublishFakeHub();
+    await hub.start();
+    try {
+      const order: string[] = [];
+      const first = makeCapturingSession('s1');
+      const fixture = makeController({
+        appState: { streamingPhase: 'thinking' },
+        endSessionTiming: { idleWaitTimeoutMs: 50 },
+        createNewSession: async () => {
+          order.push('createNewSession');
+        },
+      });
+      fixture.controller.onSessionChanged(first.session);
       await fixture.controller.start({ url: hub.url, token: 't' });
       await waitFor(() => fixture.controller.state === 'published');
 
       hub.pushOp('opEnd', 's1', { type: 'end-session', sessionId: 's1' });
 
-      await waitFor(() => hub.unregisterBodies.length === 1);
-      const body = hub.unregisterBodies[0] as { finalReceipts: ReceiptReport[] };
-      const opEnd = body.finalReceipts.filter((report) => report.opId === 'opEnd');
-      expect(opEnd).toEqual([{ opId: 'opEnd', state: 'applied' }]);
-      await waitFor(() => fixture.controller.state === 'detached');
+      await new Promise((resolve) => {
+        setTimeout(resolve, 150);
+      });
+      expect(order).toEqual([]);
+      expect(fixture.controller.state).not.toBe('detached');
+      await waitFor(() => fixture.controller.state === 'published');
+      await waitFor(() => {
+        const posts = hub.receiptBodies as { receipts: ReceiptReport[] }[];
+        return posts.some((body) =>
+          body.receipts.some((report) => report.opId === 'opEnd' && report.state === 'applied'),
+        );
+      });
+      expect(hub.unregisterBodies).toHaveLength(0);
+      await fixture.controller.stop();
     } finally {
       await hub.close();
     }

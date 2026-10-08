@@ -4,6 +4,7 @@ import {
   parseSlashInput,
   resolveSlashCommandAvailability,
   addDirArgumentCompletions,
+  forumArgumentCompletions,
   sortSlashCommands,
   swarmArgumentCompletions,
   towerArgumentCompletions,
@@ -74,6 +75,34 @@ describe('built-in slash command registry', () => {
     expect(values('on')).toBeNull();
     expect(values('off')).toBeNull();
     expect(values('Ship feature X')).toBeNull();
+  });
+
+  it('offers forum subcommand argument completions', () => {
+    const values = (prefix: string): string[] | null => {
+      const items = forumArgumentCompletions(prefix);
+      return items === null ? null : items.map((item) => item.value);
+    };
+
+    expect(values('')).toEqual(['stop']);
+    expect(forumArgumentCompletions('')).toEqual([
+      { value: 'stop', label: 'stop', description: 'Unpublish from the Forum Link hub' },
+    ]);
+    expect(forumArgumentCompletions('st')).toEqual([
+      { value: 'stop', label: 'stop', description: 'Unpublish from the Forum Link hub' },
+    ]);
+    expect(values('stop')).toBeNull();
+    expect(values('x')).toBeNull();
+  });
+
+  it('registers forum with stop-only argument completions', () => {
+    const command = findBuiltInSlashCommand('forum');
+    expect(command).toBeDefined();
+    expect(command!.aliases).toEqual([]);
+    expect((command as KimiSlashCommand).argumentHint).toBe('[stop]');
+    expect((command as KimiSlashCommand).completeArgs).toBe(forumArgumentCompletions);
+    expect((command as KimiSlashCommand).description).toBe(
+      'Publish this session to the Forum Link hub, or stop to unpublish it',
+    );
   });
 
   it('offers tower subcommand argument completions', () => {

@@ -28,7 +28,7 @@ export interface SessionControlHostView {
   steerMessage(session: Session, input: readonly SteerInputItem[]): void;
   cancelForeground(): void;
   createNewSession(): Promise<void>;
-  runEndSession(opts?: { beforeStop?: () => void }): Promise<void>;
+  runEndSession(opts?: { beforeEnd?: () => void }): Promise<void>;
   session(): Session | undefined;
 }
 

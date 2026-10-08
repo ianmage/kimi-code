@@ -616,7 +616,7 @@ async function handleBuiltInSlashCommand(
       await handleRemoteControlCommand(host);
       return;
     case 'forum':
-      await handleForumCommand(host);
+      await handleForumCommand(host, args);
       return;
     default:
       host.showError(`Unknown slash command: /${String(name)}`);
