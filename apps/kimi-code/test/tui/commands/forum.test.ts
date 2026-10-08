@@ -85,7 +85,7 @@ describe('handleForumCommand', () => {
     const host = makeHost({ session: undefined, controller: makeStubController() });
     writeRemoteKey('url=http://127.0.0.1:8787\ntoken=x\n');
 
-    await handleForumCommand(host);
+    await handleForumCommand(host, '');
 
     expect(host.showError).toHaveBeenCalledTimes(1);
     expect(host.showError).toHaveBeenCalledWith(NO_ACTIVE_SESSION_MESSAGE);
@@ -97,7 +97,7 @@ describe('handleForumCommand', () => {
   it('shows the credential hint with the full path and makes no connection', async () => {
     const host = makeHost();
 
-    await handleForumCommand(host);
+    await handleForumCommand(host, '');
 
     expect(host.showError).toHaveBeenCalledTimes(1);
     const message = host.showError.mock.calls[0]?.[0] as string;
@@ -107,28 +107,24 @@ describe('handleForumCommand', () => {
     expect(host.showStatus).not.toHaveBeenCalled();
   });
 
-  it('toggles off when the controller is not detached: stop, no publish path', async () => {
-    const controller = makeStubController('published');
-    const host = makeHost({ controller });
-
-    await handleForumCommand(host);
-
-    expect(controller.stop).toHaveBeenCalledTimes(1);
-    expect(controller.start).not.toHaveBeenCalled();
-    expect(host.ensureForumLink).not.toHaveBeenCalled();
-    expect(host.showStatus).toHaveBeenCalledWith('Forum Link: unpublished');
-    expect(host.showError).not.toHaveBeenCalled();
-  });
-
-  it('toggles off from connecting and backoff states as well', async () => {
-    for (const state of ['connecting', 'backoff'] as const) {
+  it('is idempotent while connecting/published/backoff: status notice only, zero side effects', async () => {
+    const notices = {
+      connecting: 'Forum Link: connecting...',
+      published: 'Forum Link: published',
+      backoff: 'Forum Link: connection lost, retrying...',
+    } as const;
+    for (const state of ['connecting', 'published', 'backoff'] as const) {
       const controller = makeStubController(state);
       const host = makeHost({ controller });
 
-      await handleForumCommand(host);
+      await handleForumCommand(host, '');
 
-      expect(controller.stop).toHaveBeenCalledTimes(1);
+      expect(host.showStatus).toHaveBeenCalledTimes(1);
+      expect(host.showStatus).toHaveBeenCalledWith(notices[state]);
       expect(controller.start).not.toHaveBeenCalled();
+      expect(controller.stop).not.toHaveBeenCalled();
+      expect(host.ensureForumLink).not.toHaveBeenCalled();
+      expect(host.showError).not.toHaveBeenCalled();
     }
   });
 
@@ -137,7 +133,7 @@ describe('handleForumCommand', () => {
     const host = makeHost({ controller });
     writeRemoteKey('url=http://127.0.0.1:8787\ntoken=secret123\n');
 
-    await handleForumCommand(host);
+    await handleForumCommand(host, '');
 
     expect(host.ensureForumLink).toHaveBeenCalledTimes(1);
     expect(controller.start).toHaveBeenCalledTimes(1);
@@ -154,7 +150,7 @@ describe('handleForumCommand', () => {
     const host = makeHost({ controller });
     writeRemoteKey('url=http://127.0.0.1:8787\n');
 
-    await handleForumCommand(host);
+    await handleForumCommand(host, '');
 
     expect(controller.start).not.toHaveBeenCalled();
     expect(host.showError).toHaveBeenCalledTimes(1);
@@ -172,13 +168,122 @@ describe('handleForumCommand', () => {
     const host = makeHost({ controller });
     writeRemoteKey('url=http://127.0.0.1:8787\ntoken=bad\n');
 
-    await handleForumCommand(host);
+    await handleForumCommand(host, '');
 
     expect(host.showError).toHaveBeenCalledTimes(1);
     expect(host.showError).toHaveBeenCalledWith(
       'Forum Link publish failed: unauthorized',
     );
+    expect(controller.stop).toHaveBeenCalledTimes(1);
     expect(host.showStatus).not.toHaveBeenCalledWith('Forum Link: published');
+  });
+
+  it('a publish failure is recoverable: a later /forum calls start again', async () => {
+    const controller = makeStubController('detached');
+    controller.start.mockResolvedValueOnce({
+      ok: false,
+      reason: 'connect-failed',
+      error: new Error('unauthorized'),
+    });
+    const host = makeHost({ controller });
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=bad\n');
+
+    await handleForumCommand(host, '');
+    expect(controller.start).toHaveBeenCalledTimes(1);
+    expect(controller.stop).toHaveBeenCalledTimes(1);
+
+    controller.state = 'detached';
+    await handleForumCommand(host, '');
+
+    expect(controller.start).toHaveBeenCalledTimes(2);
+    expect(controller.stop).toHaveBeenCalledTimes(1);
+    expect(host.showStatus).toHaveBeenCalledWith('Forum Link: published');
+  });
+});
+
+describe('handleForumCommand — /forum stop', () => {
+  it('stops exactly once and shows the unpublished notice when active', async () => {
+    const controller = makeStubController('published');
+    const host = makeHost({ controller });
+
+    await handleForumCommand(host, 'stop');
+
+    expect(controller.stop).toHaveBeenCalledTimes(1);
+    expect(controller.start).not.toHaveBeenCalled();
+    expect(host.ensureForumLink).not.toHaveBeenCalled();
+    expect(host.showStatus).toHaveBeenCalledTimes(1);
+    expect(host.showStatus).toHaveBeenCalledWith('Forum Link: unpublished');
+    expect(host.showError).not.toHaveBeenCalled();
+  });
+
+  it('is a zero-call no-op notice when no controller exists', async () => {
+    const host = makeHost();
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=x\n');
+
+    await handleForumCommand(host, 'stop');
+
+    expect(host.ensureForumLink).not.toHaveBeenCalled();
+    expect(host.showStatus).toHaveBeenCalledTimes(1);
+    expect(host.showStatus).toHaveBeenCalledWith('Forum Link: unpublished');
+    expect(host.showError).not.toHaveBeenCalled();
+  });
+
+  it('is a zero-call no-op notice when the controller is detached', async () => {
+    const controller = makeStubController('detached');
+    const host = makeHost({ controller });
+
+    await handleForumCommand(host, 'stop');
+
+    expect(controller.stop).not.toHaveBeenCalled();
+    expect(controller.start).not.toHaveBeenCalled();
+    expect(host.showStatus).toHaveBeenCalledTimes(1);
+    expect(host.showStatus).toHaveBeenCalledWith('Forum Link: unpublished');
+    expect(host.showError).not.toHaveBeenCalled();
+  });
+});
+
+describe('handleForumCommand — invalid args', () => {
+  it.each(['stop now', 'off', 'toggle'])(
+    'rejects %j with the usage error and never touches the controller',
+    async (args) => {
+      const controller = makeStubController('published');
+      const host = makeHost({ controller });
+
+      await handleForumCommand(host, args);
+
+      expect(host.showError).toHaveBeenCalledTimes(1);
+      expect(host.showError).toHaveBeenCalledWith('Usage: /forum or /forum stop');
+      expect(controller.start).not.toHaveBeenCalled();
+      expect(controller.stop).not.toHaveBeenCalled();
+      expect(host.ensureForumLink).not.toHaveBeenCalled();
+      expect(host.showStatus).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('handleForumCommand — argument parsing', () => {
+  it('treats uppercase and padded stop as stop', async () => {
+    for (const args of ['STOP', '  stop  ']) {
+      const controller = makeStubController('published');
+      const host = makeHost({ controller });
+
+      await handleForumCommand(host, args);
+
+      expect(controller.stop).toHaveBeenCalledTimes(1);
+      expect(host.showStatus).toHaveBeenCalledWith('Forum Link: unpublished');
+    }
+  });
+
+  it('treats empty and whitespace-only args as publish', async () => {
+    const controller = makeStubController('detached');
+    const host = makeHost({ controller });
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=parse\n');
+
+    await handleForumCommand(host, '');
+    await handleForumCommand(host, '   ');
+
+    expect(controller.start).toHaveBeenCalledTimes(2);
+    expect(host.showStatus).toHaveBeenCalledWith('Forum Link: published');
   });
 });
 
@@ -363,15 +468,29 @@ describe('dispatchInput — /forum routing', () => {
     expect(host.showStatus).toHaveBeenCalledWith('Forum Link: published');
   });
 
-  it('dispatches /forum to stop when already published', async () => {
+  it('dispatches /forum as an idempotent status notice when already published', async () => {
     const controller = makeStubController('published');
     const host = makeHost({ controller });
     writeRemoteKey('url=http://127.0.0.1:8787\ntoken=route\n');
 
     dispatchInput(host, '/forum');
     await vi.waitFor(() => {
+      expect(host.showStatus).toHaveBeenCalledWith('Forum Link: published');
+    });
+    expect(controller.stop).not.toHaveBeenCalled();
+    expect(controller.start).not.toHaveBeenCalled();
+  });
+
+  it('dispatches /forum stop to the explicit stop path', async () => {
+    const controller = makeStubController('published');
+    const host = makeHost({ controller });
+    writeRemoteKey('url=http://127.0.0.1:8787\ntoken=route\n');
+
+    dispatchInput(host, '/forum stop');
+    await vi.waitFor(() => {
       expect(controller.stop).toHaveBeenCalledTimes(1);
     });
     expect(controller.start).not.toHaveBeenCalled();
+    expect(host.showStatus).toHaveBeenCalledWith('Forum Link: unpublished');
   });
 });
