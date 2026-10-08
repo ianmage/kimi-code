@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { Session, SessionPlan } from '@moonshot-ai/kimi-code-sdk';
 
-import { ForumLinkController, wrapUiHooksForForumLink } from '#/tui/controllers/forum-link';
+import {
+  ForumLinkController,
+  forumLinkStateNotice,
+  wrapUiHooksForForumLink,
+} from '#/tui/controllers/forum-link';
 import { resolveEndSessionMode } from '#/tui/controllers/forum-link/end-session';
 import { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
 import { QuestionController } from '#/tui/reverse-rpc/question/controller';
@@ -117,6 +121,15 @@ function makeController(
     hooks,
   };
 }
+
+describe('forumLinkStateNotice single source of state notices', () => {
+  it('returns the current notice text for every link state', () => {
+    expect(forumLinkStateNotice('connecting')).toBe('Forum Link: connecting...');
+    expect(forumLinkStateNotice('published')).toBe('Forum Link: published');
+    expect(forumLinkStateNotice('backoff')).toBe('Forum Link: connection lost, retrying...');
+    expect(forumLinkStateNotice('detached')).toBe('Forum Link: unpublished');
+  });
+});
 
 describe('M4-A1 card id stability and unique panel mapping', () => {
   it('keeps the card id stable while open and maps to exactly one local panel', () => {

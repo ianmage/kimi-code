@@ -175,7 +175,7 @@ function makeHostView(overrides: HostOverrides = {}) {
     cancelledForeground: 0,
     createdSessions: 0,
     endSession: 0,
-    beforeStop: 0,
+    beforeEnd: 0,
   };
   const hostView: SessionControlHostView = {
     slashHost,
@@ -192,9 +192,9 @@ function makeHostView(overrides: HostOverrides = {}) {
       calls.createdSessions += 1;
       mockSession.id = 'session-2';
     },
-    runEndSession: async (opts?: { beforeStop?: () => void }) => {
+    runEndSession: async (opts?: { beforeEnd?: () => void }) => {
       calls.endSession += 1;
-      opts?.beforeStop?.();
+      opts?.beforeEnd?.();
     },
     session: () => session,
   };
@@ -404,7 +404,7 @@ describe('pause', () => {
 });
 
 describe('end-session', () => {
-  it('applies and enters the unpublish path with the beforeStop callback', async () => {
+  it('applies and enters the unpublish path with the beforeEnd callback', async () => {
     const { hostView, calls } = makeHostView();
     const outcome = await apply(intentOf({ type: 'end-session' }), hostView);
     expect(outcome).toEqual({ state: 'applied' });
@@ -413,7 +413,7 @@ describe('end-session', () => {
 
   it('reports postcondition-failed when runEndSession throws', async () => {
     const { hostView } = makeHostView();
-    const made = hostView as unknown as { runEndSession: (opts?: { beforeStop?: () => void }) => Promise<void> };
+    const made = hostView as unknown as { runEndSession: (opts?: { beforeEnd?: () => void }) => Promise<void> };
     made.runEndSession = async () => {
       throw new Error('unpublish failed');
     };
@@ -916,16 +916,16 @@ describe('M2-A3 approve-for-session auto-resolves queued same-action requests', 
   });
 });
 
-describe('P1 end-session terminal state is written before stop()', () => {
-  it('reports applied via the beforeStop callback before the link stops', async () => {
+describe('P1 end-session terminal state is written before the session ends', () => {
+  it('reports applied via the beforeEnd callback before the link stops', async () => {
     const fixture = makeInjectorFixture();
     const events: string[] = [];
     const made = fixture.hostView as unknown as {
-      runEndSession: (opts?: { beforeStop?: () => void }) => Promise<void>;
+      runEndSession: (opts?: { beforeEnd?: () => void }) => Promise<void>;
     };
     made.runEndSession = async (opts) => {
       events.push('run-start');
-      opts?.beforeStop?.();
+      opts?.beforeEnd?.();
       events.push('after-before-stop');
     };
     await fixture.injector.handle(downlinkOp('op1', { type: 'end-session', sessionId: 'session-1' }));
@@ -936,10 +936,10 @@ describe('P1 end-session terminal state is written before stop()', () => {
     ]);
   });
 
-  it('still reports applied when runEndSession completes without invoking beforeStop', async () => {
+  it('still reports applied when runEndSession completes without invoking beforeEnd', async () => {
     const fixture = makeInjectorFixture();
     const made = fixture.hostView as unknown as {
-      runEndSession: (opts?: { beforeStop?: () => void }) => Promise<void>;
+      runEndSession: (opts?: { beforeEnd?: () => void }) => Promise<void>;
     };
     made.runEndSession = async () => {};
     await fixture.injector.handle(downlinkOp('op1', { type: 'end-session', sessionId: 'session-1' }));
@@ -952,7 +952,7 @@ describe('P1 end-session terminal state is written before stop()', () => {
   it('reports rejected: postcondition-failed when runEndSession throws before reporting', async () => {
     const fixture = makeInjectorFixture();
     const made = fixture.hostView as unknown as {
-      runEndSession: (opts?: { beforeStop?: () => void }) => Promise<void>;
+      runEndSession: (opts?: { beforeEnd?: () => void }) => Promise<void>;
     };
     made.runEndSession = async () => {
       throw new Error('unpublish failed');
@@ -1302,19 +1302,21 @@ describe('M2-A4 new-session and end-session receipts reach applied over a real l
     }
   });
 
-  it('end-session: terminal applied is written before stop and delivered via finalReceipts', async () => {
+  it('end-session: applied is written before the resync, the new session registers, and no unregister happens', async () => {
     const hub = new InjectorFakeHub();
     await hub.start();
     try {
       const { hostView } = makeHostView();
       const madeHost = hostView as unknown as {
-        runEndSession: (opts?: { beforeStop?: () => void }) => Promise<void>;
+        runEndSession: (opts?: { beforeEnd?: () => void }) => Promise<void>;
       };
       const receipts: ReceiptReport[] = [];
       let link: Link;
+      let sessionIds = ['session-1'];
       madeHost.runEndSession = async (opts) => {
-        opts?.beforeStop?.();
-        await link.stop();
+        opts?.beforeEnd?.();
+        sessionIds = ['s2'];
+        link.resync();
       };
       const host: InjectorHost = {
         reportReceipt: (report) => {
@@ -1330,7 +1332,7 @@ describe('M2-A4 new-session and end-session receipts reach applied over a real l
       link = new Link({
         url: hub.url,
         token: 'token',
-        getSnapshot: () => makeHubSnapshot(['session-1']),
+        getSnapshot: () => makeHubSnapshot(sessionIds),
         onOp: (op) => {
           void injector.handle(op);
         },
@@ -1338,17 +1340,24 @@ describe('M2-A4 new-session and end-session receipts reach applied over a real l
       } satisfies LinkOptions);
       link.start();
       await waitFor(() => link.state === 'published');
+      const registerCountBefore = hub.registerSnapshots.length;
       hub.pushToStreams(
         `event: op\ndata: ${JSON.stringify({ opId: 'opEnd', sessionId: 'session-1', intent: { type: 'end-session', sessionId: 'session-1' } })}`,
       );
-      await waitFor(() => hub.unregisterBodies.length === 1);
-      const body = hub.unregisterBodies[0] as { finalReceipts: ReceiptReport[] };
-      const opEnd = body.finalReceipts.filter((report) => report.opId === 'opEnd');
-      expect(opEnd).toEqual([{ opId: 'opEnd', state: 'applied' }]);
+      await waitFor(() => hub.registerSnapshots.length > registerCountBefore);
+      const lastRegister = hub.registerSnapshots.at(-1) as {
+        threads: { descriptor: { sessionId: string } }[];
+        recentReceipts: ReceiptReport[];
+      };
+      expect(lastRegister.threads.map((t) => t.descriptor.sessionId)).toEqual(['s2']);
+      expect(lastRegister.recentReceipts).toContainEqual({ opId: 'opEnd', state: 'applied' });
+      await waitFor(() => hubReceiptState(hub, 'opEnd') === 'applied');
+      expect(hub.unregisterBodies).toHaveLength(0);
       expect(receipts.filter((report) => report.opId === 'opEnd')).toEqual([
         { opId: 'opEnd', state: 'delivered' },
         { opId: 'opEnd', state: 'applied' },
       ]);
+      await link.stop();
     } finally {
       await hub.close();
     }

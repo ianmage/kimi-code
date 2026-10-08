@@ -74,12 +74,16 @@ export interface ForumLinkControllerDeps {
 const DEFAULT_IDLE_WAIT_TIMEOUT_MS = 5000;
 const DEFAULT_OVERVIEW_INTERVAL_MS = 2000;
 
-const LINK_STATE_NOTICES: Partial<Record<ForumLinkState, string>> = {
+const LINK_STATE_NOTICES: Record<ForumLinkState, string> = {
   connecting: 'Forum Link: connecting...',
   published: 'Forum Link: published',
   backoff: 'Forum Link: connection lost, retrying...',
   detached: 'Forum Link: unpublished',
 };
+
+export function forumLinkStateNotice(state: ForumLinkState): string {
+  return LINK_STATE_NOTICES[state];
+}
 
 const RECONNECTING_NOTICE = 'Forum Link: reconnecting...';
 
@@ -129,7 +133,7 @@ export class ForumLinkController {
         steerMessage: this.host.steerMessage,
         cancelForeground: this.host.cancelForeground,
         createNewSession: this.host.createNewSession,
-        runEndSession: (opts?: { beforeStop?: () => void }) => this.runEndSession(opts),
+        runEndSession: (opts?: { beforeEnd?: () => void }) => this.runEndSession(opts),
         session: () => this.currentSession,
       };
       this.injector = new Injector(
@@ -301,21 +305,19 @@ export class ForumLinkController {
     respond();
   }
 
-  async runEndSession(opts?: { beforeStop?: () => void }): Promise<void> {
+  async runEndSession(opts?: { beforeEnd?: () => void }): Promise<void> {
     const session = this.currentSession;
     if (session === undefined) return;
     const mode = resolveEndSessionMode(this.host?.appState());
     if (mode === 'immediate') {
-      opts?.beforeStop?.();
-      await this.stop();
+      opts?.beforeEnd?.();
       await this.host?.createNewSession();
       return;
     }
     const idle = this.waitForIdle(session);
     if (mode === 'compaction') await session.cancelCompaction();
     else await session.cancel();
-    opts?.beforeStop?.();
-    await this.stop();
+    opts?.beforeEnd?.();
     if (await idle) await this.host?.createNewSession();
   }
 
@@ -340,7 +342,7 @@ export class ForumLinkController {
     this.linkState = next;
     let notice = LINK_STATE_NOTICES[next];
     if (previous === 'backoff' && next === 'connecting') notice = RECONNECTING_NOTICE;
-    if (notice !== undefined) this.host?.showStatus(notice);
+    this.host?.showStatus(notice);
     if (next === 'published') {
       this.markOverviewDirty();
     }

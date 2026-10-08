@@ -91,17 +91,17 @@ export class Injector {
 
   private async settleEndSession(opId: string): Promise<void> {
     let reported = false;
-    const beforeStop = () => {
+    const beforeEnd = () => {
       this.host.reportReceipt({ opId, state: 'applied' });
       reported = true;
     };
     try {
-      await this.sessionControl.runEndSession({ beforeStop });
+      await this.sessionControl.runEndSession({ beforeEnd });
     } catch {
       if (!reported) this.reportTerminal(opId, { state: 'rejected', reason: 'postcondition-failed' });
       return;
     }
-    if (!reported) beforeStop();
+    if (!reported) beforeEnd();
   }
 
   private reportTerminal(opId: string, outcome: SessionControlOutcome): void {
