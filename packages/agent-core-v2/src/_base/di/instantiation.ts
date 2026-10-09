@@ -43,10 +43,12 @@ export interface IConstructorSignature<T, Args extends any[] = []> {
   new <Services extends BrandedService[]>(...args: [...Args, ...Services]): T;
 }
 
-export type GetLeadingNonServiceArgs<TArgs extends any[]> =
-  TArgs extends [] ? []
-  : TArgs extends [...infer TFirst, BrandedService] ? GetLeadingNonServiceArgs<TFirst>
-  : TArgs;
+export type GetLeadingNonServiceArgs<TArgs extends any[], TAcc extends any[] = []> =
+  TArgs extends [infer THead, ...infer TRest]
+    ? THead extends BrandedService | undefined
+      ? TAcc
+      : GetLeadingNonServiceArgs<TRest, [...TAcc, THead]>
+    : TAcc;
 
 export interface ServiceIdentifier<T> {
   (target: any, key: string | symbol | undefined, index: number): void;
