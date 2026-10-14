@@ -6,8 +6,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 import {
   buildRequestOptions,
-  KIMI_MCP_CLIENT_NAME,
-  KIMI_MCP_CLIENT_VERSION,
+  createMcpSdkClient,
   MCP_LIVENESS_PROBE_TIMEOUT_MS,
   toMcpToolDefinition,
   toMcpToolResult,
@@ -21,6 +20,7 @@ import type { MCPClient, MCPToolDefinition, MCPToolResult } from './types';
 export interface HttpMcpClientOptions {
   readonly clientName?: string;
   readonly clientVersion?: string;
+  readonly rootDirectories?: readonly string[];
   readonly startupTimeoutMs?: number;
   readonly toolCallTimeoutMs?: number;
   readonly envLookup?: (name: string) => string | undefined;
@@ -51,9 +51,10 @@ export class HttpMcpClient implements MCPClient {
       fetch: createMcpOAuthFetch(options.oauthProvider, options.fetch),
       authProvider: options.oauthProvider,
     });
-    this.client = new Client({
-      name: options.clientName ?? KIMI_MCP_CLIENT_NAME,
-      version: options.clientVersion ?? KIMI_MCP_CLIENT_VERSION,
+    this.client = createMcpSdkClient({
+      clientName: options.clientName,
+      clientVersion: options.clientVersion,
+      rootDirectories: options.rootDirectories,
     });
     this.startupTimeoutMs = options.startupTimeoutMs;
     this.toolCallTimeoutMs = options.toolCallTimeoutMs;

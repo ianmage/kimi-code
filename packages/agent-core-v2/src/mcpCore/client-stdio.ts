@@ -10,8 +10,7 @@ import { proxyEnvForChild, reconcileChildNoProxy } from '#/_base/utils/proxy';
 
 import {
   buildRequestOptions,
-  KIMI_MCP_CLIENT_NAME,
-  KIMI_MCP_CLIENT_VERSION,
+  createMcpSdkClient,
   MCP_LIVENESS_PROBE_TIMEOUT_MS,
   toMcpToolDefinition,
   toMcpToolResult,
@@ -24,6 +23,7 @@ import type { MCPClient, MCPToolDefinition, MCPToolResult } from './types';
 export interface StdioMcpClientOptions {
   readonly clientName?: string;
   readonly clientVersion?: string;
+  readonly rootDirectories?: readonly string[];
   readonly startupTimeoutMs?: number;
   readonly toolCallTimeoutMs?: number;
   readonly defaultCwd?: string;
@@ -55,9 +55,10 @@ export class StdioMcpClient implements MCPClient {
       throw new Error2(ErrorCodes.NOT_IMPLEMENTED, `MCP stdio executor '${config.executor}' is not yet implemented`);
     }
     this.transport = new RuntimeStdioTransport(config, options, this.stderrBuffer);
-    this.client = new Client({
-      name: options.clientName ?? KIMI_MCP_CLIENT_NAME,
-      version: options.clientVersion ?? KIMI_MCP_CLIENT_VERSION,
+    this.client = createMcpSdkClient({
+      clientName: options.clientName,
+      clientVersion: options.clientVersion,
+      rootDirectories: options.rootDirectories,
     });
     this.startupTimeoutMs = options.startupTimeoutMs;
     this.toolCallTimeoutMs = options.toolCallTimeoutMs;

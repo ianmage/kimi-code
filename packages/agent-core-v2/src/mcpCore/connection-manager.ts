@@ -446,16 +446,19 @@ export class McpConnectionManager implements McpConnectionView {
         startupTimeoutMs,
         toolCallTimeoutMs,
         defaultCwd: this.options.stdioCwd,
+        rootDirectories: this.options.stdioCwd === undefined ? [] : [this.options.stdioCwd],
         clientName,
         runtimeResolver,
         workspaceId,
         runtimeId,
       });
     }
+    const rootDirectories = this.options.stdioCwd === undefined ? [] : [this.options.stdioCwd];
     if (config.transport === 'sse') {
       return new SseMcpClient(config, {
         startupTimeoutMs,
         toolCallTimeoutMs,
+        rootDirectories,
         envLookup: this.options.envLookup,
         oauthProvider: await this.resolveOAuthProvider(config, name),
         clientName,
@@ -464,6 +467,7 @@ export class McpConnectionManager implements McpConnectionView {
     return new HttpMcpClient(config, {
       startupTimeoutMs,
       toolCallTimeoutMs,
+      rootDirectories,
       envLookup: this.options.envLookup,
       oauthProvider: await this.resolveOAuthProvider(config, name),
       clientName,
