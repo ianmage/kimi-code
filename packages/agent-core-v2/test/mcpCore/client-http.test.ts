@@ -1,9 +1,29 @@
+import { mkdtempSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'pathe';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { ErrorCodes, Error2 } from '#/errors';
 import { buildMcpHttpHeaders, HttpMcpClient, isTerminalTransportError } from '#/mcpCore/client-http';
+import { deriveMcpRoots } from '#/mcpCore/roots';
 
 import { startInProcessHttpMcpServer } from './stubs';
+
+interface RootsProbeResult {
+  readonly capabilities: { roots?: { listChanged?: boolean } } | undefined;
+  readonly roots: { readonly uri: string; readonly name?: string }[];
+  readonly listChangedCount: number;
+}
+
+function parseRootsProbe(result: { content: { type: string; text?: string }[] }): RootsProbeResult {
+  const text = result.content[0]?.text ?? '';
+  return JSON.parse(text) as RootsProbeResult;
+}
+
+async function settleStandaloneSseStream(client: HttpMcpClient): Promise<void> {
+  await client.ping();
+}
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -193,6 +213,47 @@ describe('HttpMcpClient', () => {
       await client.connect();
       const tools = await client.listTools();
       expect(tools.map((t) => t.name)).toEqual(['echo']);
+    } finally {
+      await client.close();
+    }
+  }, 15000);
+
+  it('declares roots capability and answers roots/list with the derived snapshot', async () => {
+    const server = await startInProcessHttpMcpServer({ exposeRoots: true });
+    cleanups.push(server.close);
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-mcp-roots-'));
+
+    const client = new HttpMcpClient(
+      { transport: 'http', url: server.url },
+      { rootDirectories: [dir] },
+    );
+    try {
+      await client.connect();
+      await settleStandaloneSseStream(client);
+      const result = parseRootsProbe(await client.callTool('get_roots', {}));
+      expect(result.capabilities?.roots?.listChanged).toBe(true);
+      expect(result.roots).toEqual(deriveMcpRoots([dir]));
+      expect(result.listChangedCount).toBe(0);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  it('declares roots capability with an empty snapshot when no rootDirectories is given', async () => {
+    const server = await startInProcessHttpMcpServer({ exposeRoots: true });
+    cleanups.push(server.close);
+
+    const client = new HttpMcpClient({ transport: 'http', url: server.url });
+    try {
+      await client.connect();
+      await settleStandaloneSseStream(client);
+      const tools = await client.listTools();
+      expect(tools.map((t) => t.name)).toContain('get_roots');
+      const result = parseRootsProbe(await client.callTool('get_roots', {}));
+      expect(result.capabilities?.roots?.listChanged).toBe(true);
+      expect(result.roots).toEqual([]);
+      expect(result.listChangedCount).toBe(0);
     } finally {
       await client.close();
     }

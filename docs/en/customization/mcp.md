@@ -160,6 +160,7 @@ When connecting to external MCP servers, be aware of:
 - Only connect to servers from trusted sources
 - Verify that tool names and parameters look reasonable in approval requests
 - Keep manual approval for high-risk tools (file writes, command execution, etc.); avoid using `mcp__*` wildcards to allow all tools at once
+- Kimi Code CLI declares the MCP `roots` capability (a standard way to tell servers which directories it works in) during the handshake and reports the session working directory as the only root to every MCP server, including remote http/sse servers. The root is informational only: it does not expose file contents, and it does not change what Kimi Code CLI's own tools can access. Servers that follow roots (such as chrome-devtools-mcp) will therefore allow writing files inside the working directory.
 
 ::: warning Note
 In [Ask When Needed mode](../guides/interaction.md#the-three-permission-modes), MCP tool calls are automatically approved. Only use this mode when you fully trust the MCP servers you have connected.

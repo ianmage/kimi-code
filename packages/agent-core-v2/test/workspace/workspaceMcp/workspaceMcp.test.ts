@@ -49,9 +49,11 @@ import { registerAgentIdentityStub } from '../../app/agentIdentity/stubs';
 import {
   createMemoryMcpOAuthStore,
   ManualMcpOAuthScheduler,
+  rootsStdioFixture,
   startInProcessHttpMcpServer,
   stdioFixture,
 } from '../../mcpCore/stubs';
+import { deriveMcpRoots } from '#/mcpCore/roots';
 
 function stdioServer(): McpServerConfig {
   return {
@@ -60,6 +62,45 @@ function stdioServer(): McpServerConfig {
     args: [stdioFixture],
     runtime_id: 'local',
   };
+}
+
+function rootsStdioServer(): McpServerConfig {
+  return {
+    transport: 'stdio',
+    command: process.execPath,
+    args: [rootsStdioFixture],
+    runtime_id: 'local',
+  };
+}
+
+interface RootsProbeResult {
+  readonly capabilities: { roots?: { listChanged?: boolean } } | undefined;
+  readonly roots: { readonly uri: string; readonly name?: string }[];
+  readonly listChangedCount: number;
+}
+
+type RootsProbeView = {
+  resolved(name: string): { client: { callTool(name: string, args: Record<string, unknown>): Promise<{ content: { type: string; text?: string }[] }> } } | undefined;
+};
+
+async function callGetRoots(view: RootsProbeView, name: string): Promise<RootsProbeResult> {
+  const client = view.resolved(name)?.client;
+  if (client === undefined) throw new Error(`expected a connected client for ${name}`);
+  const result = await client.callTool('get_roots', {});
+  const text = result.content[0]?.text ?? '';
+  return JSON.parse(text) as RootsProbeResult;
+}
+
+async function rmWithRetry(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 9) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 describe('WorkspaceMcpService', () => {
@@ -108,11 +149,11 @@ describe('WorkspaceMcpService', () => {
     };
   }
 
-  function createService(): IWorkspaceMcpService {
+  function createService(serviceCwd: string = cwd): IWorkspaceMcpService {
     const ix = createServices(disposables, {
       strict: true,
       additionalServices: (reg) => {
-        reg.definePartialInstance(IWorkspaceContext, { cwd, workspaceId: 'test-workspace' });
+        reg.definePartialInstance(IWorkspaceContext, { cwd: serviceCwd, workspaceId: 'test-workspace' });
         reg.defineInstance(IWorkspaceMcpConfigService, mcpConfigStub());
         reg.definePartialInstance(IMcpOAuthService, oauthService);
         reg.defineInstance(ILogService, stubLog());
@@ -120,7 +161,7 @@ describe('WorkspaceMcpService', () => {
         const runtime = Object.assign(
           new FakeRuntime(
             { workspaceId: 'test-workspace', runtimeId: 'local', generation: 'test-generation' },
-            { capabilities: ['process'] },
+            { capabilities: ['process'], pathClass: process.platform === 'win32' ? 'win32' : 'posix' },
           ),
           { process: new HostProcessService() },
         );
@@ -750,6 +791,83 @@ describe('WorkspaceMcpService', () => {
 
       expect(reconnectAndJoin).not.toHaveBeenCalled();
     });
+  });
+
+  describe('roots reporting per scope', () => {
+    it('two workspace services with different cwds each report only their own root', async () => {
+      const cwdA = mkdtempSync(join(tmpdir(), 'kimi-roots-scope-a-'));
+      const cwdB = mkdtempSync(join(tmpdir(), 'kimi-roots-scope-b-'));
+      current = { probe: rootsStdioServer() };
+      try {
+        const serviceA = createService(cwdA);
+        const managerA = serviceA.connectionManager();
+        await serviceA.ready;
+        const serviceB = createService(cwdB);
+        const managerB = serviceB.connectionManager();
+        await serviceB.ready;
+
+        expect(managerA.get('probe')?.status).toBe('connected');
+        expect(managerB.get('probe')?.status).toBe('connected');
+
+        const resultA = await callGetRoots(managerA, 'probe');
+        expect(resultA.capabilities?.roots?.listChanged).toBe(true);
+        expect(resultA.roots).toEqual(deriveMcpRoots([cwdA]));
+        expect(resultA.listChangedCount).toBe(0);
+
+        const resultB = await callGetRoots(managerB, 'probe');
+        expect(resultB.capabilities?.roots?.listChanged).toBe(true);
+        expect(resultB.roots).toEqual(deriveMcpRoots([cwdB]));
+        expect(resultB.listChangedCount).toBe(0);
+
+        await managerA.shutdown();
+        await managerB.shutdown();
+      } finally {
+        await rmWithRetry(cwdA);
+        await rmWithRetry(cwdB);
+      }
+    }, 30000);
+
+    it('session overlay reports only the session cwd as its root', async () => {
+      const sessionCwd = mkdtempSync(join(tmpdir(), 'kimi-roots-session-'));
+      const service = createService();
+      manager = service.connectionManager();
+      await service.ready;
+
+      const overlay = service.sessionOverlay({ probe: rootsStdioServer() }, { stdioCwd: sessionCwd });
+      try {
+        await overlay.handle.ready;
+        const view = overlay.handle.connectionManager;
+        expect(view.get('probe')?.status).toBe('connected');
+
+        const result = await callGetRoots(view, 'probe');
+        expect(result.capabilities?.roots?.listChanged).toBe(true);
+        expect(result.roots).toEqual(deriveMcpRoots([sessionCwd]));
+        expect(result.listChangedCount).toBe(0);
+
+        await overlay.shutdown();
+        expect(view.get('probe')).toBeUndefined();
+      } finally {
+        await rmWithRetry(sessionCwd);
+      }
+    }, 30000);
+
+    it('overlay shutdown closes the session-owned probe connections', async () => {
+      const sessionCwd = mkdtempSync(join(tmpdir(), 'kimi-roots-shutdown-'));
+      const service = createService();
+      manager = service.connectionManager();
+      await service.ready;
+
+      const overlay = service.sessionOverlay({ probe: rootsStdioServer() }, { stdioCwd: sessionCwd });
+      await overlay.handle.ready;
+      const view = overlay.handle.connectionManager;
+      expect(view.get('probe')?.status).toBe('connected');
+
+      await overlay.shutdown();
+      expect(view.get('probe')).toBeUndefined();
+      expect(manager?.get('probe')).toBeUndefined();
+
+      await rmWithRetry(sessionCwd);
+    }, 30000);
   });
 });
 

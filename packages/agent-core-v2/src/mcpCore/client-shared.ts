@@ -1,10 +1,31 @@
 import { getCoreVersion } from '#/_base/version';
-import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { ErrorCode, McpError, ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
+import { deriveMcpRoots } from './roots';
 import type { MCPClient, MCPToolDefinition, MCPToolResult } from './types';
 
 export const KIMI_MCP_CLIENT_NAME = 'kimi-code';
 export const KIMI_MCP_CLIENT_VERSION = getCoreVersion();
+
+export interface McpSdkClientOptions {
+  readonly clientName?: string;
+  readonly clientVersion?: string;
+  readonly rootDirectories?: readonly string[];
+}
+
+export function createMcpSdkClient(options: McpSdkClientOptions = {}): Client {
+  const client = new Client(
+    {
+      name: options.clientName ?? KIMI_MCP_CLIENT_NAME,
+      version: options.clientVersion ?? KIMI_MCP_CLIENT_VERSION,
+    },
+    { capabilities: { roots: { listChanged: true } } },
+  );
+  const roots = deriveMcpRoots(options.rootDirectories ?? []);
+  client.setRequestHandler(ListRootsRequestSchema, () => ({ roots }));
+  return client;
+}
 
 export interface UnexpectedCloseReason {
   readonly error?: Error;

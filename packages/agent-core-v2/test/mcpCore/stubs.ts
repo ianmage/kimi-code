@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { RootsListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
 import type { ToolDescription as KosongTool } from '#human/llm/message';
@@ -21,27 +23,25 @@ import type {
   ToolExecution,
 } from '#/tool/toolContract';
 
-export const fixturesDir = new URL('./fixtures/', import.meta.url).pathname;
-export const stdioFixture = new URL('./fixtures/mock-stdio-server.mjs', import.meta.url).pathname;
-export const cwdStdioFixture = new URL('./fixtures/cwd-stdio-server.mjs', import.meta.url).pathname;
-export const slowStdioFixture = new URL('./fixtures/slow-stdio-server.mjs', import.meta.url)
-  .pathname;
-export const slowToolStdioFixture = new URL(
-  './fixtures/slow-tool-stdio-server.mjs',
-  import.meta.url,
-).pathname;
-export const hangingListStdioFixture = new URL(
-  './fixtures/hanging-list-stdio-server.mjs',
-  import.meta.url,
-).pathname;
-export const crashAfterConnectFixture = new URL(
-  './fixtures/crash-after-connect-stdio-server.mjs',
-  import.meta.url,
-).pathname;
-export const stderrThenExitFixture = new URL(
-  './fixtures/stderr-then-exit-stdio-server.mjs',
-  import.meta.url,
-).pathname;
+export const fixturesDir = fileURLToPath(new URL('./fixtures/', import.meta.url));
+export const stdioFixture = fileURLToPath(new URL('./fixtures/mock-stdio-server.mjs', import.meta.url));
+export const cwdStdioFixture = fileURLToPath(new URL('./fixtures/cwd-stdio-server.mjs', import.meta.url));
+export const rootsStdioFixture = fileURLToPath(
+  new URL('./fixtures/roots-stdio-server.mjs', import.meta.url),
+);
+export const slowStdioFixture = fileURLToPath(new URL('./fixtures/slow-stdio-server.mjs', import.meta.url));
+export const slowToolStdioFixture = fileURLToPath(
+  new URL('./fixtures/slow-tool-stdio-server.mjs', import.meta.url),
+);
+export const hangingListStdioFixture = fileURLToPath(
+  new URL('./fixtures/hanging-list-stdio-server.mjs', import.meta.url),
+);
+export const crashAfterConnectFixture = fileURLToPath(
+  new URL('./fixtures/crash-after-connect-stdio-server.mjs', import.meta.url),
+);
+export const stderrThenExitFixture = fileURLToPath(
+  new URL('./fixtures/stderr-then-exit-stdio-server.mjs', import.meta.url),
+);
 
 export function createMemoryMcpOAuthStore(): McpOAuthStore {
   const data = new Map<string, unknown>();
@@ -153,8 +153,29 @@ export async function executeTool<Input>(
   return execution.execute(executionContext);
 }
 
+function registerRootsProbeTool(mcpServer: McpServer): void {
+  let listChangedCount = 0;
+  mcpServer.server.setNotificationHandler(RootsListChangedNotificationSchema, () => {
+    listChangedCount += 1;
+  });
+  mcpServer.registerTool(
+    'get_roots',
+    { description: 'Returns client roots capability, roots/list result, and listChanged count', inputSchema: {} },
+    async () => {
+      const capabilities = mcpServer.server.getClientCapabilities();
+      const roots = capabilities?.roots ? (await mcpServer.server.listRoots()).roots : [];
+      return {
+        content: [
+          { type: 'text', text: JSON.stringify({ capabilities, roots, listChangedCount }) },
+        ],
+      };
+    },
+  );
+}
+
 export async function startInProcessHttpMcpServer(opts?: {
   authToken?: string;
+  exposeRoots?: boolean;
 }): Promise<{ url: string; close: () => Promise<void> }> {
   const mcpServer = new McpServer({ name: 'mock-http', version: '0.0.1' });
   mcpServer.registerTool(
@@ -162,6 +183,7 @@ export async function startInProcessHttpMcpServer(opts?: {
     { description: 'Echoes text', inputSchema: { text: z.string() } },
     ({ text }) => ({ content: [{ type: 'text', text }] }),
   );
+  if (opts?.exposeRoots === true) registerRootsProbeTool(mcpServer);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
@@ -259,6 +281,7 @@ export async function startAnonymousDiscoveryHttpMcpServer(opts?: {
 
 export async function startInProcessSseMcpServer(opts?: {
   authToken?: string;
+  exposeRoots?: boolean;
 }): Promise<{ url: string; close: () => Promise<void> }> {
   const transports = new Map<string, SSEServerTransport>();
   const httpServer: Server = createServer((req, res) => {
@@ -279,6 +302,7 @@ export async function startInProcessSseMcpServer(opts?: {
         { description: 'Echoes text', inputSchema: { text: z.string() } },
         ({ text }) => ({ content: [{ type: 'text', text }] }),
       );
+      if (opts?.exposeRoots === true) registerRootsProbeTool(mcpServer);
       const transport = new SSEServerTransport('/messages', res);
       transports.set(transport.sessionId, transport);
       transport.onclose = () => {
