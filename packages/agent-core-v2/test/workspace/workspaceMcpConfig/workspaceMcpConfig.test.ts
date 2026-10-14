@@ -371,7 +371,6 @@ describe('WorkspaceMcpConfigService', () => {
           ready: Promise.resolve(),
           get: <T = unknown>(domain: string): T => (domain === MCP_SECTION ? undefined : undefined) as T,
         });
-        reg.defineInstance(IHostFsWatchService, fsWatchStub());
         reg.defineInstance(IHostFileSystem, new HostFileSystem());
         reg.definePartialInstance(IWorkspaceTrust, {
           ready: Promise.resolve(),
