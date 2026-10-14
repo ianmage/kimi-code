@@ -129,6 +129,7 @@ pattern = "mcp__filesystem__write_file"
 - 只接入可信来源的 server
 - 在审批请求中核查工具名与参数是否合理
 - 对高风险工具（写文件、执行命令等）维持手动审批，避免用 `mcp__*` 通配放行全部工具
+- Kimi Code CLI 会在握手时声明 MCP `roots` 能力（向 server 告知工作目录的标准方式），并把会话工作目录作为唯一 root 上报给每个 MCP server（含远端 http/sse server）。root 只是告知信息：不暴露文件内容，也不改变 Kimi Code CLI 自身工具的访问范围。遵循 roots 的 server（如 chrome-devtools-mcp）会因此允许在工作目录内写文件。
 
 ::: warning 注意
 在 [YOLO 模式](../guides/interaction.md#三种权限模式)下，MCP 工具调用会被自动批准。仅在完全信任所接入的 MCP server 时使用此模式。
