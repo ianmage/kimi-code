@@ -9,6 +9,7 @@ import type {
 } from '@moonshot-ai/kimi-code-sdk';
 
 import { ToolCallComponent } from '../components/messages/tool-call';
+import { REMOTE_APPROVED_LABEL } from '../../constant/app';
 import { ShellRunComponent } from '../components/messages/shell-run';
 import { ReplayTurnBoundaryComponent } from '../components/messages/user-message';
 import { currentTheme } from '../theme';
@@ -717,7 +718,9 @@ export class SessionReplayRenderer {
     const parts: string[] = [];
     switch (result.decision) {
       case 'approved':
-        parts.push(result.scope === 'session' ? 'Approved for session' : 'Approved');
+        if (result.scope === 'session') parts.push('Approved for session');
+        else if (result.selectedLabel === REMOTE_APPROVED_LABEL) parts.push(REMOTE_APPROVED_LABEL);
+        else parts.push('Approved');
         break;
       case 'rejected':
         parts.push('Rejected');

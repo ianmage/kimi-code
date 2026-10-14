@@ -1328,6 +1328,43 @@ describe('KimiTUI resume message replay', () => {
     expect(transcript).toContain('Plan mode: OFF');
   });
 
+  it('renders remote-approved replay notices with the remote attribution label', async () => {
+    const driver = await replayIntoDriver([
+      {
+        time: REPLAY_TIME,
+        type: 'approval_result',
+        record: {
+          turnId: 0,
+          toolCallId: 'call_remote',
+          action: 'run command',
+          toolName: 'Bash',
+          result: {
+            decision: 'approved',
+            selectedLabel: 'Approved (remote)',
+          },
+        },
+      },
+      {
+        time: REPLAY_TIME,
+        type: 'approval_result',
+        record: {
+          turnId: 0,
+          toolCallId: 'call_local',
+          action: 'edit file',
+          toolName: 'Edit',
+          result: {
+            decision: 'approved',
+          },
+        },
+      },
+    ]);
+
+    const transcript = driver.state.transcriptContainer.render(120).join('\n');
+
+    expect(transcript).toContain('Approved (remote): run command');
+    expect(transcript).toContain('Approved: edit file');
+  });
+
   it('keeps only the final approved plan card after rejected plan reviews', async () => {
     const driver = await replayIntoDriver([
       message('assistant', [], {

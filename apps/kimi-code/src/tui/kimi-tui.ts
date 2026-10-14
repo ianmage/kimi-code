@@ -36,6 +36,7 @@ import {
 import { resolve } from 'pathe';
 
 import type { CLIOptions } from '#/cli/options';
+import { REMOTE_APPROVED_LABEL } from '#/constant/app';
 import { MigrationScreenComponent, type MigrationScreenResult } from '#/migration/index';
 import { copyTextToClipboard } from '#/utils/clipboard/clipboard-text';
 import { appendInputHistory, loadInputHistory } from '#/utils/history/input-history';
@@ -2978,7 +2979,9 @@ export class KimiTUI {
     const parts: string[] = [];
     switch (response.decision) {
       case 'approved':
-        parts.push(response.scope === 'session' ? 'Approved for session' : 'Approved');
+        if (response.scope === 'session') parts.push('Approved for session');
+        else if (response.selectedLabel === REMOTE_APPROVED_LABEL) parts.push(REMOTE_APPROVED_LABEL);
+        else parts.push('Approved');
         break;
       case 'rejected':
         parts.push('Rejected');

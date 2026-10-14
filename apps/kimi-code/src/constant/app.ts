@@ -70,6 +70,18 @@ export const KIMI_CODE_BANNER_STATE_FILE_NAME = 'state.json';
 export const KIMI_CODE_SURVEY_STATE_FILE_NAME = 'feedback-survey-state.json';
 export const KIMI_CODE_RECOMMENDED_EFFORT_STATE_FILE_NAME = 'recommended-effort-state.json';
 
+// Remote pre-approval callback: env var carrying the user callback module
+// path (absolute or cwd-relative). Unset/empty disables remote consultation
+// and every approval falls back to the local panel.
+export const KIMI_CODE_PRE_APPROVAL_CALLBACK_ENV = 'KIMI_CODE_PRE_APPROVAL_CALLBACK';
+// Per-consult timeout for the remote pre-approval callback, in milliseconds.
+export const KIMI_CODE_PRE_APPROVAL_TIMEOUT_MS_ENV = 'KIMI_CODE_PRE_APPROVAL_TIMEOUT_MS';
+// Fallback when the timeout env var is missing or not a positive integer.
+export const REMOTE_PRE_APPROVAL_DEFAULT_TIMEOUT_MS = 120_000;
+// Transcript attribution label marking an approval granted by the remote
+// callback, as opposed to a local panel choice.
+export const REMOTE_APPROVED_LABEL = 'Approved (remote)';
+
 // Managed Kimi auth provider key shared with OAuth/SDK config.
 export const DEFAULT_OAUTH_PROVIDER_NAME = 'managed:kimi-code';
 
