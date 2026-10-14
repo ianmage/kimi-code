@@ -7,15 +7,28 @@ import { describe, expect, it } from 'vitest';
 import { Error2 } from '#/errors';
 import { mergeStdioEnv, StdioMcpClient, type StdioMcpClientOptions } from '#/mcpCore/client-stdio';
 import type { McpServerStdioConfig } from '#/mcpCore/config-schema';
+import { deriveMcpRoots } from '#/mcpCore/roots';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
 import { FakeRuntime } from '#/runtime/fakeRuntime';
 
 import {
   crashAfterConnectFixture,
   cwdStdioFixture,
+  rootsStdioFixture,
   stderrThenExitFixture,
   stdioFixture,
 } from './stubs';
+
+interface RootsProbeResult {
+  readonly capabilities: { roots?: { listChanged?: boolean } } | undefined;
+  readonly roots: { readonly uri: string; readonly name?: string }[];
+  readonly listChangedCount: number;
+}
+
+function parseRootsProbe(result: { content: { type: string; text?: string }[] }): RootsProbeResult {
+  const text = result.content[0]?.text ?? '';
+  return JSON.parse(text) as RootsProbeResult;
+}
 
 function createClient(
   config: McpServerStdioConfig,
@@ -24,7 +37,7 @@ function createClient(
   const runtime = Object.assign(
     new FakeRuntime(
       { workspaceId: 'workspace', runtimeId: 'local', generation: 'test' },
-      { capabilities: ['process'] },
+      { capabilities: ['process'], pathClass: process.platform === 'win32' ? 'win32' : 'posix' },
     ),
     { process: new HostProcessService() },
   );
@@ -368,6 +381,47 @@ describe('StdioMcpClient', () => {
     await client.close();
     await new Promise((r) => setTimeout(r, 100));
     expect(closes).toEqual([]);
+  }, 15000);
+
+  it('declares roots capability and answers roots/list with the derived snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-mcp-roots-'));
+    const client = createClient(
+      {
+        transport: 'stdio',
+        command: process.execPath,
+        args: [rootsStdioFixture],
+      },
+      { rootDirectories: [dir] },
+    );
+    try {
+      await client.connect();
+      const result = parseRootsProbe(await client.callTool('get_roots', {}));
+      expect(result.capabilities?.roots?.listChanged).toBe(true);
+      expect(result.roots).toEqual(deriveMcpRoots([dir]));
+      expect(result.listChangedCount).toBe(0);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  it('declares roots capability with an empty snapshot when no rootDirectories is given', async () => {
+    const client = createClient({
+      transport: 'stdio',
+      command: process.execPath,
+      args: [rootsStdioFixture],
+    });
+    try {
+      await client.connect();
+      const tools = await client.listTools();
+      expect(tools.map((t) => t.name)).toContain('get_roots');
+      const result = parseRootsProbe(await client.callTool('get_roots', {}));
+      expect(result.capabilities?.roots?.listChanged).toBe(true);
+      expect(result.roots).toEqual([]);
+      expect(result.listChangedCount).toBe(0);
+    } finally {
+      await client.close();
+    }
   }, 15000);
 });
 

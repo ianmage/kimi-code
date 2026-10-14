@@ -1,9 +1,25 @@
+import { mkdtempSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'pathe';
 import { SseError } from '@modelcontextprotocol/sdk/client/sse.js';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { SseMcpClient, isTerminalSseTransportError } from '#/mcpCore/client-sse';
+import { deriveMcpRoots } from '#/mcpCore/roots';
 
 import { startInProcessSseMcpServer } from './stubs';
+
+interface RootsProbeResult {
+  readonly capabilities: { roots?: { listChanged?: boolean } } | undefined;
+  readonly roots: { readonly uri: string; readonly name?: string }[];
+  readonly listChangedCount: number;
+}
+
+function parseRootsProbe(result: { content: { type: string; text?: string }[] }): RootsProbeResult {
+  const text = result.content[0]?.text ?? '';
+  return JSON.parse(text) as RootsProbeResult;
+}
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -48,6 +64,42 @@ describe('SseMcpClient', () => {
       await client.connect();
       const result = await client.callTool('echo', { text: 'with auth' });
       expect(result.content).toEqual([{ type: 'text', text: 'with auth' }]);
+    } finally {
+      await client.close();
+    }
+  }, 15000);
+
+  it('declares roots capability and answers roots/list with the derived snapshot', async () => {
+    const server = await startInProcessSseMcpServer({ exposeRoots: true });
+    cleanups.push(server.close);
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-mcp-roots-'));
+
+    const client = new SseMcpClient({ transport: 'sse', url: server.url }, { rootDirectories: [dir] });
+    try {
+      await client.connect();
+      const result = parseRootsProbe(await client.callTool('get_roots', {}));
+      expect(result.capabilities?.roots?.listChanged).toBe(true);
+      expect(result.roots).toEqual(deriveMcpRoots([dir]));
+      expect(result.listChangedCount).toBe(0);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  it('declares roots capability with an empty snapshot when no rootDirectories is given', async () => {
+    const server = await startInProcessSseMcpServer({ exposeRoots: true });
+    cleanups.push(server.close);
+
+    const client = new SseMcpClient({ transport: 'sse', url: server.url });
+    try {
+      await client.connect();
+      const tools = await client.listTools();
+      expect(tools.map((t) => t.name)).toContain('get_roots');
+      const result = parseRootsProbe(await client.callTool('get_roots', {}));
+      expect(result.capabilities?.roots?.listChanged).toBe(true);
+      expect(result.roots).toEqual([]);
+      expect(result.listChangedCount).toBe(0);
     } finally {
       await client.close();
     }

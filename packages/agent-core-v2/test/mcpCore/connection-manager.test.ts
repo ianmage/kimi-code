@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Error2 } from '#/errors';
 import { KIMI_MCP_CLIENT_NAME } from '#/mcpCore/client-shared';
+import { deriveMcpRoots } from '#/mcpCore/roots';
 import { McpConnectionManager, type McpConnectionManagerOptions, type McpServerEntry } from '#/mcpCore/connection-manager';
 import { McpOAuthService } from '#/mcpCore/oauth/service';
 import type { StoredMcpOAuthTokens } from '#/mcpCore/oauth/provider';
@@ -33,6 +34,7 @@ const testProcess = new HostProcessService();
 const testRuntime = Object.assign(
   new FakeRuntime({ ...testRuntimeBinding, generation: 'test-generation' }, {
     capabilities: ['process'],
+    pathClass: process.platform === 'win32' ? 'win32' : 'posix',
   }),
   { process: testProcess },
 );
@@ -62,9 +64,12 @@ import {
   createMemoryMcpOAuthStore,
   cwdStdioFixture,
   hangingListStdioFixture,
+  rootsStdioFixture,
   slowStdioFixture,
   slowToolStdioFixture,
   startAnonymousDiscoveryHttpMcpServer,
+  startInProcessHttpMcpServer,
+  startInProcessSseMcpServer,
   stderrThenExitFixture,
   stdioFixture,
 } from './stubs';
@@ -75,6 +80,23 @@ function stdioConfig(args: string[] = [stdioFixture]) {
     command: process.execPath,
     args,
   };
+}
+
+interface RootsProbeResult {
+  readonly capabilities: { roots?: { listChanged?: boolean } } | undefined;
+  readonly roots: { readonly uri: string; readonly name?: string }[];
+  readonly listChangedCount: number;
+}
+
+async function callGetRoots(
+  cm: McpConnectionManager,
+  name: string,
+): Promise<RootsProbeResult> {
+  const client = cm.resolved(name)?.client;
+  if (client === undefined) throw new Error(`expected a connected client for ${name}`);
+  const result = await client.callTool('get_roots', {});
+  const text = (result.content[0] as { type: 'text'; text: string }).text;
+  return JSON.parse(text) as RootsProbeResult;
 }
 
 describe('McpConnectionManager', () => {
@@ -1114,4 +1136,96 @@ describe('McpConnectionManager', () => {
       await server.close();
     }
   }, 15000);
+
+  it('reports roots from stdioCwd to stdio and http probes on the same manager', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-mcp-manager-roots-'));
+    const httpServer = await startInProcessHttpMcpServer({ exposeRoots: true });
+    const cm = createManager({ stdioCwd: dir });
+    try {
+      await cm.connectAll({
+        stdioProbe: stdioConfig([rootsStdioFixture]),
+        httpProbe: { transport: 'http', url: httpServer.url, startupTimeoutMs: 10_000 },
+      });
+      expect(cm.get('stdioProbe')?.status).toBe('connected');
+      expect(cm.get('httpProbe')?.status).toBe('connected');
+
+      const stdioResult = await callGetRoots(cm, 'stdioProbe');
+      expect(stdioResult.capabilities?.roots?.listChanged).toBe(true);
+      expect(stdioResult.roots).toEqual(deriveMcpRoots([dir]));
+      expect(stdioResult.listChangedCount).toBe(0);
+
+      const httpResult = await callGetRoots(cm, 'httpProbe');
+      expect(httpResult.capabilities?.roots?.listChanged).toBe(true);
+      expect(httpResult.roots).toEqual(deriveMcpRoots([dir]));
+      expect(httpResult.listChangedCount).toBe(0);
+    } finally {
+      await cm.shutdown();
+      await httpServer.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  it('reports empty roots while staying connected when stdioCwd is unset', async () => {
+    const httpServer = await startInProcessHttpMcpServer({ exposeRoots: true });
+    const cm = createManager({ stdioCwd: undefined });
+    try {
+      await cm.connectAll({
+        probe: { transport: 'http', url: httpServer.url, startupTimeoutMs: 10_000 },
+      });
+      expect(cm.get('probe')?.status).toBe('connected');
+      const result = await callGetRoots(cm, 'probe');
+      expect(result.capabilities?.roots?.listChanged).toBe(true);
+      expect(result.roots).toEqual([]);
+      expect(result.listChangedCount).toBe(0);
+    } finally {
+      await cm.shutdown();
+      await httpServer.close();
+    }
+  }, 15000);
+
+  it('derives roots from stdioCwd even when the stdio server config.cwd differs', async () => {
+    const stdioCwd = mkdtempSync(join(tmpdir(), 'kimi-mcp-manager-bound-'));
+    const serverCwd = mkdtempSync(join(tmpdir(), 'kimi-mcp-manager-server-'));
+    const cm = createManager({ stdioCwd });
+    try {
+      await cm.connectAll({
+        probe: { ...stdioConfig([rootsStdioFixture]), cwd: serverCwd },
+      });
+      expect(cm.get('probe')?.status).toBe('connected');
+      const result = await callGetRoots(cm, 'probe');
+      expect(result.roots).toEqual(deriveMcpRoots([stdioCwd]));
+      expect(result.listChangedCount).toBe(0);
+    } finally {
+      await cm.shutdown();
+      await rm(stdioCwd, { recursive: true, force: true });
+      await rm(serverCwd, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  it('reports the same stdioCwd roots over stdio, http, and sse probes on one manager', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-mcp-manager-xport-'));
+    const httpServer = await startInProcessHttpMcpServer({ exposeRoots: true });
+    const sseServer = await startInProcessSseMcpServer({ exposeRoots: true });
+    const cm = createManager({ stdioCwd: dir });
+    try {
+      await cm.connectAll({
+        stdioProbe: stdioConfig([rootsStdioFixture]),
+        httpProbe: { transport: 'http', url: httpServer.url, startupTimeoutMs: 10_000 },
+        sseProbe: { transport: 'sse', url: sseServer.url, startupTimeoutMs: 10_000 },
+      });
+      const expected = deriveMcpRoots([dir]);
+      for (const name of ['stdioProbe', 'httpProbe', 'sseProbe']) {
+        expect(cm.get(name)?.status).toBe('connected');
+        const result = await callGetRoots(cm, name);
+        expect(result.capabilities?.roots?.listChanged).toBe(true);
+        expect(result.roots).toEqual(expected);
+        expect(result.listChangedCount).toBe(0);
+      }
+    } finally {
+      await cm.shutdown();
+      await httpServer.close();
+      await sseServer.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30000);
 });
