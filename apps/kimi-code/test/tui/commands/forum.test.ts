@@ -433,6 +433,7 @@ describe('KimiTUI — ensureForumLink / buildForumDescriptor wiring', () => {
       setQuestionHandler: vi.fn(),
       onEvent: vi.fn(() => () => {}),
       close: vi.fn(async () => {}),
+      getResumeState: vi.fn(() => undefined),
     } as never;
     await tui.setSession(session);
     expect(tui.forumLink).toBeUndefined();
