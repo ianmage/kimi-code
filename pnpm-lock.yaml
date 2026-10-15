@@ -85,9 +85,6 @@ importers:
       '@moonshot-ai/agent-core-v2':
         specifier: workspace:^
         version: link:../../packages/agent-core-v2
-      '@moonshot-ai/forum-link':
-        specifier: workspace:^
-        version: link:../../packages/forum-link
       '@moonshot-ai/kap-server':
         specifier: workspace:^
         version: link:../../packages/kap-server
@@ -632,12 +629,6 @@ importers:
       tsx:
         specifier: ^4.21.0
         version: 4.21.0
-
-  packages/forum-link:
-    dependencies:
-      zod:
-        specifier: 'catalog:'
-        version: 4.3.6
 
   packages/kap-server:
     dependencies:

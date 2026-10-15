@@ -7,7 +7,6 @@ import type { ColorToken, ThemeName } from '#/tui/theme';
 import { LLM_NOT_SET_MESSAGE } from '../constant/kimi-tui';
 import type { AuthFlowController } from '../controllers/auth-flow';
 import type { BtwPanelController } from '../controllers/btw-panel';
-import type { ForumLinkController } from '../controllers/forum-link';
 import type { StreamingUIController } from '../controllers/streaming-ui';
 import type { TasksBrowserController } from '../controllers/tasks-browser';
 import { tryHandleDanceCommand } from '../easter-eggs/dance';
@@ -41,7 +40,6 @@ import {
 import { handleGoalCommand } from './goal';
 import { handleFeedbackCommand, showMcpServers, showStatusReport, showUsage } from './info';
 import { handleAddDirCommand } from './add-dir';
-import { handleForumCommand } from './forum';
 import { parseSlashInput } from './parse';
 import { handlePluginsCommand } from './plugins';
 import { handleProviderCommand } from './provider';
@@ -213,14 +211,6 @@ export interface SlashCommandHost {
   readonly btwPanelController: BtwPanelController;
   readonly tasksBrowserController: TasksBrowserController;
   readonly authFlow: AuthFlowController;
-  /**
-   * The forum-link controller, when it has already been created; undefined
-   * until the first `/forum` publish. Read-only observation face for the
-   * command layer.
-   */
-  readonly forumLink: ForumLinkController | undefined;
-  /** Lazily create the forum-link controller with the full host wiring. */
-  ensureForumLink(): ForumLinkController;
 }
 
 // ---------------------------------------------------------------------------
@@ -529,9 +519,6 @@ async function handleBuiltInSlashCommand(
       return;
     case 'remote-control':
       await handleRemoteControlCommand(host);
-      return;
-    case 'forum':
-      await handleForumCommand(host, args);
       return;
     default:
       host.showError(`Unknown slash command: /${String(name)}`);

@@ -427,7 +427,7 @@ function showGoalStartPermissionPrompt(
   );
 }
 
-export async function startGoalWithPermission(
+async function startGoalWithPermission(
   host: GoalCommandHost,
   parsed: Extract<ParsedGoalCommand, { kind: 'create' }>,
   choice: GoalStartPermissionChoice,

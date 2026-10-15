@@ -33,10 +33,6 @@ const TOWER_ARG_COMPLETIONS: readonly ArgCompletionSpec[] = [
   { value: 'off', description: 'Turn tower mode off' },
 ];
 
-const FORUM_ARG_COMPLETIONS: readonly ArgCompletionSpec[] = [
-  { value: 'stop', description: 'Unpublish from the Forum Link hub' },
-];
-
 const ADD_DIR_ARG_COMPLETIONS: readonly ArgCompletionSpec[] = [
   { value: 'list', description: 'Show configured additional workspace directories' },
 ];
@@ -63,11 +59,6 @@ export function swarmArgumentCompletions(argumentPrefix: string): AutocompleteIt
 /** Argument autocompletion for the `/tower` command (subcommands). */
 export function towerArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
   return completeLeadingArg(TOWER_ARG_COMPLETIONS, argumentPrefix);
-}
-
-/** Argument autocompletion for the `/forum` command (subcommands). */
-export function forumArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
-  return completeLeadingArg(FORUM_ARG_COMPLETIONS, argumentPrefix);
 }
 
 /** Argument autocompletion for the `/add-dir` command. */
@@ -450,15 +441,6 @@ export const BUILTIN_SLASH_COMMANDS = [
     aliases: ['rc'],
     description: 'Open the current session through Kimi Remote Control',
     priority: 40,
-    availability: 'always',
-  },
-  {
-    name: 'forum',
-    aliases: [],
-    description: 'Publish this session to the Forum Link hub, or stop to unpublish it',
-    priority: 40,
-    argumentHint: '[stop]',
-    completeArgs: forumArgumentCompletions,
     availability: 'always',
   },
   {
