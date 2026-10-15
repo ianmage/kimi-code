@@ -66,7 +66,6 @@
         ./packages/agent-core-v2
         ./packages/forum-link
         ./packages/kap-server
-        ./packages/kaos
         ./packages/klient
         ./packages/kosong
         ./packages/migration-legacy
@@ -92,7 +91,6 @@
         "@moonshot-ai/agent-core-v2"
         "@moonshot-ai/forum-link"
         "@moonshot-ai/kap-server"
-        "@moonshot-ai/kaos"
         "@moonshot-ai/kosong"
         "@moonshot-ai/migration-legacy"
         "@moonshot-ai/minidb"
@@ -160,7 +158,7 @@
               inherit (finalAttrs) pname version src pnpmWorkspaces;
               inherit pnpm;
               fetcherVersion = 3;
-              hash = "sha256-xrn34bQ76s+ouOZPHZ4TBkpTHxG7gZejmx8RqSii2uA=";
+              hash = "sha256-XLjspHl3+xErXYH5fMW8J8fDB5m1ZF8MkATKh11odo0=";
             };
 
             nativeBuildInputs = [

@@ -122,6 +122,7 @@ export interface SessionEventHost {
   updateTerminalTitle(): void;
   sendQueuedMessage(session: Session, item: QueuedMessage): void;
   shiftQueuedMessage(): QueuedMessage | undefined;
+  steerQueuedMessagesIntoRunningTurn(): void;
   handleTurnStarted?(event: TurnStartedEvent): void;
   handleTurnEnded?(event: TurnEndedEvent): void;
   readonly btwPanelController: BtwPanelController;
@@ -161,7 +162,7 @@ export class SessionEventHandler {
   backgroundTasks: Map<string, BackgroundTaskInfo> = new Map();
   backgroundTaskTranscriptedTerminal: Set<string> = new Set();
 
-  renderedSkillActivationIds: Set<string> = new Set();
+  seenSkillActivationIds: Set<string> = new Set();
   renderedPluginCommandActivationIds: Set<string> = new Set();
   renderedMcpServerStatusKeys: Map<string, string> = new Map();
   mcpServerStatusSpinners: Map<string, MoonLoader> = new Map();
@@ -182,7 +183,7 @@ export class SessionEventHandler {
     this.backgroundTaskTranscriptedTerminal.clear();
     this.subAgentEventHandler.resetRuntimeState();
     this.notifications.reset();
-    this.renderedSkillActivationIds.clear();
+    this.seenSkillActivationIds.clear();
     this.renderedPluginCommandActivationIds.clear();
     this.renderedMcpServerStatusKeys.clear();
     this.mcpServers.clear();
@@ -670,6 +671,11 @@ export class SessionEventHandler {
   }
 
   private handleToolProgress(event: ToolProgressEvent): void {
+    // Input queued before the wait began would otherwise sit until the wait
+    // returns; steering it now ends the wait so the model reads it first.
+    if (this.host.streamingUI.markWaitForRunning(event.toolCallId)) {
+      this.host.steerQueuedMessagesIntoRunningTurn();
+    }
     const text = event.update.text;
     if (text === undefined || text.length === 0) return;
     const tc = this.host.streamingUI.getToolComponent(event.toolCallId);
@@ -724,6 +730,10 @@ export class SessionEventHandler {
       event.swarmMode === false &&
       this.host.state.appState.swarmMode &&
       this.host.state.swarmModeEntry === 'task';
+    const shouldRenderTowerGoalExit =
+      event.towerMode === false &&
+      this.host.state.appState.towerMode &&
+      event.towerExitReason === 'mode-mutex';
     const patch: Partial<AppState> = {};
     if (event.contextTokens !== undefined) patch.contextTokens = event.contextTokens;
     if (event.maxContextTokens !== undefined) patch.maxContextTokens = event.maxContextTokens;
@@ -756,6 +766,12 @@ export class SessionEventHandler {
       if (shouldRenderSwarmEnded) {
         this.renderSwarmModeMarker('ended');
       }
+    }
+    if (shouldRenderTowerGoalExit) {
+      this.host.state.transcriptContainer.addChild(
+        new StatusMessageComponent('Tower mode ended — a goal was activated'),
+      );
+      this.host.state.ui.requestRender();
     }
   }
 
@@ -1087,8 +1103,9 @@ export class SessionEventHandler {
   }
 
   private handleSkillActivated(event: SkillActivatedEvent): void {
-    if (this.renderedSkillActivationIds.has(event.activationId)) return;
-    this.renderedSkillActivationIds.add(event.activationId);
+    if (this.seenSkillActivationIds.has(event.activationId)) return;
+    this.seenSkillActivationIds.add(event.activationId);
+    if (event.trigger === 'user-slash') return;
     this.host.appendTranscriptEntry({
       id: nextTranscriptId(),
       kind: 'skill_activation',

@@ -65,6 +65,7 @@ import {
   computeFuzzyScore,
   computeMatchPositions,
   evaluateSuggestCandidate,
+  globCanMatchBelow,
   matchesAnyGlob,
   type RgJsonRecord,
   rgPath,
@@ -77,6 +78,8 @@ import {
 } from './internal/fsSearch';
 
 const SEARCH_HARD_CAP = 500;
+const PROBE_MAX_DEPTH = 6;
+const PROBE_MAX_ENTRIES = 500;
 const GREP_TIMEOUT_MS = 30_000;
 const SUGGEST_TIMEOUT_MS = 10_000;
 const SUGGEST_WALK_ABORTED = new Error('suggest walk aborted');
@@ -169,6 +172,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
 
     const items: FsEntry[] = [];
     const childrenByPath: Record<string, FsEntry[]> = {};
+    const probeBudget = { visited: 0 };
     let truncated = false;
 
     interface QueueEntry {
@@ -190,7 +194,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       const entry = queue.shift()!;
       let entries: readonly HostDirEntry[];
       try {
-        entries = await this.hostFs.readdir(this.absOf(entry.relPath));
+entries = await this.hostFs.readdir(this.absOf(entry.relPath));
       } catch (error) {
         if (entry.relPath === (rel === '.' ? '' : rel)) {
           throw mapFsError(error, req.path);
@@ -203,14 +207,23 @@ export class WorkspaceFsService implements IWorkspaceFsService {
         const name = childEntry.name;
         if (!req.show_hidden && isHidden(name)) continue;
         const childRel = entry.relPath === '' ? name : `${entry.relPath}/${name}`;
+        let ancestorOfAllowed = false;
         if (gitignore && (gitignore.ignores(childRel) || gitignore.ignores(`${childRel}/`))) {
-          continue;
+          if (req.allow_ignored_globs === undefined) continue;
+          if (!matchesAnyGlob(childRel, req.allow_ignored_globs)) {
+            if (!globCanMatchBelow(childRel, req.allow_ignored_globs)) continue;
+            ancestorOfAllowed = true;
+          }
         }
         if (req.exclude_globs && matchesAnyGlob(childRel, req.exclude_globs)) continue;
-        const childAbs = this.absOf(childRel);
+const childAbs = this.absOf(childRel);
         if (projectIgnore.hidden(childAbs, childEntry.isDirectory)) continue;
         const st = await this.hostFs.lstat(childAbs).catch(() => undefined);
-        if (st === undefined) continue;
+        if (st === undefined || (ancestorOfAllowed && !st.isDirectory)) continue;
+        if (
+          ancestorOfAllowed &&
+          !(await this.hasAllowedDescendant(childRel, req.allow_ignored_globs!, req.exclude_globs, req.show_hidden, probeBudget))
+        ) continue;
         visible.push({ name, relPath: childRel, abs: childAbs, stat: st });
       }
 
@@ -247,6 +260,38 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       response.children_by_path = childrenByPath;
     }
     return response;
+  }
+
+  private async hasAllowedDescendant(
+    relDir: string,
+    globs: readonly string[],
+    excludeGlobs: readonly string[] | undefined,
+    showHidden: boolean,
+    budget: { visited: number },
+  ): Promise<boolean> {
+    const walk = async (rel: string, depth: number): Promise<boolean> => {
+      if (depth > PROBE_MAX_DEPTH || budget.visited >= PROBE_MAX_ENTRIES) return true;
+      let names: readonly string[];
+      try {
+        names = (await this.hostFs.readdir(this.absOf(rel))).map((e) => e.name);
+      } catch {
+        return false;
+      }
+      for (const name of names) {
+        if (budget.visited >= PROBE_MAX_ENTRIES) return true;
+        budget.visited += 1;
+        if (!showHidden && isHidden(name)) continue;
+        const childRel = `${rel}/${name}`;
+        if (excludeGlobs !== undefined && matchesAnyGlob(childRel, excludeGlobs)) continue;
+        if (matchesAnyGlob(childRel, globs)) return true;
+        const st = await this.hostFs.lstat(this.absOf(childRel)).catch(() => undefined);
+        if (st?.isDirectory === true && globCanMatchBelow(childRel, globs)) {
+          if (await walk(childRel, depth + 1)) return true;
+        }
+      }
+      return false;
+    };
+    return walk(relDir, 1);
   }
 
   async read(req: FsReadRequest): Promise<FsReadResponse> {
@@ -571,7 +616,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       }
       if (resolution !== null) {
         try {
-          return await this.suggestWithRg(query, cap, controller.signal, resolution.path, roots, projectIgnore);
+return await this.suggestWithRg(query, cap, controller.signal, resolution.path, roots, projectIgnore);
         } catch (error) {
           if (controller.signal.aborted) throw error;
           this.telemetry.track2('fs_suggest_node_fallback', { reason: 'rg_error' });
