@@ -14,6 +14,7 @@ import { kimiConnection, kimiOpenAITrait } from '#/llm-kimi/trait';
 import { createGoogleGenAIRequester } from '#/llm/requester/bases/google-genai/requester';
 import { convertOpenAIError } from '#/llm/requester/bases/openai/format';
 import { createOpenAIRequester } from '#/llm/requester/bases/openai/requester';
+import { toLlmStatusErrorMessage } from '#/llm/errors';
 import type { LlmRequester, LlmRequestEvent } from '#/llm/requester/requester';
 
 const model: LlmModel = {
@@ -102,6 +103,34 @@ describe('convertOpenAIError', () => {
     expect(convertOpenAIError(overloaded)).toMatchObject({ kind: 'overloaded', statusCode: 529 });
     const generic = new RawOpenAISDKAPIError(500, {}, 'server error', new Headers());
     expect(convertOpenAIError(generic)).toMatchObject({ kind: 'status', statusCode: 500 });
+  });
+
+  it('maps a 413 size rejection to request_too_large', () => {
+    const raw = new RawOpenAISDKAPIError(
+      413,
+      { message: 'Failed to buffer the request body: length limit exceeded' },
+      undefined,
+      new Headers(),
+    );
+    expect(convertOpenAIError(raw)).toMatchObject({
+      kind: 'request_too_large',
+      statusCode: 413,
+    });
+  });
+
+  it('classifies 413 size and token-overflow wording mutually exclusively', () => {
+    expect(
+      toLlmStatusErrorMessage({
+        statusCode: 413,
+        message: 'Failed to buffer the request body: length limit exceeded',
+      }),
+    ).toMatchObject({ kind: 'request_too_large', statusCode: 413 });
+    expect(
+      toLlmStatusErrorMessage({
+        statusCode: 413,
+        message: 'prompt is too long: 210000 tokens > 200000 maximum',
+      }),
+    ).toMatchObject({ kind: 'context_overflow', statusCode: 413 });
   });
 
   it('maps 400 request-structure rejections to request_structure', () => {

@@ -23,6 +23,7 @@ import {
 } from '#/agent/scopeContext/scopeContext';
 import { IAgentStateService } from '#/agent/state/agentState';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
+import { ILogService } from '#/_base/log/log';
 import { stripDynamicToolContext } from '#/agent/toolSelect/dynamicTools';
 import { IAgentToolSelectService } from '#/agent/toolSelect/toolSelect';
 import { IAgentTodoService } from '#/features/todo/todoService';
@@ -156,6 +157,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
     @IAgentLoopService private readonly loopService: IAgentLoopService,
     @IAgentStateService private readonly states: IAgentStateService,
     @IWireService private readonly wire: IWireService,
+    @ILogService private readonly log: ILogService,
   ) {
     super();
     this.states.contributeState(fullCompactionKey);
@@ -305,16 +307,23 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
   private shouldRecoverFromContextOverflow(
     error: unknown,
     estimatedRequestTokens = this.currentRequestTokens(),
+    site: 'turn' | 'compaction' = 'turn',
   ): boolean {
     if (isCodedError(error) && error.code === ErrorCodes.CONTEXT_OVERFLOW) return true;
     const statusError = findAPIStatusError(error);
     if (statusError instanceof APIContextOverflowError) return true;
     if (statusError === undefined || statusError.statusCode !== 413) return false;
     const effectiveMax = this.getEffectiveMaxContextTokens();
-    return (
+    const recover =
       effectiveMax > 0 &&
-      estimatedRequestTokens >= effectiveMax * OVERFLOW_STATUS_RECOVERY_RATIO
-    );
+      estimatedRequestTokens >= effectiveMax * OVERFLOW_STATUS_RECOVERY_RATIO;
+    this.log.warn('request too large; deciding whether to compact', {
+      site,
+      estimatedRequestTokens,
+      effectiveMaxContextTokens: effectiveMax,
+      recover,
+    });
+    return recover;
   }
 
   private observeContextOverflow(estimatedRequestTokens: number): void {
@@ -690,6 +699,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
           const isContextOverflow = this.shouldRecoverFromContextOverflow(
             error,
             estimatedCompactionRequestTokens,
+            'compaction',
           );
           if (isContextOverflow) {
             this.observeContextOverflow(estimatedCompactionRequestTokens);

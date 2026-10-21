@@ -26,6 +26,8 @@ import {
   isRetryableGenerateError,
 } from '#/llm-adapter/contract/errors';
 import type { Message } from '#/llm-adapter/contract/message';
+import type { ContextMessage } from '#/agent/contextMemory/types';
+import { isDataUrl } from '#/agent/media/image-format-policy';
 import { type ThinkingEffort } from '#human/llm/thinking';
 import type { LlmCredentialProvider } from '#human/llm/requester/requester';
 import { isToolCall, type StreamedMessagePart, type ToolDescription as Tool } from '#human/llm/message';
@@ -358,14 +360,16 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
         : this.isRecoveryTurn(this.mediaDegradedTurns, request.source)
           ? { media: 'degraded' }
           : undefined;
-    const captureMediaStripPolicy = (): { readonly strip: MediaStripSnapshot } => {
-      const snapshot = this.projector.captureMediaStripSnapshot(shaped);
-      this.markMediaStrippedRecoveryTurn(snapshot, request.source);
-      return { strip: snapshot };
-    };
+    const captureMediaStripPolicy = (): { readonly strip: MediaStripSnapshot } => ({
+      strip: this.projector.captureMediaStripSnapshot(shaped),
+    });
     let previousMediaCount: number | undefined;
     let previousMediaPolicy: ProjectionPolicy['media'];
     let mediaPaths: ReadonlyMap<string, string> | undefined;
+    const ensureMediaPaths = async (): Promise<ReadonlyMap<string, string>> => {
+      mediaPaths ??= await this.mediaResolver.displayPaths(shaped);
+      return mediaPaths;
+    };
     const run = async (
       policy: ProjectionPolicy | undefined,
     ): Promise<AgentLLMRequestFinish> => {
@@ -373,9 +377,7 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       const projection = projectionNameOf(policy);
       const fields =
         projection === undefined ? request.logFields : { ...request.logFields, projection };
-      if (policy?.media !== undefined) {
-        mediaPaths ??= await this.mediaResolver.displayPaths(shaped);
-      }
+      if (policy?.media !== undefined) await ensureMediaPaths();
       const projected = this.projector.project(shaped, policy, mediaPaths);
       const currentMediaCount = mediaPartCount(projected);
       const mediaPolicyChanged =
@@ -483,6 +485,15 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
         }
       } catch (error) {
         toolCallIds.rollback();
+        if (apiStatusCode(error) === 413) {
+          this.log.warn('provider rejected the request as too large', {
+            ...request.logFields,
+            model: request.model.name,
+            requestBytes: Buffer.byteLength(JSON.stringify(input), 'utf8'),
+            mediaBytes: mediaBytes(input.messages),
+            projection: projectionNameOf(policy) ?? 'normal',
+          });
+        }
         throw error;
       }
 
@@ -525,11 +536,14 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       try {
         return await run(policy);
       } catch (error) {
-        const nextPolicy = this.nextProjectionPolicyForError(
+        const nextPolicy = await this.nextProjectionPolicyForError(
           error,
           policy,
           request,
           signal,
+          shaped,
+          previousMediaCount,
+          ensureMediaPaths,
           captureMediaStripPolicy,
         );
         if (nextPolicy !== undefined) {
@@ -567,16 +581,33 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     return parseBooleanEnv(this.bootstrap.getEnv(KIMI_CODE_INFINITE_RETRY_ENV)) === true;
   }
 
-  private nextProjectionPolicyForError(
+  private async nextProjectionPolicyForError(
     error: unknown,
     policy: ProjectionPolicy | undefined,
     request: ResolvedLLMRequest,
     signal: AbortSignal | undefined,
+    shaped: readonly ContextMessage[],
+    currentMediaCount: number | undefined,
+    ensureMediaPaths: () => Promise<ReadonlyMap<string, string>>,
     captureMediaStripPolicy: () => { readonly strip: MediaStripSnapshot },
-  ): ProjectionPolicy | undefined {
-    if (signal?.aborted === true) return undefined;
+  ): Promise<ProjectionPolicy | undefined> {
+    if (signal?.aborted === true || currentMediaCount === undefined) return undefined;
     const raw = unwrapErrorCause(error);
     const media = policy?.media;
+    const reducesMedia = async (candidate: ProjectionPolicy): Promise<boolean> => {
+      const projected = this.projector.project(shaped, candidate, await ensureMediaPaths());
+      return mediaPartCount(projected) < currentMediaCount;
+    };
+    const stripCandidate = async (
+      logMessage: string,
+    ): Promise<ProjectionPolicy | undefined> => {
+      const strip = captureMediaStripPolicy();
+      const candidate: ProjectionPolicy = { ...policy, media: strip };
+      if (!(await reducesMedia(candidate))) return undefined;
+      this.log.warn(logMessage, { model: request.model.name, ...request.logFields });
+      this.markMediaStrippedRecoveryTurn(strip.strip, request.source);
+      return candidate;
+    };
     let projection: LlmRequestProjectionFallbackEvent['projection'];
     let nextPolicy: ProjectionPolicy;
     if (
@@ -585,23 +616,30 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     ) {
       signal?.throwIfAborted();
       if (media === undefined) {
-        this.log.warn('provider rejected request as too large; resending with degraded media', {
-          model: request.model.name,
-          ...request.logFields,
-        });
-        this.markRecoveryTurn(this.mediaDegradedTurns, request.source);
-        projection = 'media-degraded';
-        nextPolicy = { ...policy, media: 'degraded' };
-      } else {
-        this.log.warn(
-          'provider rejected degraded-media request as too large; resending with rejected media stripped',
-          {
+        const degradedPolicy: ProjectionPolicy = { ...policy, media: 'degraded' };
+        if (await reducesMedia(degradedPolicy)) {
+          this.log.warn('provider rejected request as too large; resending with degraded media', {
             model: request.model.name,
             ...request.logFields,
-          },
+          });
+          this.markRecoveryTurn(this.mediaDegradedTurns, request.source);
+          projection = 'media-degraded';
+          nextPolicy = degradedPolicy;
+        } else {
+          const stripped = await stripCandidate(
+            'provider rejected request as too large; resending with rejected media stripped',
+          );
+          if (stripped === undefined) return undefined;
+          projection = 'media-stripped';
+          nextPolicy = stripped;
+        }
+      } else {
+        const stripped = await stripCandidate(
+          'provider rejected degraded-media request as too large; resending with rejected media stripped',
         );
+        if (stripped === undefined) return undefined;
         projection = 'media-stripped';
-        nextPolicy = { ...policy, media: captureMediaStripPolicy() };
+        nextPolicy = stripped;
       }
     } else if (typeof media !== 'object' && isImageFormatError(raw)) {
       signal?.throwIfAborted();
@@ -612,8 +650,10 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
           ...request.logFields,
         },
       );
+      const strip = captureMediaStripPolicy();
+      this.markMediaStrippedRecoveryTurn(strip.strip, request.source);
       projection = 'media-stripped';
-      nextPolicy = { ...policy, media: captureMediaStripPolicy() };
+      nextPolicy = { ...policy, media: strip };
     } else if (policy?.structure === undefined && isRecoverableRequestStructureError(raw)) {
       signal?.throwIfAborted();
       this.log.warn('provider rejected request structure; resending with strict projection', {
@@ -941,16 +981,29 @@ function numberField(fields: AgentLLMRequestLogFields, key: string): number | un
   return typeof value === 'number' ? value : undefined;
 }
 
+function mediaUrlOf(part: Message['content'][number]): string | undefined {
+  if (part.type === 'image_url') return part.imageUrl.url;
+  if (part.type === 'audio_url') return part.audioUrl.url;
+  if (part.type === 'video_url') return part.videoUrl.url;
+  return undefined;
+}
+
 function mediaPartCount(messages: readonly Message[]): number {
   return messages.reduce(
-    (count, message) =>
-      count +
-      message.content.filter(
-        (part) =>
-          part.type === 'image_url' || part.type === 'audio_url' || part.type === 'video_url',
-      ).length,
+    (count, message) => count + message.content.filter((part) => mediaUrlOf(part) !== undefined).length,
     0,
   );
+}
+
+function mediaBytes(messages: readonly Message[]): number {
+  let total = 0;
+  for (const message of messages) {
+    for (const part of message.content) {
+      const url = mediaUrlOf(part);
+      if (url !== undefined && isDataUrl(url)) total += Buffer.byteLength(url, 'utf8');
+    }
+  }
+  return total;
 }
 
 type LlmRequestProjection = NonNullable<LlmRequestPayload['projection']>;

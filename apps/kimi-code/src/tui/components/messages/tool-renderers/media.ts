@@ -109,7 +109,7 @@ function formatBytes(bytes: number): string {
 function metaSegments(summary: ReadMediaSummary): string[] {
   const segs: string[] = [];
   if (summary.mimeType !== undefined) segs.push(summary.mimeType);
-  if (summary.bytes !== undefined) segs.push(formatBytes(summary.bytes));
+  if (summary.bytes !== undefined) segs.push(`${formatBytes(summary.bytes)} sent`);
   return segs;
 }
 
