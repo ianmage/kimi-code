@@ -33,6 +33,9 @@ const PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 const PNG_DATA_URL = `data:image/png;base64,${PNG_B64}`;
 
+// base64 payload that decodes to exactly 93491 bytes (91.3 KB).
+const SENT_B64 = `${'A'.repeat(124_655)}=`;
+
 function imageOutput(path: string, b64 = PNG_B64, mime = 'image/png'): string {
   return JSON.stringify([
     { type: 'text', text: `<image path="${path}">` },
@@ -94,6 +97,28 @@ describe('readMediaChip', () => {
     expect(text).toMatch(/B|KB|MB/);
   });
 
+  it('labels the delivered byte count as sent', () => {
+    const text = strip(
+      readMediaChip(call('ReadMediaFile'), result(imageOutput('/tmp/a.png', SENT_B64))),
+    );
+    expect(text).toBe('image (image/png, 91.3 KB sent)');
+  });
+
+  it('keeps the old output when the media carries no byte count', () => {
+    const out = JSON.stringify([
+      { type: 'text', text: `<video path="/tmp/a.mp4">` },
+      { type: 'video_url', videoUrl: { url: 'https://cdn.example/v/abc' } },
+      { type: 'text', text: '</video>' },
+    ]);
+    expect(strip(readMediaChip(call('ReadMediaFile'), result(out)))).toBe('video · uploaded');
+    const expanded = strip(
+      joinRender(readMediaSummary(call('ReadMediaFile'), result(out), expandedCtx)),
+    );
+    expect(expanded).toContain('/tmp/a.mp4');
+    expect(expanded).toContain('https://cdn.example/v/abc');
+    expect(expanded).not.toContain('sent');
+  });
+
   it('returns empty string on error so the truncated body shows the error', () => {
     expect(readMediaChip(call('ReadMediaFile'), result('boom', true))).toBe('');
   });
@@ -122,6 +147,18 @@ describe('readMediaSummary renderer', () => {
     // Crucially: the base64 must never reach the screen.
     expect(out).not.toContain(PNG_B64);
     expect(out).not.toContain(PNG_DATA_URL);
+  });
+
+  it('renders the sent byte count on the expanded meta line', () => {
+    const out = strip(
+      joinRender(
+        readMediaSummary(call('ReadMediaFile'), result(imageOutput('/tmp/a.png', SENT_B64)), expandedCtx),
+      ),
+    );
+    expect(out).toContain('91.3 KB sent');
+    expect(strip(readMediaChip(call('ReadMediaFile'), result(imageOutput('/tmp/a.png', SENT_B64))))).toContain(
+      '91.3 KB sent',
+    );
   });
 
   it('falls back to truncated renderer for errors', () => {

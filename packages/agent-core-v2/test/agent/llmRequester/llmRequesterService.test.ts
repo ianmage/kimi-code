@@ -1,4 +1,5 @@
 import { createControlledPromise } from '@antfu/utils';
+import { APIError } from 'openai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SyncDescriptor } from '#/_base/di/descriptors';
@@ -12,6 +13,7 @@ import {
   type MediaStripSnapshot,
   type ProjectionPolicy,
 } from '#/agent/contextProjector/contextProjector';
+import { MEDIA_DEGRADE_KEEP_RECENT } from '#/agent/contextProjector/mediaProjection';
 import { AgentContextProjectorService } from '#/agent/contextProjector/contextProjectorService';
 import { AgentLLMRequesterService, KIMI_CODE_INFINITE_RETRY_ENV } from '#/agent/llmRequester/llmRequesterService';
 import { IAgentLLMRequesterService } from '#/agent/llmRequester/llmRequester';
@@ -27,6 +29,8 @@ import {
 import { UNKNOWN_CAPABILITY } from '#human/llm/capability';
 import type { LlmModel } from '#human/llm/model';
 import type { LlmRequester } from '#human/llm/requester/requester';
+import { createOpenAIRequester } from '#human/llm/requester/bases/openai/requester';
+import { ModelRequesterImpl } from '#/llm-adapter/model/model-requester-impl';
 import { createActor, emit, setup } from '#human/xstate2';
 import { ISessionTokenCountingService } from '#/session/tokenCounting/sessionTokenCounting';
 import { IAgentProfileService } from '#/agent/profile/profile';
@@ -47,6 +51,7 @@ import {
   APIProviderRateLimitError,
   APIRequestTooLargeError,
   APIStatusError,
+  normalizeAPIStatusError,
 } from '#/llm-adapter/contract/errors';
 import { emptyUsage, type TokenUsage } from '#human/llm/usage';
 import { type Message } from '#/llm-adapter/contract/message';
@@ -133,11 +138,43 @@ function classifyProjectionPolicy(policy: ProjectionPolicy | undefined): Project
   return 'normal';
 }
 
+function isMediaPart(part: ContextMessage['content'][number]): boolean {
+  return part.type === 'image_url' || part.type === 'audio_url' || part.type === 'video_url';
+}
+
+function mediaPartTotal(messages: readonly ContextMessage[]): number {
+  return messages.reduce(
+    (count, message) => count + message.content.filter(isMediaPart).length,
+    0,
+  );
+}
+
+function applyMediaPolicy(
+  messages: readonly ContextMessage[],
+  policy: ProjectionPolicy | undefined,
+): readonly ContextMessage[] {
+  const media = policy?.media;
+  if (media === undefined) return messages;
+  let drop = Math.max(0, mediaPartTotal(messages) - (media === 'degraded' ? MEDIA_DEGRADE_KEEP_RECENT : 0));
+  if (drop === 0) return messages;
+  return messages.map((message) => {
+    if (drop === 0) return message;
+    let changed = false;
+    const content = message.content.flatMap((part): ContextMessage['content'][number][] => {
+      if (drop === 0 || !isMediaPart(part)) return [part];
+      drop -= 1;
+      changed = true;
+      return [{ type: 'text', text: '[media omitted]' }];
+    });
+    return changed ? { ...message, content } : message;
+  });
+}
+
 function recordProjectionCalls(
   project: (
     messages: readonly ContextMessage[],
     policy: ProjectionPolicy | undefined,
-  ) => readonly Message[] = (messages) => messages,
+  ) => readonly Message[] = applyMediaPolicy,
 ): {
   projector: Pick<IAgentContextProjectorService, 'project'>;
   calls: ProjectionKind[];
@@ -152,6 +189,20 @@ function recordProjectionCalls(
     },
     calls,
   };
+}
+
+function imageMessage(url: string, id?: string): Message {
+  return {
+    role: 'user',
+    content: [{ type: 'image_url', imageUrl: id === undefined ? { url } : { url, id } }],
+    toolCalls: [],
+  };
+}
+
+function imageMessages(count: number): Message[] {
+  return Array.from({ length: count }, (_, index) =>
+    imageMessage(`data:image/png;base64,IMG${String(index)}`, `img-${String(index)}`),
+  );
 }
 
 function createRequester(
@@ -263,7 +314,13 @@ function createService(
   const config: Partial<IConfigService> = {
     get: (() => undefined) as IConfigService['get'],
   };
-  const log = { info: () => undefined, warn: () => undefined };
+  const warnings: { readonly message: string; readonly payload: Record<string, unknown> }[] = [];
+  const log = {
+    info: () => undefined,
+    warn: (message: string, payload?: Record<string, unknown>) => {
+      warnings.push({ message, payload: payload ?? {} });
+    },
+  };
   const telemetryRecords: TelemetryRecord[] = [];
   const telemetry = recordingTelemetry(telemetryRecords);
   const toolSelect: Partial<IAgentToolSelectService> = {
@@ -329,6 +386,7 @@ function createService(
     telemetry,
     telemetryRecords,
     measuredCalls,
+    warnings,
   };
 }
 
@@ -479,6 +537,7 @@ describe('AgentLLMRequesterService infinite retry', () => {
     const requester = createRequester(calls, new APIRequestTooLargeError(413, 'Request Entity Too Large'));
     const { service } = createService(requester, undefined, {
       env: { [KIMI_CODE_INFINITE_RETRY_ENV]: '1' },
+      contextMessages: imageMessages(3),
     });
 
     await service.request();
@@ -622,13 +681,14 @@ describe('AgentLLMRequesterService media-degraded resend', () => {
         }),
       ),
       projection.projector,
+      { contextMessages: imageMessages(3) },
     );
 
     const result = await service.request();
 
     expect(result.message.content).toEqual([{ type: 'text', text: 'ok' }]);
     expect(calls.value).toBe(2);
-    expect(projection.calls).toEqual(['normal', 'degraded']);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded']);
   });
 
   it('attaches display paths to degraded older media', async () => {
@@ -674,22 +734,22 @@ describe('AgentLLMRequesterService media-degraded resend', () => {
     const { service } = createService(
       createRequester(calls, BODY_TOO_LARGE_413, [BODY_TOO_LARGE_413]),
       projection.projector,
+      { contextMessages: imageMessages(3) },
     );
 
     const result = await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
 
     expect(result.message.content).toEqual([{ type: 'text', text: 'ok' }]);
     expect(calls.value).toBe(3);
-    expect(projection.calls).toEqual(['normal', 'degraded', 'stripped']);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded', 'stripped', 'stripped']);
   });
 
   it('records repeated-413 recovery projections on the sticky later request', async () => {
     const calls = { value: 0 };
     const { service, dispatcher, records } = createService(
       createRequester(calls, BODY_TOO_LARGE_413, [BODY_TOO_LARGE_413]),
-      {
-        project: (messages: readonly ContextMessage[]) => messages,
-      },
+      { project: applyMediaPolicy },
+      { contextMessages: imageMessages(3) },
     );
 
     await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
@@ -724,12 +784,18 @@ describe('AgentLLMRequesterService media-degraded resend', () => {
     );
 
     await service.request({
-      messages: [imageMessage(oldUrl, 'rejected-id')],
+      messages: [
+        imageMessage(oldUrl, 'rejected-id'),
+        imageMessage('data:image/png;base64,FILLER1', 'filler-1'),
+        imageMessage('data:image/png;base64,FILLER2', 'filler-2'),
+      ],
       source: { type: 'turn', turnId: 1, step: 1 },
     });
     await service.request({
       messages: [
         imageMessage(oldUrl, 'rejected-id'),
+        imageMessage('data:image/png;base64,FILLER1', 'filler-1'),
+        imageMessage('data:image/png;base64,FILLER2', 'filler-2'),
         imageMessage(newUrl, 'recovery-id'),
       ],
       source: { type: 'turn', turnId: 1, step: 2 },
@@ -749,27 +815,30 @@ describe('AgentLLMRequesterService media-degraded resend', () => {
     const { service } = createService(
       createRequester(calls, BODY_TOO_LARGE_413, [BODY_TOO_LARGE_413, BODY_TOO_LARGE_413]),
       projection.projector,
+      { contextMessages: imageMessages(3) },
     );
 
     await expect(
       service.request({ source: { type: 'turn', turnId: 1, step: 1 } }),
     ).rejects.toBe(BODY_TOO_LARGE_413);
     expect(calls.value).toBe(3);
-    expect(projection.calls).toEqual(['normal', 'degraded', 'stripped']);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded', 'stripped', 'stripped']);
   });
 
   it('keeps later steps of the same turn on the degraded projection', async () => {
     const calls = { value: 0 };
     const projection = recordProjectionCalls();
-    const { service } = createService(createRequester(calls, BODY_TOO_LARGE_413), projection.projector);
+    const { service } = createService(createRequester(calls, BODY_TOO_LARGE_413), projection.projector, {
+      contextMessages: imageMessages(3),
+    });
 
     await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
     expect(calls.value).toBe(2);
-    expect(projection.calls).toEqual(['normal', 'degraded']);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded']);
 
     await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
     expect(calls.value).toBe(3);
-    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded']);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded', 'degraded']);
   });
 
   it('does not resend for a plain 400 or a non-413 status', async () => {
@@ -795,9 +864,10 @@ describe('AgentLLMRequesterService media-degraded resend', () => {
       projection.projector,
     );
 
-    await service.request();
+    await expect(service.request()).rejects.toBe(BODY_TOO_LARGE_413);
     await dispatcher.flush();
 
+    expect(calls.value).toBe(1);
     expect(events.filter((event) => event.type === 'warning')).toEqual([]);
   });
 
@@ -836,6 +906,486 @@ describe('AgentLLMRequesterService media-degraded resend', () => {
   });
 });
 
+describe('AgentLLMRequesterService request-too-large resend guard', () => {
+  const BODY_TOO_LARGE_413 = new APIRequestTooLargeError(413, 'Request Entity Too Large');
+
+  it('does not resend when no projection reduces the media part count', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls();
+    const { service, dispatcher, events, records } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413),
+      projection.projector,
+    );
+
+    await expect(
+      service.request({ source: { type: 'turn', turnId: 1, step: 1 } }),
+    ).rejects.toBe(BODY_TOO_LARGE_413);
+    await dispatcher.flush();
+
+    expect(calls.value).toBe(1);
+    expect(events.filter((event) => event.type === 'warning')).toEqual([]);
+
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    await dispatcher.flush();
+    expect(
+      records
+        .filter((record) => record.type === 'llm.request')
+        .map((record) => record['projection']),
+    ).toEqual([undefined, undefined]);
+  });
+
+  it('leaves no recovery side effect behind when the guard rejects', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls();
+    const { service, dispatcher, telemetryRecords, records } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413),
+      projection.projector,
+    );
+    const onAttemptRetry = vi.fn();
+
+    await expect(
+      service.request({ source: { type: 'turn', turnId: 1, step: 1 }, onAttemptRetry }),
+    ).rejects.toBe(BODY_TOO_LARGE_413);
+    await dispatcher.flush();
+
+    expect(onAttemptRetry).not.toHaveBeenCalled();
+    expect(
+      telemetryRecords.filter((record) => record.event === 'llm_request_projection_fallback'),
+    ).toEqual([]);
+
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    await dispatcher.flush();
+    expect(
+      records
+        .filter((record) => record.type === 'llm.request')
+        .map((record) => record['projection']),
+    ).toEqual([undefined, undefined]);
+  });
+
+  it('does not resend when the projector ignores the policy despite media being present', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls((messages) => messages);
+    const { service, dispatcher, events } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413),
+      projection.projector,
+      { contextMessages: imageMessages(6) },
+    );
+
+    await expect(
+      service.request({ source: { type: 'turn', turnId: 1, step: 1 } }),
+    ).rejects.toBe(BODY_TOO_LARGE_413);
+    await dispatcher.flush();
+
+    expect(calls.value).toBe(1);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'stripped']);
+    expect(events.filter((event) => event.type === 'warning')).toEqual([]);
+  });
+
+  it('jumps straight to stripped media when degrading leaves the media count unchanged', async () => {
+    const calls = { value: 0 };
+    const capturedInputs: ModelRequestInput[] = [];
+    const projection = recordProjectionCalls((messages, policy) =>
+      typeof policy?.media === 'object' ? applyMediaPolicy(messages, policy) : messages,
+    );
+    const { service, dispatcher, events, telemetryRecords } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413, [], capturedInputs),
+      projection.projector,
+      { contextMessages: imageMessages(2) },
+    );
+
+    const result = await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    await dispatcher.flush();
+
+    expect(result.message.content).toEqual([{ type: 'text', text: 'ok' }]);
+    expect(calls.value).toBe(2);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'stripped', 'stripped']);
+    expect(capturedInputs[1]!.messages.flatMap((message) => message.content).filter(isMediaPart)).toHaveLength(0);
+    expect(events.filter((event) => event.type === 'warning')).toEqual([
+      expect.objectContaining({ type: 'warning', code: 'media-stripped' }),
+    ]);
+    expect(
+      telemetryRecords.filter((record) => record.event === 'llm_request_projection_fallback'),
+    ).toHaveLength(1);
+  });
+
+  it('keeps the stripped snapshot on later steps after a direct strip jump', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls((messages, policy) =>
+      typeof policy?.media === 'object' ? applyMediaPolicy(messages, policy) : messages,
+    );
+    const { service, dispatcher, records } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413),
+      projection.projector,
+      { contextMessages: imageMessages(2) },
+    );
+
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    await dispatcher.flush();
+
+    expect(projection.calls).toEqual(['normal', 'degraded', 'stripped', 'stripped', 'stripped']);
+    expect(
+      records
+        .filter((record) => record.type === 'llm.request')
+        .map((record) => record['projection']),
+    ).toEqual([undefined, 'media-stripped', 'media-stripped']);
+  });
+});
+
+describe('AgentLLMRequesterService recovery exhaustion and source isolation', () => {
+  const BODY_TOO_LARGE_413 = new APIRequestTooLargeError(413, 'Request Entity Too Large');
+
+  it('exhausts degraded then stripped before rethrowing the 413', async () => {
+    const calls = { value: 0 };
+    const capturedInputs: ModelRequestInput[] = [];
+    const projection = recordProjectionCalls(applyMediaPolicy);
+    const { service, dispatcher, events } = createService(
+      createRequester(
+        calls,
+        BODY_TOO_LARGE_413,
+        [BODY_TOO_LARGE_413, BODY_TOO_LARGE_413],
+        capturedInputs,
+      ),
+      projection.projector,
+      { contextMessages: imageMessages(12) },
+    );
+
+    const error = await service
+      .request({ source: { type: 'turn', turnId: 1, step: 1 } })
+      .catch((error: unknown) => error);
+    await dispatcher.flush();
+
+    expect(calls.value).toBe(3);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded', 'stripped', 'stripped']);
+    expect(capturedInputs[1]!.messages.flatMap((message) => message.content).filter(isMediaPart)).toHaveLength(2);
+    expect(capturedInputs[2]!.messages.flatMap((message) => message.content).filter(isMediaPart)).toHaveLength(0);
+    expect(error).toBeInstanceOf(APIRequestTooLargeError);
+    expect((error as APIRequestTooLargeError).statusCode).toBe(413);
+    expect(events.filter((event) => event.type === 'warning')).toEqual([
+      expect.objectContaining({ type: 'warning', code: 'media-degraded' }),
+      expect.objectContaining({ type: 'warning', code: 'media-stripped' }),
+    ]);
+  });
+
+  it('keeps the stripped snapshot on later steps after exhaustion', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls(applyMediaPolicy);
+    const { service, dispatcher, records } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413, [BODY_TOO_LARGE_413, BODY_TOO_LARGE_413]),
+      projection.projector,
+      { contextMessages: imageMessages(12) },
+    );
+
+    await expect(
+      service.request({ source: { type: 'turn', turnId: 1, step: 1 } }),
+    ).rejects.toBe(BODY_TOO_LARGE_413);
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    await dispatcher.flush();
+
+    expect(projection.calls.at(-1)).toBe('stripped');
+    expect(
+      records
+        .filter((record) => record.type === 'llm.request')
+        .map((record) => record['projection']),
+    ).toEqual([
+      undefined,
+      'media-degraded',
+      'media-stripped',
+      'media-stripped',
+    ]);
+  });
+
+  it('resends image-format and request-structure errors without media to reduce', async () => {
+    const imageFormatCalls = { value: 0 };
+    const imageFormat = recordProjectionCalls();
+    const imageFormatService = createService(
+      createRequester(
+        imageFormatCalls,
+        new APIStatusError(400, 'unsupported image format: image/avif is not supported'),
+      ),
+      imageFormat.projector,
+    ).service;
+
+    await imageFormatService.request();
+    expect(imageFormatCalls.value).toBe(2);
+    expect(imageFormat.calls).toEqual(['normal', 'stripped']);
+
+    const structureCalls = { value: 0 };
+    const structure = recordProjectionCalls();
+    const structureService = createService(
+      createRequester(structureCalls, new APIStatusError(400, 'messages: `tool_use` ids must be unique')),
+      structure.projector,
+    ).service;
+
+    await structureService.request();
+    expect(structureCalls.value).toBe(2);
+    expect(structure.calls).toEqual(['normal', 'strict']);
+  });
+
+  it('leaves no turn mark behind for operation requests', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls(applyMediaPolicy);
+    const { service, dispatcher, records } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413),
+      projection.projector,
+      { contextMessages: imageMessages(3) },
+    );
+
+    await service.request({
+      source: { type: 'operation', turnId: 1, requestKind: 'full_compaction' },
+    });
+    expect(calls.value).toBe(2);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded']);
+
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    await dispatcher.flush();
+
+    expect(
+      records
+        .filter((record) => record.type === 'llm.request')
+        .map((record) => record['projection']),
+    ).toEqual([undefined, 'media-degraded', undefined]);
+  });
+});
+
+describe('AgentLLMRequesterService real 413 wording through the guard', () => {
+  const BUFFER_LIMIT_413 = normalizeAPIStatusError(
+    413,
+    'Failed to buffer the request body: length limit exceeded',
+  );
+
+  it('escalates through both media projections for a real 413 wording', async () => {
+    const calls = { value: 0 };
+    const capturedInputs: ModelRequestInput[] = [];
+    const projection = recordProjectionCalls(applyMediaPolicy);
+    const { service } = createService(
+      createRequester(calls, BUFFER_LIMIT_413, [BUFFER_LIMIT_413], capturedInputs),
+      projection.projector,
+      { contextMessages: imageMessages(12) },
+    );
+
+    const result = await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+
+    expect(result.message.content).toEqual([{ type: 'text', text: 'ok' }]);
+    expect(calls.value).toBe(3);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded', 'stripped', 'stripped']);
+    expect(capturedInputs[1]!.messages.flatMap((message) => message.content).filter(isMediaPart)).toHaveLength(2);
+    expect(capturedInputs[2]!.messages.flatMap((message) => message.content).filter(isMediaPart)).toHaveLength(0);
+  });
+
+  it('rethrows the classified 413 once both projections are exhausted', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls(applyMediaPolicy);
+    const { service, dispatcher, events } = createService(
+      createRequester(calls, BUFFER_LIMIT_413, [BUFFER_LIMIT_413, BUFFER_LIMIT_413]),
+      projection.projector,
+      { contextMessages: imageMessages(12) },
+    );
+
+    const error = await service
+      .request({ source: { type: 'turn', turnId: 1, step: 1 } })
+      .catch((error: unknown) => error);
+    await dispatcher.flush();
+
+    expect(error).toBeInstanceOf(APIRequestTooLargeError);
+    expect((error as APIRequestTooLargeError).statusCode).toBe(413);
+    expect(events.filter((event) => event.type === 'warning')).toEqual([
+      expect.objectContaining({ type: 'warning', code: 'media-degraded' }),
+      expect.objectContaining({ type: 'warning', code: 'media-stripped' }),
+    ]);
+  });
+});
+
+describe('AgentLLMRequesterService 413 attempt byte logging', () => {
+  const BODY_TOO_LARGE_413 = new APIRequestTooLargeError(413, 'Request Entity Too Large');
+  const dataUrl = 'data:image/png;base64,PAYLOAD';
+
+  function byteLogs(warnings: { readonly payload: Record<string, unknown> }[]) {
+    return warnings.filter((warning) => 'requestBytes' in warning.payload);
+  }
+
+  it('logs the request and media bytes of the rejected attempt', async () => {
+    const calls = { value: 0 };
+    const capturedInputs: ModelRequestInput[] = [];
+    const { service, warnings } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413, [], capturedInputs),
+      { project: applyMediaPolicy },
+      {
+        contextMessages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'image_url', imageUrl: { url: dataUrl } },
+              { type: 'image_url', imageUrl: { url: 'https://example.test/remote.png' } },
+            ],
+            toolCalls: [],
+          },
+        ],
+      },
+    );
+
+    await service.request();
+
+    const logs = byteLogs(warnings);
+    expect(logs).toHaveLength(1);
+    const first = capturedInputs[0]!;
+    expect(logs[0]!.payload['requestBytes']).toBe(
+      Buffer.byteLength(
+        JSON.stringify({
+          systemPrompt: first.systemPrompt,
+          tools: first.tools,
+          messages: first.messages,
+        }),
+        'utf8',
+      ),
+    );
+    expect(logs[0]!.payload['mediaBytes']).toBe(Buffer.byteLength(dataUrl, 'utf8'));
+    expect(logs[0]!.payload['projection']).toBe('normal');
+  });
+
+  it('logs one entry per rejected attempt and none for other outcomes', async () => {
+    const calls = { value: 0 };
+    const { service, warnings } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413, [BODY_TOO_LARGE_413, BODY_TOO_LARGE_413]),
+      { project: applyMediaPolicy },
+      { contextMessages: imageMessages(12) },
+    );
+
+    await expect(
+      service.request({ source: { type: 'turn', turnId: 1, step: 1 } }),
+    ).rejects.toBe(BODY_TOO_LARGE_413);
+
+    expect(byteLogs(warnings).map((warning) => warning.payload['projection'])).toEqual([
+      'normal',
+      'media-degraded',
+      'media-stripped',
+    ]);
+
+    const success = createService(createRequester({ value: 0 }, null), undefined);
+    await success.service.request();
+    expect(byteLogs(success.warnings)).toHaveLength(0);
+
+    const failure = createService(
+      createRequester({ value: 0 }, new APIStatusError(500, 'boom')),
+      undefined,
+    );
+    await expect(failure.service.request()).rejects.toMatchObject({ statusCode: 500 });
+    expect(byteLogs(failure.warnings)).toHaveLength(0);
+  });
+
+  it('logs a 413 context-overflow rejection too', async () => {
+    const calls = { value: 0 };
+    const { service, warnings } = createService(
+      createRequester(
+        calls,
+        new APIContextOverflowError(413, 'prompt is too long: 210000 tokens > 200000 maximum'),
+      ),
+      undefined,
+    );
+
+    await expect(service.request()).rejects.toBeInstanceOf(APIContextOverflowError);
+
+    expect(byteLogs(warnings)).toHaveLength(1);
+  });
+
+  it('carries the request log fields and model without a contentLength key', async () => {
+    const calls = { value: 0 };
+    const { service, warnings } = createService(
+      createRequester(calls, BODY_TOO_LARGE_413),
+      undefined,
+    );
+
+    await expect(
+      service.request({ source: { type: 'turn', turnId: 7, step: 3 } }),
+    ).rejects.toBe(BODY_TOO_LARGE_413);
+
+    const payload = byteLogs(warnings)[0]!.payload;
+    expect(Object.keys(payload)).toEqual(
+      expect.arrayContaining(['requestBytes', 'mediaBytes', 'projection', 'model', 'turnStep']),
+    );
+    expect(Object.keys(payload)).not.toContain('contentLength');
+  });
+});
+
+describe('AgentLLMRequesterService real requester 413 end to end', () => {
+  const FAILED_TO_BUFFER = 'Failed to buffer the request body: length limit exceeded';
+  const streamChunks = [
+    {
+      id: 'chatcmpl-1',
+      object: 'chat.completion.chunk',
+      created: 0,
+      model: 'wire-model',
+      choices: [
+        { index: 0, delta: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+      ],
+    },
+  ];
+
+  function bufferingClient(calls: { value: number }): never {
+    calls.value += 1;
+    const attempt = calls.value;
+    return {
+      chat: {
+        completions: {
+          create: () => ({
+            withResponse: async () => {
+              if (attempt <= 2) {
+                throw new APIError(413, {}, FAILED_TO_BUFFER, new Headers());
+              }
+              return {
+                data: (async function* () {
+                  for (const chunk of streamChunks) yield chunk;
+                })(),
+                response: new Response(null),
+              };
+            },
+          }),
+        },
+      },
+    } as never;
+  }
+
+  it('recovers through the real OpenAI requester on a Failed to buffer 413', async () => {
+    const calls = { value: 0 };
+    const projection = recordProjectionCalls(applyMediaPolicy);
+    const requester = new ModelRequesterImpl(createRequester({ value: 0 }).model, {
+      resolve: () => ({
+        requester: createOpenAIRequester({ clientFactory: () => bufferingClient(calls) }),
+        protocol: 'openai',
+        model: turnHarnessModel,
+      }),
+    });
+    const { service, dispatcher, events, warnings } = createService(
+      requester,
+      projection.projector,
+      { contextMessages: imageMessages(3) },
+    );
+
+    const result = await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    await dispatcher.flush();
+
+    expect(result.message.content).toEqual([{ type: 'text', text: 'ok' }]);
+    expect(calls.value).toBe(3);
+    expect(projection.calls).toEqual(['normal', 'degraded', 'degraded', 'stripped', 'stripped']);
+    expect(events.filter((event) => event.type === 'warning')).toContainEqual(
+      expect.objectContaining({ type: 'warning', code: 'media-degraded' }),
+    );
+
+    const byteLogs = warnings.filter((warning) => 'requestBytes' in warning.payload);
+    expect(byteLogs.map((warning) => warning.payload['projection'])).toEqual([
+      'normal',
+      'media-degraded',
+    ]);
+    expect(
+      events.filter(
+        (event) =>
+          event.type === 'warning' &&
+          (event as { code?: string }).code === 'media-degraded',
+      ),
+    ).toHaveLength(1);
+  });
+});
+
 describe('AgentLLMRequesterService combined recovery projections', () => {
   const BODY_TOO_LARGE_413 = new APIRequestTooLargeError(413, 'Request Entity Too Large');
   const IMAGE_FORMAT_400 = new APIStatusError(
@@ -850,7 +1400,7 @@ describe('AgentLLMRequesterService combined recovery projections', () => {
     return {
       project: (messages: readonly ContextMessage[], policy) => {
         policies.policies.push(policy);
-        return messages;
+        return applyMediaPolicy(messages, policy);
       },
     };
   }
@@ -861,6 +1411,7 @@ describe('AgentLLMRequesterService combined recovery projections', () => {
     const { service, dispatcher, records } = createService(
       createRequester(calls, STRUCTURAL_400, [BODY_TOO_LARGE_413, BODY_TOO_LARGE_413]),
       createPolicyRecordingProjector({ policies }),
+      { contextMessages: imageMessages(3) },
     );
 
     await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
@@ -870,6 +1421,8 @@ describe('AgentLLMRequesterService combined recovery projections', () => {
       undefined,
       { structure: 'strict' },
       { structure: 'strict', media: 'degraded' },
+      { structure: 'strict', media: 'degraded' },
+      { structure: 'strict', media: { strip: expect.anything() } },
       { structure: 'strict', media: { strip: expect.anything() } },
     ]);
     await dispatcher.flush();
@@ -926,6 +1479,7 @@ describe('AgentLLMRequesterService combined recovery projections', () => {
     expect(calls.value).toBe(3);
     expect(policies).toEqual([
       undefined,
+      { media: 'degraded' },
       { media: 'degraded' },
       { structure: 'strict', media: 'degraded' },
     ]);
@@ -1075,7 +1629,11 @@ describe('AgentLLMRequesterService trace id', () => {
         throw new APIConnectionError('socket hang up');
       },
     });
-    const { service, telemetryRecords } = createService(requester, passthroughProjector);
+    const { service, telemetryRecords } = createService(
+      requester,
+      { project: applyMediaPolicy },
+      { contextMessages: imageMessages(3) },
+    );
     const request = service.start();
     await expect(request.result).rejects.toThrow('socket hang up');
 

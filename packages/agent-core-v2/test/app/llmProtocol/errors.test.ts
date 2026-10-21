@@ -423,6 +423,10 @@ describe('normalizeAPIStatusError', () => {
     [413, 'Request too large'],
     [413, 'Request body too large'],
     [413, 'http: request body too large'],
+    [413, 'Failed to buffer the request body: length limit exceeded'],
+    [413, 'Request failed'],
+    [413, ''],
+    [413, '<html><body>413 Request Entity Too Large</body></html>'],
   ])('normalizes %i "%s" to APIRequestTooLargeError', (statusCode, message) => {
     const error = normalizeAPIStatusError(statusCode, message, 'req-large');
     expect(error).toBeInstanceOf(APIRequestTooLargeError);
@@ -436,8 +440,23 @@ describe('normalizeAPIStatusError', () => {
     expect(error).not.toBeInstanceOf(APIRequestTooLargeError);
   });
 
+  it('classifies 413 size and token-overflow wording mutually exclusively', () => {
+    const sizeWording = normalizeAPIStatusError(
+      413,
+      'Failed to buffer the request body: length limit exceeded',
+    );
+    expect(sizeWording).toBeInstanceOf(APIRequestTooLargeError);
+    expect(sizeWording).not.toBeInstanceOf(APIContextOverflowError);
+
+    const tokenWording = normalizeAPIStatusError(
+      413,
+      'prompt is too long: 210000 tokens > 200000 maximum',
+    );
+    expect(tokenWording).toBeInstanceOf(APIContextOverflowError);
+    expect(tokenWording).not.toBeInstanceOf(APIRequestTooLargeError);
+  });
+
   it.each([
-    [413, 'Request failed'],
     [400, 'Payload too large'],
     [422, 'Request entity too large'],
   ])('keeps %i "%s" as plain APIStatusError', (statusCode, message) => {

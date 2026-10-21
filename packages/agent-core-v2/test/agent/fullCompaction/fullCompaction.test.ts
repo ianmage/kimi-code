@@ -29,7 +29,7 @@ import { MASTER_ENV } from '#/app/flag/flagService';
 import { estimateTokensForMessages } from '#/llm-adapter/contract/tokens';
 import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/stubs';
 import type { TestAgentContext, TestAgentOptions, TestAgentServiceOverride } from '../../harness';
-import { agentService, appService, appServices, createCommandRunner, execEnvServices, hostEnvironmentServices, requesterFromGenerateFn, sessionServices, testAgent as createTestAgent, type LegacyGenerateResult } from '../../harness';
+import { agentService, appService, appServices, createCommandRunner, execEnvServices, hostEnvironmentServices, logServices, requesterFromGenerateFn, sessionServices, testAgent as createTestAgent, type LegacyGenerateResult } from '../../harness';
 import { IFileSystemStorageService } from '#/persistence/interface/storage';
 import { InMemoryStorageService } from '#/persistence/backends/memory/inMemoryStorageService';
 import { ISessionTokenCountingService } from '#/session/tokenCounting/sessionTokenCounting';
@@ -60,6 +60,44 @@ function testAgent(
 ): TestAgentContext {
   const context = createTestAgent(...inputs);
   return context;
+}
+
+interface RecordedLog {
+  readonly level: string;
+  readonly message: string;
+  readonly payload?: unknown;
+}
+
+function recordingLogger(): {
+  readonly entries: RecordedLog[];
+  readonly logger: {
+    info(message: string, payload?: unknown): void;
+    warn(message: string, payload?: unknown): void;
+    error(message: string, payload?: unknown): void;
+    debug(message: string, payload?: unknown): void;
+  };
+} {
+  const entries: RecordedLog[] = [];
+  const record =
+    (level: string) =>
+    (message: string, payload?: unknown): void => {
+      entries.push({ level, message, payload });
+    };
+  return {
+    entries,
+    logger: {
+      info: record('info'),
+      warn: record('warn'),
+      error: record('error'),
+      debug: record('debug'),
+    },
+  };
+}
+
+function overflowDecisions(entries: readonly RecordedLog[]): Record<string, unknown>[] {
+  return entries
+    .filter((entry) => entry.message === 'request too large; deciding whether to compact')
+    .map((entry) => entry.payload as Record<string, unknown>);
 }
 
 const CATALOGUED_PROVIDER = {
@@ -2844,6 +2882,189 @@ describe('FullCompaction', () => {
       }),
     );
     await ctx.expectResumeMatches();
+  });
+
+  it('logs the compaction decision for a plain 413 over the effective window', async () => {
+    let callCount = 0;
+    const { entries, logger } = recordingLogger();
+    const generate: GenerateFn = requesterFromGenerateFn(async (_provider, _system, _tools, _history, callbacks) => {
+      callCount += 1;
+      if (callCount === 1) {
+        throw new APIRequestTooLargeError(413, 'Request Entity Too Large', 'req-plain-413');
+      }
+      if (callCount === 2) {
+        return textResult('Plain 413 compacted summary.');
+      }
+      await callbacks?.onMessagePart?.({ type: 'text', text: 'Recovered after plain 413 compaction.' });
+      return textResult('Recovered after plain 413 compaction.');
+    });
+    const ctx = testAgent({ generate }, logServices(logger));
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: {
+        ...CATALOGUED_MODEL_CAPABILITIES,
+        max_context_tokens: 400_000,
+      },
+    });
+    ctx.appendExchange(1, 'old user one', `old assistant one ${'x'.repeat(1_000_000)}`, 250_000);
+    ctx.newEvents();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Retry after plain 413' }] });
+    const events = await ctx.untilTurnEnd();
+
+    expect(eventIndex(events, 'compaction.started')).toBeGreaterThanOrEqual(0);
+    const decisions = overflowDecisions(entries);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toEqual({
+      site: 'turn',
+      estimatedRequestTokens: expect.any(Number),
+      effectiveMaxContextTokens: 400_000,
+      recover: true,
+    });
+    expect(decisions[0]!['estimatedRequestTokens']).toBeGreaterThanOrEqual(200_000);
+  });
+
+  it('logs a non-recovering decision for a small plain 413', async () => {
+    const { entries, logger } = recordingLogger();
+    const generate: GenerateFn = requesterFromGenerateFn(async () => {
+      throw new APIStatusError(413, 'Request Entity Too Large', 'req-small-413');
+    });
+    const ctx = testAgent({ generate }, logServices(logger));
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: {
+        ...CATALOGUED_MODEL_CAPABILITIES,
+        max_context_tokens: 200_000,
+      },
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+    ctx.newEvents();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'small prompt' }] });
+    const events = await ctx.untilTurnEnd();
+
+    expect(eventIndex(events, 'compaction.started')).toBe(-1);
+    const decisions = overflowDecisions(entries);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!['recover']).toBe(false);
+  });
+
+  it('logs a compaction-site decision when the compaction request itself gets a 413', async () => {
+    vi.useFakeTimers();
+    const firstAttemptFailed = deferred<void>();
+    const { entries, logger } = recordingLogger();
+    let attempts = 0;
+    const generate: GenerateFn = requesterFromGenerateFn(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        firstAttemptFailed.resolve();
+        throw new APIStatusError(413, 'Request Entity Too Large', 'req-compact-plain-413');
+      }
+      return textResult('Recovered compacted summary.');
+    });
+    const ctx = testAgent({ generate }, logServices(logger));
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: {
+        ...CATALOGUED_MODEL_CAPABILITIES,
+        max_context_tokens: 20_000,
+      },
+    });
+    ctx.appendExchange(1, 'old user one', `old assistant one ${'x'.repeat(45_000)}`, 20);
+    ctx.appendExchange(2, 'recent user two', 'recent assistant two', 80);
+    const compacted = ctx.once('full_compaction.complete');
+
+    await ctx.rpc.beginCompaction({});
+    await firstAttemptFailed.promise;
+    await vi.advanceTimersByTimeAsync(10_000);
+    await compacted;
+
+    expect(overflowDecisions(entries).map((decision) => decision['site'])).toContain('compaction');
+    vi.useRealTimers();
+  });
+
+  it('logs no decision for short-circuited and non-413 errors', async () => {
+    const cases = [
+      new APIContextOverflowError(400, 'context length exceeded'),
+      new APIStatusError(500, 'boom'),
+    ];
+    for (const error of cases) {
+      const { entries, logger } = recordingLogger();
+      const generate: GenerateFn = requesterFromGenerateFn(async () => {
+        throw error;
+      });
+      const ctx = testAgent({ generate }, logServices(logger));
+      ctx.configure({
+        provider: CATALOGUED_PROVIDER,
+        modelCapabilities: {
+          ...CATALOGUED_MODEL_CAPABILITIES,
+          max_context_tokens: 200_000,
+        },
+      });
+      ctx.appendExchange(1, 'old user one', `old assistant one ${'x'.repeat(600_000)}`, 150_000);
+      ctx.newEvents();
+
+      await ctx.rpc.prompt({ input: [{ type: 'text', text: 'boom' }] });
+      await ctx.untilTurnEnd();
+
+      expect(overflowDecisions(entries)).toHaveLength(0);
+    }
+  });
+
+  it('compacts after media projections are exhausted on a plain 413', async () => {
+    let callCount = 0;
+    const { entries, logger } = recordingLogger();
+    const generate: GenerateFn = requesterFromGenerateFn(async (_provider, _system, _tools, history, callbacks) => {
+      callCount += 1;
+      if (callCount <= 3) {
+        throw new APIRequestTooLargeError(413, 'Request Entity Too Large');
+      }
+      if (callCount === 4) {
+        return textResult('Exhausted-media compacted summary.');
+      }
+      const text = 'Recovered after exhausted media compaction.';
+      await callbacks?.onMessagePart?.({ type: 'text', text });
+      return textResult(text);
+    });
+    const ctx = testAgent({ generate }, logServices(logger));
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: {
+        ...CATALOGUED_MODEL_CAPABILITIES,
+        max_context_tokens: 400_000,
+      },
+    });
+    ctx.appendExchange(1, 'old user one', `old assistant one ${'x'.repeat(1_000_000)}`, 250_000);
+    ctx.appendRichToolExchange();
+    ctx.appendRichToolExchange();
+    ctx.newEvents();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Retry after exhausted media' }] });
+    const events = await ctx.untilTurnEnd();
+
+    expect(callCount).toBe(5);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        event: 'compaction.started',
+        args: expect.objectContaining({ trigger: 'auto' }),
+      }),
+    );
+    const decisions = overflowDecisions(entries);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!['site']).toBe('turn');
+    expect(decisions[0]!['recover']).toBe(true);
+
+    const byteLogs = entries.filter(
+      (entry) => typeof entry.payload === 'object' && entry.payload !== null && 'requestBytes' in entry.payload,
+    );
+    expect(byteLogs).toHaveLength(3);
+    const decisionKeys = Object.keys(decisions[0]!);
+    for (const entry of byteLogs) {
+      const overlap = Object.keys(entry.payload as Record<string, unknown>).filter((key) =>
+        decisionKeys.includes(key),
+      );
+      expect(overlap).toEqual([]);
+    }
   });
 
   it('does not compact plain 413 when estimated request is small', async () => {
