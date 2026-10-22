@@ -8,6 +8,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { CLUSTER_META_FILE, shardDirName } from './utils.js';
+import { publishExclusive } from '../exclusive-publish.js';
 import type { ClusterMeta, ClusterOpenOptions } from './types.js';
 
 const META_VERSION = 1;
@@ -39,17 +40,14 @@ export class Topology {
       valueCodec: opts.valueCodec ?? 'buffer',
       fsyncPolicy: opts.fsyncPolicy ?? 'everysec',
     };
-    // Atomic creation race: write to a temp file, then hard-link it into
-    // place. link(2) fails with EEXIST if another process won the race, and
-    // unlike the O_EXCL-create-then-write pattern, readers can never observe
-    // a meta file whose content has not been fully written yet.
+    // Atomic creation race: write to a temp file, then publish it exclusively.
+    // The publish fails with EEXIST if another process won the race, and unlike
+    // the O_EXCL-create-then-write pattern, readers can never observe a meta
+    // file whose content has not been fully written yet.
     const tmpPath = `${metaPath}.tmp-${process.pid}`;
     try {
       await fs.writeFile(tmpPath, JSON.stringify(requested, null, 2));
-      await fs.link(tmpPath, metaPath);
-      return new Topology(dir, requested);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      if (await publishExclusive(tmpPath, metaPath)) return new Topology(dir, requested);
     } finally {
       await fs.unlink(tmpPath).catch(() => {});
     }

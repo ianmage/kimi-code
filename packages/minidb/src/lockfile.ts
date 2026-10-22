@@ -20,6 +20,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { renameReplace } from './rename-replace.js';
 import { createSerializer } from './serialize.js';
+import { publishExclusive } from './exclusive-publish.js';
 
 export class LockError extends Error {
   readonly code = 'ELOCKED';
@@ -248,17 +249,14 @@ export class LockFile {
     return false;
   }
 
-  /** Atomic create-if-absent publish: tmp write + hard link (EEXIST-safe). */
+  /** Atomic create-if-absent publish: tmp write + exclusive publish (EEXIST-safe). */
   private async tryCreate(): Promise<boolean> {
     const tmp = `${this.path}.tmp-${process.pid}-${nextSidecarSeq()}`;
     try {
       await fs.writeFile(tmp, this.payload());
-      await fs.link(tmp, this.path);
+      if (!(await publishExclusive(tmp, this.path))) return false;
       this.markHeld();
       return true;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-      return false;
     } finally {
       await fs.unlink(tmp).catch(() => {});
     }

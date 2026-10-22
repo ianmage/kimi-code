@@ -40,6 +40,26 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+const NO_HARDLINK_CODES = new Set(['EISDIR', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM']);
+
+function publishExclusive(tmp: string, target: string): boolean {
+  try {
+    fs.linkSync(tmp, target);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') return false;
+    if (code === undefined || !NO_HARDLINK_CODES.has(code)) throw error;
+  }
+  try {
+    fs.copyFileSync(tmp, target, fs.constants.COPYFILE_EXCL);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
 export class SessionLockService extends SessionLockHolds {
   private readonly lockDir: string;
   private readonly hostname: string;
@@ -127,11 +147,7 @@ export class SessionLockService extends SessionLockHolds {
     const tmp = `${lockPath}.tmp-${process.pid}-${randomUUID()}`;
     try {
       fs.writeFileSync(tmp, body, { mode: 0o600 });
-      fs.linkSync(tmp, lockPath);
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
-      throw error;
+      return publishExclusive(tmp, lockPath);
     } finally {
       this.unlinkSilent(tmp);
     }

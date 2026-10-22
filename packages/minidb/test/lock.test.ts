@@ -1,5 +1,5 @@
 // test/lock.test.js
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -32,6 +32,31 @@ test('lock is released on close, allowing another writer', async () => {
   assert.equal(db2.get('a'), '1');
   await db2.close();
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('publishes the lock by exclusive copy when the filesystem cannot hard-link', async () => {
+  const dir = await tmpDir();
+  const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async () => {
+    throw Object.assign(new Error('EISDIR: illegal operation on a directory, link'), {
+      code: 'EISDIR',
+    });
+  });
+  try {
+    const db1 = await MiniDb.open({ dir, valueCodec: 'string' });
+    try {
+      await db1.set('a', '1');
+      await assert.rejects(() => MiniDb.open({ dir, valueCodec: 'string' }), LockError);
+    } finally {
+      await db1.close();
+    }
+
+    const db2 = await MiniDb.open({ dir, valueCodec: 'string' });
+    assert.equal(db2.get('a'), '1');
+    await db2.close();
+  } finally {
+    linkSpy.mockRestore();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('readOnly open succeeds alongside a writer and rejects writes', async () => {

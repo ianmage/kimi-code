@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import fs, { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -133,6 +133,24 @@ describe('SessionLockService', () => {
     expect(degraded.held(SID)).toBe(true);
     expect(() => degraded.release(SID)).not.toThrow();
     degraded.dispose();
+  });
+
+  it('falls back to an exclusive copy when the filesystem cannot hard-link', () => {
+    const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+      throw Object.assign(new Error('EISDIR: illegal operation on a directory, link'), {
+        code: 'EISDIR',
+      });
+    });
+    try {
+      serviceA.hold(SID);
+      expect(existsSync(lockPath(homeDir, SID))).toBe(true);
+      expect(readLockFile(homeDir, SID).clientIdentity).toBe('client_a');
+      expect(() => serviceB.hold(SID)).toThrowError(/in use by another Kimi Code process/);
+      serviceA.release(SID);
+      expect(existsSync(lockPath(homeDir, SID))).toBe(false);
+    } finally {
+      linkSpy.mockRestore();
+    }
   });
 
   it('releases held locks when the process exit hook fires', () => {
