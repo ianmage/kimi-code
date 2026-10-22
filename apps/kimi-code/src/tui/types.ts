@@ -81,6 +81,8 @@ export interface AppState {
   /** Mirrors the TUI config toggle; defaults to true when absent from older fixtures. */
   cacheExpiryHint?: boolean;
   disableFeedbackSurvey?: boolean;
+  /** Mirrors the TUI config toggle; defaults to true when absent from older fixtures. */
+  autoSessionTitle?: boolean;
   notifications: NotificationsConfig;
   upgrade: UpgradePreferences;
   /** Footer status line customization from tui.toml; absent means the default layout. */
@@ -163,6 +165,9 @@ export interface BackgroundAgentMetadata {
   readonly parentToolCallId: string;
   readonly agentName?: string;
   readonly description?: string;
+  /** Background task id carried on the spawn event (Agent tool only); lets the
+   *  terminal card register before `background.task.started` syncs. */
+  readonly taskId?: string;
   /** Display name of the model the agent is bound to (resolved at spawn). */
   readonly model?: string;
   /** Thinking effort, set only for concrete levels (boolean on/off hidden). */
@@ -175,6 +180,10 @@ export interface BackgroundAgentStatusData {
   readonly phase: BackgroundAgentStatusPhase;
   readonly headline: string;
   readonly detail?: string;
+  /** Subagent behind a background-agent card; lets the task-notification
+   *  anchor reuse a terminal card that was mounted before its task id was
+   *  known (e.g. a tower worker that finished before `registerTask`). */
+  readonly agentId?: string;
 }
 
 export interface CompactionTranscriptData {
@@ -287,9 +296,13 @@ export interface QueuedMessage {
   readonly imageAttachmentIds?: readonly number[];
   readonly videoAttachmentIds?: readonly number[];
   readonly mediaSnapshots?: readonly MediaAttachment[];
-  readonly mode?: 'prompt' | 'bash';
+  readonly mode?: 'prompt' | 'bash' | 'compact';
   /** Skills to activate together with this queued message's prompt. */
   readonly inlineSkillActivations?: readonly InlineSkillActivation[];
+  readonly compactInstruction?: string;
+  readonly compactRetries?: number;
+  /** Auto-compaction serial at enqueue time; a mismatch at dequeue skips the fire. */
+  readonly queuedAfterAutoSerial?: number;
 }
 
 /**

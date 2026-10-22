@@ -125,7 +125,7 @@ export interface SlashCommandHost {
   showNotice(title: string, detail?: string): void;
   appendTranscriptEntry(entry: TranscriptEntry): void;
   track(event: string, props?: Record<string, unknown>): void;
-  mountEditorReplacement(panel: Component & Focusable): void;
+  mountEditorReplacement(panel: Component & Focusable, onDisplaced?: () => void): void;
   restoreEditor(): void;
   restoreInputText(text: string): void;
   refreshSlashCommandAutocomplete(): void;
@@ -156,13 +156,17 @@ export interface SlashCommandHost {
    * fails.
    */
   ensureSession(): Promise<Session | undefined>;
-  /** Await the in-flight lazy session creation, if any (v2); no-op otherwise. */
-  waitForLazyCreation(): Promise<void>;
+  /** Await in-flight session assembly — lazy creation or a `/new` replacement — if any; no-op otherwise. */
+  waitForSessionAssembly(): Promise<void>;
+  /** True while a `/new` replacement is assembling; idle checks must treat it as busy. */
+  readonly sessionReplacementInFlight: boolean;
   switchToSession(session: Session, message: string): Promise<void>;
   reloadCurrentSessionView(session: Session, message: string): Promise<void>;
   beginSessionRequest(): void;
   failSessionRequest(message: string): void;
   sendQueuedMessage(session: Session, item: QueuedMessage): void;
+  /** Queue a `/compact` for FIFO dispatch; false when one is already queued. */
+  enqueueCompactCommand(args: string): boolean;
   requestQueuedGoalPromotion?(): void;
   /** Reset the client-side cache-break baseline after the context was cut
    *  (/undo): the next step's cache-read drop is expected, not a break. */
@@ -297,6 +301,16 @@ async function executeSlashCommand(
       host.sendNormalUserInput(intent.input);
       return;
     case 'builtin':
+      if (intent.enqueue === true) {
+        if (!host.enqueueCompactCommand(intent.args)) {
+          host.track('input_command_invalid', { reason: 'duplicate-compact', command: intent.name });
+          host.showError('A /compact is already queued.');
+          host.restoreInputText(input);
+          return;
+        }
+        host.track('input_queue');
+        return;
+      }
       host.track('input_command', { command: intent.name });
       if (intent.name === 'new' && parsedCommand?.name === 'clear') {
         host.track('clear');
@@ -361,6 +375,17 @@ async function handleBuiltInSlashCommand(
       command !== undefined &&
       resolveSlashCommandAvailability(command, args) === 'idle-only'
     ) {
+      // Same enqueue semantics as the dispatch builtin branch: a /compact
+      // submitted before the session existed joins the queue when the
+      // awaited creation lands on a running turn.
+      if (name === 'compact' && busyReason === 'streaming' && !host.state.appState.isCompacting) {
+        if (!host.enqueueCompactCommand(args)) {
+          host.showError('A /compact is already queued.');
+          // Same restore as the adjacent blocked path, guarded the same way.
+          if (canRestoreSubmittedInput(host)) host.restoreInputText(input);
+        }
+        return;
+      }
       host.showError(slashBusyMessage(name, busyReason));
       // Same as the dispatch blocked branch: give the cleared input back,
       // guarded the same way — session creation awaited above.
@@ -381,7 +406,7 @@ async function handleBuiltInSlashCommand(
     case 'new': {
       // A first-use lazy creation may still be in flight: wait it out so /new
       // never races a second createSession against the pending prompt.
-      await host.waitForLazyCreation();
+      await host.waitForSessionAssembly();
       // The waited-out prompt may have started a turn meanwhile; /new is
       // idle-only, so re-run the busy gate resolved before the await.
       const busyReason = slashCommandBusyReason({

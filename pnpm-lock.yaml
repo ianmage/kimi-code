@@ -72,6 +72,9 @@ importers:
 
   apps/kimi-code:
     dependencies:
+      chokidar:
+        specifier: ^4.0.3
+        version: 4.0.3
       qrcode:
         specifier: ^1.5.4
         version: 1.5.4
@@ -91,6 +94,9 @@ importers:
       '@moonshot-ai/kimi-code-oauth':
         specifier: workspace:^
         version: link:../../packages/oauth
+      '@moonshot-ai/kimi-code-product':
+        specifier: workspace:^
+        version: link:../../packages/product
       '@moonshot-ai/kimi-code-sdk':
         specifier: workspace:^
         version: link:../../packages/node-sdk
@@ -644,6 +650,9 @@ importers:
       '@moonshot-ai/kimi-code-oauth':
         specifier: workspace:^
         version: link:../oauth
+      '@moonshot-ai/kimi-code-product':
+        specifier: workspace:^
+        version: link:../product
       '@moonshot-ai/minidb':
         specifier: workspace:*
         version: link:../minidb
@@ -777,6 +786,9 @@ importers:
       '@moonshot-ai/kimi-code-oauth':
         specifier: workspace:^
         version: link:../oauth
+      '@moonshot-ai/kimi-code-product':
+        specifier: workspace:^
+        version: link:../product
       '@moonshot-ai/klient':
         specifier: workspace:^
         version: link:../klient
@@ -818,6 +830,18 @@ importers:
       chalk:
         specifier: ^5.4.1
         version: 5.6.2
+
+  packages/product:
+    dependencies:
+      '@moonshot-ai/agent-core-v2':
+        specifier: workspace:^
+        version: link:../agent-core-v2
+      '@moonshot-ai/kimi-code-oauth':
+        specifier: workspace:^
+        version: link:../oauth
+      zod:
+        specifier: 'catalog:'
+        version: 4.3.6
 
   packages/remote-control:
     dependencies:

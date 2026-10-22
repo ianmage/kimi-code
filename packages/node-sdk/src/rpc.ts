@@ -65,6 +65,8 @@ import type {
   RenameSessionInput,
   ResumeSessionInput,
   ResumedSessionSummary,
+  RefreshProviderModelsOptions,
+  RefreshProviderModelsResponse,
   SessionSummary,
   SessionSummaryPage,
   SkillSummary,
@@ -167,11 +169,22 @@ export interface SessionWarningInfo {
   readonly severity: 'info' | 'warning' | 'error';
 }
 
+export interface ConfigSectionChange {
+  readonly domain: string;
+  readonly source: 'load' | 'reload' | 'set';
+  readonly value: unknown;
+  readonly previousValue: unknown;
+}
+
 export abstract class SDKRpcClientBase {
   private readonly interactiveAgentScope = new AsyncLocalStorage<string>();
   private readonly eventListeners = new Set<(event: Event) => void>();
   private readonly approvalHandlers = new Map<string, ApprovalHandler>();
   private readonly questionHandlers = new Map<string, QuestionHandler>();
+  private readonly staleReloadHandlers = new Map<
+    string,
+    (summary: ResumedSessionSummary) => Promise<void>
+  >();
 
   get interactiveAgentId(): string {
     return this.interactiveAgentScope.getStore() ?? MAIN_AGENT_ID;
@@ -213,19 +226,21 @@ export abstract class SDKRpcClientBase {
 
   abstract getConfigDiagnostics(): Promise<ConfigDiagnostics>;
 
+  abstract onConfigSectionChanged(listener: (change: ConfigSectionChange) => void): Unsubscribe;
+
   abstract getExperimentalFeatures(): Promise<readonly ExperimentalFeatureState[]>;
 
   abstract setConfig(input: KimiConfigPatch): Promise<KimiConfig>;
 
   abstract removeProvider(providerId: string): Promise<KimiConfig>;
 
-  abstract supportsAtomicSectionReplace(): boolean;
-
   abstract importCustomRegistry(
     options: ImportCustomRegistryOptions,
   ): Promise<ImportCustomRegistryResult>;
 
-  abstract replaceConfigSections(sections: Record<string, unknown>): Promise<void>;
+  abstract refreshProviderModels(
+    options?: RefreshProviderModelsOptions,
+  ): Promise<RefreshProviderModelsResponse>;
 
   abstract uploadFile(data: Uint8Array, options: UploadFileOptions): Promise<FileMeta>;
 
@@ -487,9 +502,28 @@ export abstract class SDKRpcClientBase {
     this.questionHandlers.set(sessionId, handler);
   }
 
+  setStaleReloadHandler(
+    sessionId: string,
+    handler: ((summary: ResumedSessionSummary) => Promise<void>) | undefined,
+  ): void {
+    if (handler === undefined) {
+      this.staleReloadHandlers.delete(sessionId);
+      return;
+    }
+    this.staleReloadHandlers.set(sessionId, handler);
+  }
+
   clearSessionHandlers(sessionId: string): void {
     this.approvalHandlers.delete(sessionId);
     this.questionHandlers.delete(sessionId);
+    this.staleReloadHandlers.delete(sessionId);
+  }
+
+  protected async notifyStaleReload(
+    sessionId: string,
+    summary: ResumedSessionSummary,
+  ): Promise<void> {
+    await this.staleReloadHandlers.get(sessionId)?.(summary);
   }
 
   async requestApproval(

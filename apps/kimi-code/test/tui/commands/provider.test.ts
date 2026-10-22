@@ -35,7 +35,7 @@ function makeHost(
   };
   const host = {
     state: { appState },
-    waitForLazyCreation: vi.fn(async () => {}),
+    waitForSessionAssembly: vi.fn(async () => {}),
     harness: {
       setConfig: vi.fn(async () => ({})),
     },
@@ -51,7 +51,7 @@ function makeHost(
       refreshConfigAfterLogin: ReturnType<typeof vi.fn>;
       activateModelAfterLogin: ReturnType<typeof vi.fn>;
     };
-    waitForLazyCreation: ReturnType<typeof vi.fn>;
+    waitForSessionAssembly: ReturnType<typeof vi.fn>;
     track: ReturnType<typeof vi.fn>;
   };
   return { host };
@@ -147,9 +147,20 @@ describe('setDefaultModel', () => {
 
     await setDefaultModel(host, 'opus', 'high');
 
-    expect(host.waitForLazyCreation).toHaveBeenCalled();
+    expect(host.waitForSessionAssembly).toHaveBeenCalled();
     expect(
-      host.waitForLazyCreation.mock.invocationCallOrder[0]!,
+      host.waitForSessionAssembly.mock.invocationCallOrder[0]!,
     ).toBeLessThan(host.harness.setConfig.mock.invocationCallOrder[0]!);
+  });
+
+  it('skips the follow-up activation and forwards the picked effort when the gate owns the switch', async () => {
+    const { host } = makeHost();
+    host.authFlow.refreshConfigAfterLogin = vi.fn(async () => 'gated' as const);
+
+    await setDefaultModel(host, 'opus', 'xhigh');
+
+    expect(host.authFlow.refreshConfigAfterLogin).toHaveBeenCalledWith('xhigh');
+    expect(host.authFlow.activateModelAfterLogin).not.toHaveBeenCalled();
+    expect(host.track).not.toHaveBeenCalled();
   });
 });

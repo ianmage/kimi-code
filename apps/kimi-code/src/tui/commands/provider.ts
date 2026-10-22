@@ -28,7 +28,7 @@ import { TabbedModelSelectorComponent } from '../components/dialogs/tabbed-model
 import { DEFAULT_OAUTH_PROVIDER_NAME } from '../constant/kimi-tui';
 import { formatErrorMessage } from '../utils/event-payload';
 import { thinkingEffortToConfig } from '../utils/thinking-config';
-import { effectiveModelForHost } from './config';
+import { effectiveModelForHost } from '../utils/model-switch';
 import {
   promptApiKey,
   promptBaseUrl,
@@ -307,7 +307,7 @@ export async function setDefaultModel(
     // A first prompt may still be inside lazy creation: wait it out so the
     // pick lands on the new session instead of racing its assembly (same
     // coordination as the /model path).
-    await host.waitForLazyCreation();
+    await host.waitForSessionAssembly();
   }
   await host.harness.setConfig({
     defaultModel: alias,
@@ -319,11 +319,15 @@ export async function setDefaultModel(
   // lazy session can come live while the config writes above are pending; a
   // session created BY activation (v1) or a same-alias rebind does not count
   // — both bind the model without an engine event.
-  let engineTrackedSwitch = await host.authFlow.refreshConfigAfterLogin();
+  const refreshed = await host.authFlow.refreshConfigAfterLogin(effort);
+  // A mounted confirmation gate owns the whole switch — including the picked
+  // effort — so the follow-up activation must not fire under the open dialog.
+  const gateOwnsSwitch = refreshed === 'gated';
+  let engineTrackedSwitch = refreshed === 'gated' ? true : refreshed;
   // refreshConfigAfterLogin reactivates from the persisted config, so a pick
   // the gate keeps session-only never reaches the runtime — apply it after
   // the refresh, or the persisted value would clobber it.
-  if (thinking.effort === undefined && effort !== 'off' && effort !== 'on') {
+  if (!gateOwnsSwitch && thinking.effort === undefined && effort !== 'off' && effort !== 'on') {
     engineTrackedSwitch =
       (await host.authFlow.activateModelAfterLogin(alias, effort)) || engineTrackedSwitch;
   }

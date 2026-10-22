@@ -201,6 +201,7 @@ function makeSession(
     getGoal: vi.fn(async () => ({ goal: null })),
     setApprovalHandler: vi.fn(),
     setQuestionHandler: vi.fn(),
+    setStaleReloadHandler: vi.fn(),
     setModel: vi.fn(async () => {}),
     setThinking: vi.fn(async () => {}),
     setPermission: vi.fn(async () => {}),
@@ -225,6 +226,7 @@ function makeHarness(initialSession: Session) {
       },
     })),
     setConfig: vi.fn(async () => ({ providers: {} })),
+    onConfigSectionChanged: vi.fn(() => vi.fn()),
     createSession: vi.fn(async () => initialSession),
     resumeSession: vi.fn(async () => initialSession),
     forkSession: vi.fn(async () => initialSession),
@@ -967,6 +969,9 @@ describe('KimiTUI resume message replay', () => {
     ).toBe(false);
     expect(driver.sessionEventHandler.backgroundTaskTranscriptedTerminal.has('task-bg-timeout'))
       .toBe(true);
+    // An agent-kind task termination mounts no transcript card on its own —
+    // the subagent lifecycle path owns agent terminal cards, and here it is
+    // suppressed because the task was already transcripted as timed out.
     expect(
       driver.state.transcriptEntries.some(
         (entry) => entry.backgroundAgentStatus?.phase === 'failed',
@@ -1138,6 +1143,27 @@ describe('KimiTUI resume message replay', () => {
 
     const transcript = stripAnsi(driver.state.transcriptContainer.render(120).join('\n'));
     expect(transcript).toContain('cron report final');
+    expect(transcript).toContain('real answer');
+  });
+
+  it('keeps the previous turn’s final answer visible when a task-notification turn follows in replay', async () => {
+    const driver = await replayIntoDriver([
+      message('user', [{ type: 'text', text: 'real prompt' }]),
+      message('assistant', [{ type: 'text', text: 'real answer' }]),
+      message('user', [{ type: 'text', text: 'task finished' }], {
+        origin: {
+          kind: 'task',
+          taskId: 'task-1',
+          status: 'completed',
+          notificationId: 'ntf-1',
+        },
+      }),
+      message('assistant', [{ type: 'text', text: 'task report part one' }]),
+      message('assistant', [{ type: 'text', text: 'task report final' }]),
+    ]);
+
+    const transcript = stripAnsi(driver.state.transcriptContainer.render(120).join('\n'));
+    expect(transcript).toContain('task report final');
     expect(transcript).toContain('real answer');
   });
 
