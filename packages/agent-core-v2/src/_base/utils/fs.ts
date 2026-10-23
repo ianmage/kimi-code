@@ -24,6 +24,45 @@ export function syncDirSync(dirPath: string): void {
   }
 }
 
+async function replaceFile(tmpPath: string, filePath: string): Promise<void> {
+  if (process.platform !== 'win32') {
+    await rename(tmpPath, filePath);
+    return;
+  }
+  const displacedPath =
+    `${filePath}.tmp.displaced.${process.pid}.${randomBytes(4).toString('hex')}`;
+  let displaced = false;
+  try {
+    await rename(filePath, displacedPath);
+    displaced = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  try {
+    await rename(tmpPath, filePath);
+  } catch (error) {
+    if (!displaced) throw error;
+    try {
+      await rename(displacedPath, filePath);
+    } catch {
+      const code = (error as NodeJS.ErrnoException).code ?? 'unknown';
+      throw Object.assign(
+        new Error(
+          `could not replace ${filePath} (${code}); ` +
+            `the previous bytes are stranded at ${displacedPath}`,
+          { cause: error },
+        ),
+        { code: 'EIO' },
+      );
+    }
+    throw error;
+  }
+  try {
+    await unlink(displacedPath);
+  } catch {
+  }
+}
+
 export async function writeFileAtomicDurable(
   filePath: string,
   content: string | Uint8Array,
@@ -38,15 +77,7 @@ export async function writeFileAtomicDurable(
     } finally {
       await fh.close();
     }
-    if (process.platform === 'win32') {
-      try {
-        await unlink(filePath);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') throw error;
-      }
-    }
-    await rename(tmpPath, filePath);
+    await replaceFile(tmpPath, filePath);
     renamed = true;
     await syncDir(dirname(filePath));
   } finally {
@@ -92,16 +123,8 @@ export async function atomicWrite(
     } finally {
       await fh.close();
     }
-    if (process.platform === 'win32') {
-      try {
-        await unlink(filePath);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') throw error;
-      }
-    }
     signal?.throwIfAborted();
-    await rename(tmpPath, filePath);
+    await replaceFile(tmpPath, filePath);
     renamed = true;
   } finally {
     if (!renamed) {
@@ -145,16 +168,8 @@ export async function atomicWriteStream(
     } finally {
       await fh.close();
     }
-    if (process.platform === 'win32') {
-      try {
-        await unlink(filePath);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') throw error;
-      }
-    }
     signal?.throwIfAborted();
-    await rename(tmpPath, filePath);
+    await replaceFile(tmpPath, filePath);
     renamed = true;
   } finally {
     signal?.removeEventListener('abort', onAbort);

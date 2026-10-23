@@ -1,7 +1,15 @@
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 
+import {
+  findProjectRoot,
+  projectLocalConfigPath,
+  type ProjectLocalConfigDiagnostic,
+  type ProjectLocalConfigFs,
+  type ProjectLocalConfigLoad,
+} from '@moonshot-ai/agent-core-v2/app/projectLocalConfig/projectLocalConfigReader';
 import { resolveConfigPath, type KimiConfigValidationIssue } from '@moonshot-ai/kimi-code-sdk';
 import type { Command } from 'commander';
 import { z } from 'zod';
@@ -24,6 +32,10 @@ export interface DoctorDeps {
   readonly fileExists?: (path: string) => boolean;
   readonly readTextFile?: (path: string) => Promise<string>;
   readonly validateConfigToml?: (text: string, path: string) => MaybePromise<string | void>;
+  readonly readProjectLocalConfig?: (
+    workDir: string,
+    deps: { fs: ProjectLocalConfigFs; homeDir: string },
+  ) => Promise<ProjectLocalConfigLoad>;
 }
 
 export interface DoctorOptions {
@@ -31,13 +43,22 @@ export interface DoctorOptions {
   readonly path?: string;
 }
 
-interface CheckSpec {
-  readonly label: 'config.toml' | 'tui.toml';
+interface CheckSpecBase {
+  readonly label: 'config.toml' | 'tui.toml' | 'local.toml';
   readonly path: string;
   readonly explicit: boolean;
-  /** Throws on invalid content; may return a non-fatal warning message. */
-  readonly parse: (text: string, path: string) => MaybePromise<string | void>;
 }
+
+type CheckSpec =
+  | (CheckSpecBase & {
+      readonly kind: 'parse';
+      /** Throws on invalid content; may return a non-fatal warning message. */
+      readonly parse: (text: string, path: string) => MaybePromise<string | void>;
+    })
+  | (CheckSpecBase & {
+      readonly kind: 'check';
+      readonly check: (deps: ResolvedDoctorDeps) => Promise<CheckResult>;
+    });
 
 interface CheckResult {
   readonly label: CheckSpec['label'];
@@ -56,13 +77,21 @@ interface ResolvedDoctorDeps {
   readonly fileExists: (path: string) => boolean;
   readonly readTextFile: (path: string) => Promise<string>;
   readonly validateConfigToml: (text: string, path: string) => MaybePromise<string | void>;
+  readonly readProjectLocalConfig: (
+    workDir: string,
+    deps: { fs: ProjectLocalConfigFs; homeDir: string },
+  ) => Promise<ProjectLocalConfigLoad>;
 }
 
 export async function handleDoctor(deps: DoctorDeps, options: DoctorOptions): Promise<number> {
   const resolved = resolveDeps(deps);
   const cwd = resolved.cwd();
   const specs = await buildCheckSpecs(resolved, options, cwd);
-  const results = await Promise.all(specs.map((spec) => checkTomlFile(resolved, spec)));
+  const results = await Promise.all(
+    specs.map((spec) =>
+      spec.kind === 'check' ? spec.check(resolved) : checkTomlFile(resolved, spec),
+    ),
+  );
 
   const issueCount = results.filter((result) => result.status === 'ERROR').length;
   const text = issueCount === 0 ? formatSuccess(results) : formatFailure(results, issueCount);
@@ -124,8 +153,28 @@ function resolveDeps(deps: Partial<DoctorDeps> | DoctorDeps | undefined): Resolv
         const { validateConfigTomlV2 } = await import('../v2/validate-config');
         return validateConfigTomlV2(text, filePath);
       }),
+    readProjectLocalConfig: deps?.readProjectLocalConfig ?? readProjectLocalConfigFromHost,
   };
 }
+
+async function readProjectLocalConfigFromHost(
+  workDir: string,
+  deps: { fs: ProjectLocalConfigFs; homeDir: string },
+): Promise<ProjectLocalConfigLoad> {
+  const { readProjectLocalConfig } = await import(
+    '@moonshot-ai/agent-core-v2/app/projectLocalConfig/projectLocalConfigReader'
+  );
+  return readProjectLocalConfig(workDir, deps);
+}
+
+const hostProjectLocalFs: ProjectLocalConfigFs = {
+  readText: (path) => readFile(path, 'utf-8'),
+  stat: async (path) => {
+    const stats = await stat(path);
+    return { isDirectory: stats.isDirectory() };
+  },
+  lstat: (path) => lstat(path),
+};
 
 async function buildCheckSpecs(
   deps: ResolvedDoctorDeps,
@@ -154,6 +203,7 @@ async function buildCheckSpecs(
   return [
     makeConfigSpec(await deps.defaultConfigPath(), false, deps),
     makeTuiSpec(deps.defaultTuiConfigPath(), false),
+    await makeLocalSpec(deps, cwd),
   ];
 }
 
@@ -163,6 +213,7 @@ function makeConfigSpec(
   deps: ResolvedDoctorDeps,
 ): CheckSpec {
   return {
+    kind: 'parse',
     label: 'config.toml',
     path,
     explicit,
@@ -174,6 +225,7 @@ function makeConfigSpec(
 
 function makeTuiSpec(path: string, explicit: boolean): CheckSpec {
   return {
+    kind: 'parse',
     label: 'tui.toml',
     path,
     explicit,
@@ -183,7 +235,86 @@ function makeTuiSpec(path: string, explicit: boolean): CheckSpec {
   };
 }
 
-async function checkTomlFile(deps: ResolvedDoctorDeps, spec: CheckSpec): Promise<CheckResult> {
+async function makeLocalSpec(deps: ResolvedDoctorDeps, cwd: string): Promise<CheckSpec> {
+  const configPath = projectLocalConfigPath(await findProjectRoot(cwd, hostProjectLocalFs));
+
+  return {
+    kind: 'check',
+    label: 'local.toml',
+    path: configPath,
+    explicit: false,
+    check: async () => {
+      try {
+        const load = await deps.readProjectLocalConfig(cwd, {
+          fs: hostProjectLocalFs,
+          homeDir: homedir(),
+        });
+        return checkProjectLocalConfig(load);
+      } catch (error: unknown) {
+        return {
+          label: 'local.toml',
+          path: configPath,
+          status: 'ERROR',
+          message: formatErrorMessage(error, configPath),
+        };
+      }
+    },
+  };
+}
+
+function checkProjectLocalConfig(load: ProjectLocalConfigLoad): CheckResult {
+  if (load.source === 'absent') {
+    return {
+      label: 'local.toml',
+      path: load.configPath,
+      status: 'SKIP',
+      message: 'File does not exist; no project-local directories are configured.',
+    };
+  }
+
+  const fileDiagnostics = load.diagnostics.filter((diagnostic) => diagnostic.scope === 'file');
+  const entryDiagnostics = load.diagnostics.filter(isEntryDiagnostic);
+  const invalidEntries = entryDiagnostics.filter((diagnostic) => diagnostic.category === 'empty');
+
+  if (fileDiagnostics.length > 0 || invalidEntries.length > 0) {
+    return {
+      label: 'local.toml',
+      path: load.configPath,
+      status: 'ERROR',
+      message: [
+        ...fileDiagnostics.map((diagnostic) => diagnostic.message),
+        ...invalidEntries.map(formatEntryDiagnostic),
+      ].join('\n'),
+    };
+  }
+
+  return {
+    label: 'local.toml',
+    path: load.configPath,
+    status: 'OK',
+    message:
+      entryDiagnostics.length === 0
+        ? undefined
+        : entryDiagnostics.map(formatEntryDiagnostic).join('\n'),
+  };
+}
+
+function isEntryDiagnostic(
+  diagnostic: ProjectLocalConfigDiagnostic,
+): diagnostic is Extract<ProjectLocalConfigDiagnostic, { scope: 'entry' }> {
+  return diagnostic.scope === 'entry';
+}
+
+function formatEntryDiagnostic(
+  diagnostic: Extract<ProjectLocalConfigDiagnostic, { scope: 'entry' }>,
+): string {
+  return `${diagnostic.entry || '<empty>'} → ${diagnostic.category}`;
+}
+
+async function checkTomlFile(
+  deps: ResolvedDoctorDeps,
+  spec: Extract<CheckSpec, { kind: 'parse' }>,
+): Promise<CheckResult> {
   if (!deps.fileExists(spec.path)) {
     return {
       label: spec.label,
