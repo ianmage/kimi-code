@@ -200,6 +200,8 @@ export type KimiErrorCode =
   | 'session.busy'
   | 'shell.git_bash_not_found'
   | 'workspace.not_found'
+  | 'workspace.additional_dir_unavailable'
+  | 'workspace.additional_dir_persist_blocked'
   | 'terminal.not_found'
   | 'file.not_found'
   | 'file.too_large'

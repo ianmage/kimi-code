@@ -74,8 +74,7 @@ export class WorkspaceTrustDisclosureService implements IWorkspaceTrustDisclosur
       }),
       this.readGatedAdditionalDirs().catch((error: unknown) => {
         this.log.warn(`trust disclosure: additional dirs scan failed: ${String(error)}`);
-        warnings.push('Could not inspect additional directory configuration.');
-        return { dirs: [], sources: [] };
+        return { dirs: [], sources: [], fileLevel: true };
       }),
       this.readGatedSkillRoots().catch((error: unknown) => {
         this.log.warn(`trust disclosure: skill roots scan failed: ${String(error)}`);
@@ -88,6 +87,9 @@ export class WorkspaceTrustDisclosureService implements IWorkspaceTrustDisclosur
         return EMPTY_INSTRUCTION_SOURCES;
       }),
     ]);
+    if (configuredDirs.fileLevel) {
+      warnings.push('Could not inspect additional directory configuration.');
+    }
     const additionalDirs = [...configuredDirs.dirs, ...skillRoots].filter(
       (dir, index, all) => all.indexOf(dir) === index,
     );
@@ -119,8 +121,11 @@ export class WorkspaceTrustDisclosureService implements IWorkspaceTrustDisclosur
   private async readGatedAdditionalDirs(): Promise<{
     dirs: readonly string[];
     sources: readonly string[];
+    fileLevel: boolean;
   }> {
     const result = await this.localConfig.readAdditionalDirs(this.context.cwd);
+    const fileLevel = result.diagnostics.some((diagnostic) => diagnostic.scope === 'file');
+    if (fileLevel) return { dirs: [], sources: [], fileLevel };
     const realRoot = await realpathOrSelf(this.fs, result.projectRoot);
     const dirs: string[] = [];
     for (const dir of result.additionalDirs) {
@@ -131,6 +136,7 @@ export class WorkspaceTrustDisclosureService implements IWorkspaceTrustDisclosur
     return {
       dirs,
       sources: dirs.length > 0 ? [await realpathOrSelf(this.fs, result.configPath)] : [],
+      fileLevel,
     };
   }
 

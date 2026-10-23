@@ -1,7 +1,24 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+import type { ILogService } from '@moonshot-ai/agent-core-v2/_base/log/log';
+import type { IAgentProfileRegistry } from '@moonshot-ai/agent-core-v2/app/agentProfileCatalog/agentProfileRegistry';
+import type { IBootstrapService } from '@moonshot-ai/agent-core-v2/app/bootstrap/bootstrap';
+import type { IConfigService } from '@moonshot-ai/agent-core-v2/app/config/config';
+import type {
+  ProjectLocalConfigDiagnostic,
+  ProjectLocalConfigLoad,
+} from '@moonshot-ai/agent-core-v2/app/projectLocalConfig/projectLocalConfigReader';
+import type { IWorkspaceSkillCatalog } from '@moonshot-ai/agent-core-v2/features/skill/workspace/workspaceSkillCatalog';
+import { HostFileSystem } from '@moonshot-ai/agent-core-v2/os/backends/node-local/hostFsService';
+import { ErrorCodes } from '@moonshot-ai/agent-core-v2/errors';
+import { FileProjectLocalConfigService } from '@moonshot-ai/agent-core-v2/persistence/backends/node-fs/projectLocalConfigService';
+import type { IWorkspaceAgentProfileLoader } from '@moonshot-ai/agent-core-v2/workspace/workspaceAgentProfileLoader/workspaceAgentProfileLoader';
+import type { IWorkspaceContext } from '@moonshot-ai/agent-core-v2/workspace/workspaceContext/workspaceContext';
+import type { IWorkspaceInstructionsService } from '@moonshot-ai/agent-core-v2/workspace/workspaceInstructions/workspaceInstructions';
+import { WorkspaceTrustDisclosureService } from '@moonshot-ai/agent-core-v2/workspace/workspaceTrust/trustDisclosureService';
+import type { IWorkspaceTrust } from '@moonshot-ai/agent-core-v2/workspace/workspaceTrust/workspaceTrust';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -23,7 +40,7 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-function makeDeps(): {
+function makeDeps(overrides: Partial<DoctorDeps> = {}): {
   deps: DoctorDeps;
   stdout: string[];
   stderr: string[];
@@ -43,11 +60,48 @@ function makeDeps(): {
         exitCodes.push(code);
         throw new Error(`exit ${String(code)}`);
       },
+      ...overrides,
     },
     stdout,
     stderr,
     exitCodes,
   };
+}
+
+function makeLoad(
+  diagnostics: readonly ProjectLocalConfigDiagnostic[] = [],
+  source: 'absent' | 'present' = 'present',
+): ProjectLocalConfigLoad {
+  return {
+    projectRoot: dir,
+    configPath: join(dir, '.kimi-code', 'local.toml'),
+    additionalDirs: [],
+    diagnostics,
+    source,
+  };
+}
+
+function tomlPath(path: string): string {
+  return path.replaceAll('\\', '/');
+}
+
+async function writeLocalConfig(text: string): Promise<string> {
+  const configDir = join(dir, '.kimi-code');
+  await mkdir(configDir, { recursive: true });
+  const path = join(configDir, 'local.toml');
+  await writeFile(path, text, 'utf-8');
+  return path;
+}
+
+function throwingStub<T>(label: string): T {
+  return new Proxy(
+    {},
+    {
+      get() {
+        throw new Error(`${label} is not stubbed`);
+      },
+    },
+  ) as T;
 }
 
 async function writeValidConfig(path = join(dir, 'config.toml')): Promise<void> {
@@ -317,6 +371,218 @@ max_context_size = "large"
     const err = stderr.join('');
     expect(err).toContain('Validation issues:');
     expect(err).toContain('models.kimi.max_context_size:');
+  });
+
+  it('skips local.toml when the project-local config file does not exist', async () => {
+    const { deps, stdout, stderr } = makeDeps({
+      readProjectLocalConfig: async () => makeLoad([], 'absent'),
+    });
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(0);
+    expect(stderr.join('')).toBe('');
+    const out = stdout.join('');
+    expect(out).toContain('SKIP local.toml');
+    expect(out).toContain('File does not exist; no project-local directories are configured.');
+  });
+
+  it('trusts the load over a second existence check', async () => {
+    await writeLocalConfig('[workspace]\nadditional_dir = []\n');
+    const { deps, stdout } = makeDeps({
+      readProjectLocalConfig: async () => makeLoad([], 'absent'),
+    });
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(0);
+    expect(stdout.join('')).toContain('SKIP local.toml');
+  });
+
+  it('reports an error instead of dying when the project-local reader rejects', async () => {
+    const { deps, stdout, stderr } = makeDeps({
+      readProjectLocalConfig: async () => {
+        throw new Error('reader exploded');
+      },
+    });
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(1);
+    expect(stdout.join('')).toBe('');
+    const err = stderr.join('');
+    expect(err).toContain('ERROR local.toml');
+    expect(err).toContain('reader exploded');
+  });
+
+  it('reports unavailable project-local directories without failing', async () => {
+    const missingA = join(dir, 'missing-a');
+    const missingB = join(dir, 'missing-b');
+    await writeLocalConfig(`[workspace]\nadditional_dir = ["${tomlPath(missingA)}"]\n`);
+    const { deps, stdout, stderr } = makeDeps({
+      readProjectLocalConfig: async () =>
+        makeLoad([
+          {
+            scope: 'entry',
+            index: 0,
+            entry: missingA,
+            category: 'missing',
+            dir: missingA,
+            code: ErrorCodes.ADDITIONAL_DIR_UNAVAILABLE,
+            message: 'missing',
+          },
+          {
+            scope: 'entry',
+            index: 1,
+            entry: missingB,
+            category: 'not_directory',
+            dir: missingB,
+            code: ErrorCodes.ADDITIONAL_DIR_UNAVAILABLE,
+            message: 'not_directory',
+          },
+        ]),
+    });
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(0);
+    expect(stderr.join('')).toBe('');
+    const out = stdout.join('');
+    expect(out).toContain('OK local.toml');
+    expect(out).toContain(`${missingA} → missing`);
+    expect(out).toContain(`${missingB} → not_directory`);
+  });
+
+  it('fails on an invalid local.toml document', async () => {
+    await writeLocalConfig('[workspace\n');
+    const { deps, stdout, stderr } = makeDeps({
+      readProjectLocalConfig: async () =>
+        makeLoad([
+          {
+            scope: 'file',
+            category: 'toml_invalid',
+            code: ErrorCodes.STORAGE_DECODE_FAILED,
+            message: 'Invalid TOML in local.toml',
+          },
+        ]),
+    });
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(1);
+    expect(stdout.join('')).toBe('');
+    const err = stderr.join('');
+    expect(err).toContain('ERROR local.toml');
+    expect(err).toContain('Invalid TOML in local.toml');
+  });
+
+  it('fails on an empty workspace.additional_dir entry', async () => {
+    await writeLocalConfig('[workspace]\nadditional_dir = [""]\n');
+    const { deps, stdout, stderr } = makeDeps({
+      readProjectLocalConfig: async () =>
+        makeLoad([
+          {
+            scope: 'entry',
+            index: 0,
+            entry: '',
+            category: 'empty',
+            code: ErrorCodes.CONFIG_INVALID,
+            message: 'workspace.additional_dir contains an empty entry',
+          },
+        ]),
+    });
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(1);
+    expect(stdout.join('')).toBe('');
+    const err = stderr.join('');
+    expect(err).toContain('ERROR local.toml');
+    expect(err).toContain('<empty> → empty');
+  });
+
+  it('does not check local.toml when the config target is selected', async () => {
+    const readProjectLocalConfig = vi.fn(async () => makeLoad());
+    const { deps, stdout } = makeDeps({ readProjectLocalConfig });
+
+    const code = await handleDoctor(deps, { target: 'config' });
+
+    expect(code).toBe(0);
+    expect(readProjectLocalConfig).not.toHaveBeenCalled();
+    expect(stdout.join('')).not.toContain('local.toml');
+  });
+
+  it('reads a real project-local config through the default reader', async () => {
+    const missingA = join(dir, 'missing-a');
+    const missingB = join(dir, 'missing-b');
+    const localConfigPath = await writeLocalConfig(
+      `[workspace]\nadditional_dir = ["${tomlPath(missingA)}", "${tomlPath(missingB)}"]\n`,
+    );
+    const { deps, stdout, stderr } = makeDeps();
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(0);
+    expect(stderr.join('')).toBe('');
+    const out = stdout.join('');
+    expect(out).toContain(`OK local.toml   ${tomlPath(localConfigPath)}`);
+    expect(out).toContain(`${tomlPath(missingA)} → missing`);
+    expect(out).toContain(`${tomlPath(missingB)} → missing`);
+
+    await writeFile(localConfigPath, '[workspace\n', 'utf-8');
+    const second = makeDeps();
+
+    const secondCode = await handleDoctor(second.deps, {});
+
+    expect(secondCode).toBe(1);
+    expect(second.stderr.join('')).toContain('ERROR local.toml');
+  });
+
+  it('agrees with the trust disclosure on an invalid project-local config', async () => {
+    await writeLocalConfig('[workspace\n');
+    const hostFs = new HostFileSystem();
+    const bootstrap = {
+      osHomeDir: homedir(),
+      homeDir: homedir(),
+      args: { skillDirs: [] },
+    };
+    const localConfig = new FileProjectLocalConfigService(
+      bootstrap as unknown as IBootstrapService,
+      hostFs,
+    );
+    const load = await localConfig.readAdditionalDirs(dir);
+    expect(load.diagnostics.map((diagnostic) => diagnostic.scope)).toEqual(['file']);
+
+    const disclosure = new WorkspaceTrustDisclosureService(
+      { cwd: dir } as unknown as IWorkspaceContext,
+      hostFs,
+      bootstrap as unknown as IBootstrapService,
+      { get: () => true } as unknown as IConfigService,
+      localConfig,
+      { ready: Promise.resolve(), isTrusted: () => false } as unknown as IWorkspaceTrust,
+      throwingStub<IWorkspaceSkillCatalog>('workspace skill catalog'),
+      throwingStub<IWorkspaceAgentProfileLoader>('workspace agent profile loader'),
+      throwingStub<IAgentProfileRegistry>('agent profile registry'),
+      throwingStub<IWorkspaceInstructionsService>('workspace instructions service'),
+      { warn: () => {} } as unknown as ILogService,
+    );
+
+    const activation = await disclosure.describeGatedActivation();
+
+    const uninspectable = activation.warnings.filter(
+      (warning) => warning === 'Could not inspect additional directory configuration.',
+    );
+    expect(uninspectable).toHaveLength(1);
+    expect(activation.additionalDirs).toEqual([]);
+
+    const { deps, stdout, stderr } = makeDeps();
+
+    const code = await handleDoctor(deps, {});
+
+    expect(code).toBe(1);
+    expect(stdout.join('')).toBe('');
+    expect(stderr.join('')).toContain('ERROR local.toml');
+    expect(stderr.join('')).toContain(`Invalid TOML in ${load.configPath}`);
   });
 });
 

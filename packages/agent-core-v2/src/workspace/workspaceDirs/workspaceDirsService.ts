@@ -4,7 +4,10 @@ import { ILogService } from '#/_base/log/log';
 import { defineState } from '#/state/state';
 import { TimeoutTimer } from '#/_base/utils/timer';
 import { subtreeWatchFilter } from '#/_base/utils/paths';
-import { IProjectLocalConfigService } from '#/app/projectLocalConfig/projectLocalConfig';
+import {
+  IProjectLocalConfigService,
+  type ProjectLocalConfigLoad,
+} from '#/app/projectLocalConfig/projectLocalConfig';
 import type { ISessionWorkspaceInfo } from '#/session/workspaceInfo/workspaceInfo';
 import { IWorkspaceStateService } from '#/workspace/state/workspaceState';
 import { IWorkspaceContext } from '#/workspace/workspaceContext/workspaceContext';
@@ -49,7 +52,11 @@ export class WorkspaceDirsService extends Disposable implements IWorkspaceDirs {
     this.states.contributeState(workspaceDirsEphemeralDirsKey);
     this.projectRoot = workspace.cwd;
     this.configPath = '';
-    this.ready = this.enqueue(() => this.reloadFromDisk());
+    this.ready = this.enqueue(() =>
+      this.reloadFromDisk().catch((error: unknown) => {
+        this.log.warn(`local.toml load failed: ${String(error)}`);
+      }),
+    );
     void this.ready.then(() => this.watchLocalToml());
   }
 
@@ -107,6 +114,7 @@ export class WorkspaceDirsService extends Disposable implements IWorkspaceDirs {
         this.workspace.cwd,
         input.path,
       );
+      this.logDiagnostics(persisted);
       this.projectRoot = persisted.projectRoot;
       this.configPath = persisted.configPath;
       const changed = this.setFileDirs(persisted.additionalDirs);
@@ -122,6 +130,7 @@ export class WorkspaceDirsService extends Disposable implements IWorkspaceDirs {
     }
 
     const onDisk = await this.localConfig.readAdditionalDirs(this.workspace.cwd);
+    this.logDiagnostics(onDisk);
     this.projectRoot = onDisk.projectRoot;
     this.configPath = onDisk.configPath;
     const resolved = await this.localConfig.resolveAdditionalDirs(this.workspace.cwd, [
@@ -140,11 +149,26 @@ export class WorkspaceDirsService extends Disposable implements IWorkspaceDirs {
   }
 
   private async reloadFromDisk(): Promise<void> {
-    const onDisk = await this.localConfig.readAdditionalDirs(this.workspace.cwd);
-    this.projectRoot = onDisk.projectRoot;
-    this.configPath = onDisk.configPath;
-    if (this.setFileDirs(onDisk.additionalDirs)) {
+    const load = await this.localConfig.readAdditionalDirs(this.workspace.cwd);
+    this.logDiagnostics(load);
+    this.projectRoot = load.projectRoot;
+    this.configPath = load.configPath;
+    if (this.setFileDirs(load.additionalDirs)) {
       this.onDidChangeEmitter.fire();
+    }
+  }
+
+  private logDiagnostics(load: ProjectLocalConfigLoad): void {
+    for (const diagnostic of load.diagnostics) {
+      if (diagnostic.scope === 'entry') {
+        this.log.warn(
+          `local.toml entry #${diagnostic.index} ignored (${diagnostic.category}) ${diagnostic.dir ?? diagnostic.entry} in ${load.configPath}`,
+        );
+        continue;
+      }
+      this.log.warn(
+        `local.toml unusable (${diagnostic.category}) in ${load.configPath}: ${diagnostic.message}`,
+      );
     }
   }
 
@@ -164,6 +188,9 @@ export class WorkspaceDirsService extends Disposable implements IWorkspaceDirs {
     try {
       const handle = watchCandidates(this.projectRoot, [this.configPath], {
         ignored: subtreeWatchFilter(this.projectRoot, [this.configPath]),
+      });
+      void handle.ready.catch((error: unknown) => {
+        this.log.warn(`cannot watch project-local config ${this.configPath}: ${String(error)}`);
       });
       this._register(handle);
       this._register(

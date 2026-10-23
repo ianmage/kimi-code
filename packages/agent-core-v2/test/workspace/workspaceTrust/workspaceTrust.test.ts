@@ -8,13 +8,26 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { encodeWorkDirKey } from '#/_base/utils/workdir-slug';
 import { DisposableStore } from '#/_base/di/lifecycle';
 import { createServices } from '#/_base/di/test';
+import type { ILogService } from '#/_base/log/log';
 import { JsonAtomicDocumentStore } from '#/persistence/backends/node-fs/atomicDocumentStore';
 import { FileStorageService } from '#/persistence/backends/node-fs/fileStorageService';
 import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
+import type { IAgentProfileRegistry } from '#/app/agentProfileCatalog/agentProfileRegistry';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
+import type { IConfigService } from '#/app/config/config';
+import type {
+  IProjectLocalConfigService,
+  ProjectLocalConfigDiagnostic,
+  ProjectLocalConfigLoad,
+} from '#/app/projectLocalConfig/projectLocalConfig';
 import { ITelemetryService, noopTelemetryService } from '#/app/telemetry/telemetry';
+import type { IWorkspaceSkillCatalog } from '#/features/skill/workspace/workspaceSkillCatalog';
+import type { IHostFileSystem } from '#/os/interface/hostFileSystem';
+import { HostFsError, OsFsErrors } from '#/os/interface/hostFsErrors';
 import { IWorkspaceStateService } from '#/workspace/state/workspaceState';
+import type { IWorkspaceAgentProfileLoader } from '#/workspace/workspaceAgentProfileLoader/workspaceAgentProfileLoader';
 import { IWorkspaceContext } from '#/workspace/workspaceContext/workspaceContext';
+import type { IWorkspaceInstructionsService } from '#/workspace/workspaceInstructions/workspaceInstructions';
 import {
   IWorkspaceTrust,
   type WorkspaceTrustChange,
@@ -24,6 +37,7 @@ import {
   WorkspaceTrustService,
   workspaceTrustTrustedKey,
 } from '#/workspace/workspaceTrust/workspaceTrustService';
+import { WorkspaceTrustDisclosureService } from '#/workspace/workspaceTrust/trustDisclosureService';
 import {
   deleteWorkspaceTrust,
   readWorkspaceTrust,
@@ -228,3 +242,132 @@ describe('WorkspaceTrustService', () => {
     expect(states.snapshot()['workspaceTrust.trusted']).toBe(false);
   });
 });
+
+describe('WorkspaceTrustDisclosureService', () => {
+  const UNINSPECTABLE_WARNING = 'Could not inspect additional directory configuration.';
+
+  let root: string;
+  let scratchDirs: string[];
+
+  beforeEach(() => {
+    root = toPosix(mkdtempSync(join(tmpdir(), 'kimi-trust-disclosure-root-')));
+    scratchDirs = [];
+  });
+
+  afterEach(async () => {
+    await Promise.all([
+      rm(root, { recursive: true, force: true }),
+      ...scratchDirs.map((dir) => rm(dir, { recursive: true, force: true })),
+    ]);
+  });
+
+  function scratchDir(label: string): string {
+    const dir = toPosix(mkdtempSync(join(tmpdir(), `kimi-trust-disclosure-${label}-`)));
+    scratchDirs.push(dir);
+    return dir;
+  }
+
+  function loadResult(
+    additionalDirs: readonly string[],
+    diagnostics: readonly ProjectLocalConfigDiagnostic[],
+  ): ProjectLocalConfigLoad {
+    return {
+      projectRoot: root,
+      configPath: join(root, '.kimi-code', 'local.toml'),
+      additionalDirs,
+      diagnostics,
+      source: 'present',
+    };
+  }
+
+  function createService(load: ProjectLocalConfigLoad): WorkspaceTrustDisclosureService {
+    const notFound = (): never => {
+      throw new HostFsError(OsFsErrors.codes.OS_FS_NOT_FOUND, 'path does not exist');
+    };
+    const fs = {
+      realpath: async (path: string) => path,
+      readText: async () => notFound(),
+      stat: async () => notFound(),
+      lstat: async () => notFound(),
+    };
+    const bootstrap = {
+      homeDir: scratchDir('home'),
+      osHomeDir: scratchDir('os-home'),
+      args: { skillDirs: [] },
+    };
+    return new WorkspaceTrustDisclosureService(
+      { cwd: root, workspaceId: 'workspace-1' } as unknown as IWorkspaceContext,
+      fs as unknown as IHostFileSystem,
+      bootstrap as unknown as IBootstrapService,
+      { get: () => true } as unknown as IConfigService,
+      { readAdditionalDirs: async () => load } as unknown as IProjectLocalConfigService,
+      { ready: Promise.resolve(), isTrusted: () => false } as unknown as IWorkspaceTrust,
+      {
+        ready: Promise.resolve(),
+        catalog: { listSkills: () => [], getSkillRoots: () => [] },
+      } as unknown as IWorkspaceSkillCatalog,
+      { ready: Promise.resolve() } as unknown as IWorkspaceAgentProfileLoader,
+      { entries: () => [] } as unknown as IAgentProfileRegistry,
+      { ready: Promise.resolve(), snapshot: {} } as unknown as IWorkspaceInstructionsService,
+      { warn: () => {} } as unknown as ILogService,
+    );
+  }
+
+  it('warns once and discloses no configured dirs when the config file is invalid', async () => {
+    const dir = scratchDir('configured');
+    const service = createService(
+      loadResult([dir], [
+        {
+          scope: 'file',
+          category: 'toml_invalid',
+          code: 'storage.decode_failed',
+          message: 'Invalid TOML',
+        },
+      ]),
+    );
+
+    const result = await service.describeGatedActivation();
+
+    expect(result.warnings.filter((warning) => warning === UNINSPECTABLE_WARNING)).toHaveLength(1);
+    expect(result.additionalDirs).toEqual([]);
+    expect(result.additionalDirSources).toEqual([]);
+  });
+
+  it('omits a broken entry without warning while keeping the healthy entries', async () => {
+    const healthy = scratchDir('healthy');
+    const missing = join(tmpdir(), 'kimi-trust-disclosure-missing-entry');
+    const service = createService(
+      loadResult([healthy], [
+        {
+          scope: 'entry',
+          index: 1,
+          entry: missing,
+          category: 'missing',
+          code: 'os.fs.not_found',
+          message: 'path does not exist',
+        },
+      ]),
+    );
+
+    const result = await service.describeGatedActivation();
+
+    expect(result.additionalDirs).toEqual([healthy]);
+    expect(result.additionalDirs).not.toContain(missing);
+    expect(result.warnings).not.toContain(UNINSPECTABLE_WARNING);
+  });
+
+  it('discloses the configured dirs and their source when there are no diagnostics', async () => {
+    const dir = scratchDir('configured');
+    const service = createService(loadResult([dir], []));
+
+    const result = await service.describeGatedActivation();
+
+    expect(result.additionalDirs).toEqual([dir]);
+    expect(result.additionalDirSources).toEqual([join(root, '.kimi-code', 'local.toml')]);
+    expect(result.warnings).toEqual([]);
+  });
+});
+
+function toPosix(path: string): string {
+  return path.replaceAll('\\', '/');
+}

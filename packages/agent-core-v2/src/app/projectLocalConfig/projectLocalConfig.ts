@@ -1,20 +1,18 @@
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
+import type { ProjectLocalConfigLoad } from './projectLocalConfigReader';
 
-export interface ProjectAdditionalDirsLoadResult {
-  readonly projectRoot: string;
-  readonly configPath: string;
-  readonly additionalDirs: readonly string[];
-}
+export type {
+  ProjectLocalConfigDiagnostic,
+  ProjectLocalConfigFs,
+  ProjectLocalConfigLoad,
+} from './projectLocalConfigReader';
 
 export interface IProjectLocalConfigService {
   readonly _serviceBrand: undefined;
 
-  readAdditionalDirs(workDir: string): Promise<ProjectAdditionalDirsLoadResult>;
+  readAdditionalDirs(workDir: string): Promise<ProjectLocalConfigLoad>;
   resolveAdditionalDirs(baseDir: string, additionalDirs: readonly string[]): Promise<string[]>;
-  appendAdditionalDir(
-    workDir: string,
-    inputPath: string,
-  ): Promise<ProjectAdditionalDirsLoadResult>;
+  appendAdditionalDir(workDir: string, inputPath: string): Promise<ProjectLocalConfigLoad>;
 }
 
 export const IProjectLocalConfigService: ServiceIdentifier<IProjectLocalConfigService> =

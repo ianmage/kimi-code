@@ -27,7 +27,7 @@ const config = withMermaid(defineConfig({
     ['meta', { name: 'theme-color', content: '#0a7aff' }],
   ],
 
-srcExclude: ['AGENTS.md', 'superpowers/**', '*_REQ.md', '*_SLN.md', '*_PLAN.md', '*_TASK.md', '*_ISSUE.md', '*_USAGE.md'],
+srcExclude: ['AGENTS.md', 'superpowers/**', '*_REQ.md', '*_SLN.md', '*_PLAN.md', '*_TASK.md', '*_ISSUE.md', '*_USAGE.md', '*_REVIEW.md'],
 
   locales: {
     zh: {
