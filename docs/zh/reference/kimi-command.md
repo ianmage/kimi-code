@@ -221,7 +221,7 @@ kimi install-desktop
 
 ### `kimi doctor`
 
-校验 `config.toml` 和 `tui.toml`，不会启动 TUI，也不会修改任一文件。默认检查 `KIMI_CODE_HOME` 下的文件；未设置该环境变量时检查 `~/.kimi-code`。默认路径缺失时会显示为跳过，因为内置默认值仍可生效。
+校验 `config.toml`、`tui.toml` 和当前项目的 `.kimi-code/local.toml`，不会启动 TUI，也不会修改任何文件。默认检查前两个文件，位置在 `KIMI_CODE_HOME` 下；未设置该环境变量时检查 `~/.kimi-code`。默认路径缺失时会显示为跳过，因为内置默认值仍可生效。
 
 ```sh
 kimi doctor
@@ -229,11 +229,13 @@ kimi doctor
 
 | 命令 | 说明 |
 | --- | --- |
-| `kimi doctor` | 校验默认 `config.toml` 和 `tui.toml` |
+| `kimi doctor` | 校验默认 `config.toml` 和 `tui.toml`，以及当前项目的 `local.toml` |
 | `kimi doctor config [path]` | 只校验 `config.toml`；传入 `path` 时使用该文件而不是默认文件 |
 | `kimi doctor tui [path]` | 只校验 `tui.toml`；传入 `path` 时使用该文件而不是默认文件 |
 
 显式传入路径时，文件必须存在。所有被检查的文件都有效或被跳过时，退出码为 `0`；任何指定文件缺失或配置无效时，退出码为 `1`。
+
+`local.toml` 检查会读取工作目录之上项目根目录中的该文件，并列出所有已不存在的 `workspace.additional_dir` 条目。失效条目只报告、不让命令失败，因为缺失目录从不阻塞启动；空条目则算错误。
 
 ```sh
 # 检查默认配置文件

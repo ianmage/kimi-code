@@ -221,7 +221,7 @@ This subcommand has no flags. The former name, `kimi install-app`, still works a
 
 ### `kimi doctor`
 
-Validate `config.toml` and `tui.toml` without starting the TUI or modifying either file. By default, the command checks the files under `KIMI_CODE_HOME` (or `~/.kimi-code` when the environment variable is unset). Missing default files are reported as skipped because built-in defaults can apply.
+Validate `config.toml`, `tui.toml`, and the current project's `.kimi-code/local.toml` without starting the TUI or modifying any file. By default, the command checks the first two under `KIMI_CODE_HOME` (or `~/.kimi-code` when the environment variable is unset). Missing default files are reported as skipped because built-in defaults can apply.
 
 ```sh
 kimi doctor
@@ -229,11 +229,13 @@ kimi doctor
 
 | Command | Description |
 | --- | --- |
-| `kimi doctor` | Validate the default `config.toml` and `tui.toml` |
+| `kimi doctor` | Validate the default `config.toml` and `tui.toml`, plus the current project's `local.toml` |
 | `kimi doctor config [path]` | Validate only `config.toml`, using `path` instead of the default file when provided |
 | `kimi doctor tui [path]` | Validate only `tui.toml`, using `path` instead of the default file when provided |
 
 When an explicit path is passed, the file must exist. The command exits with `0` when all checked files are valid or skipped, and `1` when any requested file is missing or invalid.
+
+The `local.toml` check reads the file from the project root above the working directory and lists every `workspace.additional_dir` entry that no longer exists on disk. Stale entries are reported without failing the command, because a missing directory never blocks startup; empty entries are errors.
 
 ```sh
 # Check the default config files

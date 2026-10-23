@@ -628,6 +628,8 @@ additional_dir = ["/absolute/path/to/shared"]
 
 目录以绝对路径存储，与具体机器相关。因此建议把 `.kimi-code/local.toml` 加入项目的 `.gitignore`，避免被提交。
 
+失效的条目——已删除的检出、被移动的目录、未挂载的磁盘——不会阻止项目打开。Kimi Code 会跳过该条目，正常加载工作区的其余部分，一行过期记录不会变成启动失败。运行 [`kimi doctor`](../reference/kimi-command.md#kimi-doctor) 可以列出这些失效条目，再手工删除。
+
 ### `.kimi-code/ignore`
 
 `ignore` 文件用于过滤搜索结果中的噪音：命中的文件会从 `Grep`、`Glob` 工具和 [Web 界面](../guides/web.md) 的文件树、文件搜索、`@` 补全、内容搜索中消失。目标是让结果列表更干净，而不是让搜索更快。

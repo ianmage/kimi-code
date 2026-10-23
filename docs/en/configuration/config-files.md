@@ -629,6 +629,8 @@ additional_dir = ["/absolute/path/to/shared"]
 
 Because directories are stored as absolute paths, which are specific to your machine, we recommend adding `.kimi-code/local.toml` to your project's `.gitignore` so it is not committed.
 
+An entry that no longer exists — a deleted checkout, a moved folder, an unmounted drive — does not stop the project from opening. Kimi Code skips the missing entry and loads the rest of the workspace, so a stale line never costs you a startup failure. Run [`kimi doctor`](../reference/kimi-command.md#kimi-doctor) to list the stale entries and remove them by hand.
+
 ### `.kimi-code/ignore`
 
 The `ignore` file trims noise out of search results: files it matches disappear from the `Grep` and `Glob` tools and from the [web UI](../guides/web.md) file tree, file search, `@` completion, and content search. The goal is a cleaner result list, not faster searches.
