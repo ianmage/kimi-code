@@ -1,7 +1,6 @@
 import {
   ToolAccesses,
   type ExecutableToolContext,
-  type ExecutableToolErrorResult,
   type ExecutableToolResult,
   type ToolExecution,
 } from '#/tool/toolContract';
@@ -39,12 +38,6 @@ import AGENT_SWARM_DESCRIPTION from './agent-swarm.md?raw';
 import AGENT_SWARM_FORK_DESCRIPTION from './agent-swarm-fork.md?raw';
 
 const DEFAULT_SUBAGENT_TYPE = 'coder';
-
-const SWARM_MODE_OFF_RESULT: ExecutableToolErrorResult = {
-  output:
-    'Swarm mode is off, so AgentSwarm did not run and no subagents were started. Only the user can turn swarm mode on; do not call AgentSwarm until they do.',
-  isError: true,
-};
 
 const AGENT_SWARM_PARAMETERS = toInputJsonSchema(AgentSwarmToolInputSchema);
 const AGENT_SWARM_PARAMETERS_NO_MODEL = stripSubagentModelParameter(AGENT_SWARM_PARAMETERS);
@@ -113,7 +106,6 @@ export class AgentSwarmTool implements IAgentSwarmTool {
   }
 
   resolveExecution(args: AgentSwarmToolInput): ToolExecution {
-    if (!this.swarmMode.isActive) return SWARM_MODE_OFF_RESULT;
     const agentCount = (args.items?.length ?? 0) + Object.keys(args.resume_agent_ids ?? {}).length;
     return {
       accesses: ToolAccesses.all(),
@@ -132,7 +124,6 @@ export class AgentSwarmTool implements IAgentSwarmTool {
     args: AgentSwarmToolInput,
     context: ExecutableToolContext,
   ): Promise<ExecutableToolResult> {
-    if (!this.swarmMode.isActive) return SWARM_MODE_OFF_RESULT;
     try {
       const result = await this.runSwarm(args, context.signal, context.toolCallId);
       return {
@@ -208,6 +199,7 @@ export class AgentSwarmTool implements IAgentSwarmTool {
         plan: plan!,
       };
     });
+    this.swarmMode.enter('tool');
     const results = await this.swarmService.run({
       callerAgentId: this.callerAgentId,
       tasks,

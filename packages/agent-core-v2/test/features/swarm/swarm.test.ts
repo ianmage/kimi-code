@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
-import { makeAgentScopeContext } from '#/agent/scopeContext/scopeContext';
+import { IAgentScopeContext, makeAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 
 import { type IAgentScopeHandle } from '#/_base/di/scope';
 import { LifecycleScope } from '#/app/scopes';
@@ -28,9 +28,10 @@ import { wrapSystemReminder } from '#/features/reminder/systemReminder';
 import { IAgentSwarmService } from '#/features/swarm/agent/swarm';
 import { AgentSwarmService } from '#/features/swarm/agent/swarmService';
 import SWARM_MODE_ENTER_REMINDER from '../../../src/features/swarm/agent/enter-reminder.md?raw';
-import { swarmKey } from '#/features/swarm/swarmOps';
+import { SwarmModeEnter, swarmKey } from '#/features/swarm/swarmOps';
 import { AgentSwarmToolInputSchema } from '#/features/swarm/tools/agent-swarm/agent-swarm';
 import { AgentSwarmTool } from '#/features/swarm/tools/agent-swarm/agentSwarmTool';
+import { foldWireRecordFacts, groupMessagesIntoSnapshot } from '@moonshot-ai/transcript';
 import {
   FORK_EXPERIMENTAL_UNAVAILABLE,
   FORK_WITH_MODEL_UNAVAILABLE,
@@ -51,6 +52,7 @@ import type { ExecutableToolContext } from '#/tool/toolContract';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { AgentToolRegistryService } from '#/agent/toolRegistry/toolRegistryService';
 import { IAgentLoopService } from '#/agent/loop/loop';
+import { TurnEnded } from '#/agent/loop/turnOps';
 import { IConfigService } from '#/app/config/config';
 import { normalizeAgentProfile, type AgentProfile } from '#/app/agentProfileCatalog/agentProfileCatalog';
 import { ISessionAgentProfileCatalog } from '#/session/sessionAgentProfileCatalog/sessionAgentProfileCatalog';
@@ -87,6 +89,17 @@ function messageText(message: ContextMessage | undefined): string {
   return (
     message?.content.map((part) => (part.type === 'text' ? part.text : '')).join('') ?? ''
   );
+}
+
+async function exitRecordCount(ix: TestInstantiationService): Promise<number> {
+  let count = 0;
+  for await (const record of ix.get(IAppendLogStore).read<WireRecord>(
+    testWireScope('wire', 'swarm-test'),
+    AGENT_WIRE_RECORD_KEY,
+  )) {
+    if (record.type === 'swarm_mode.exit') count += 1;
+  }
+  return count;
 }
 
 function swarmReminder(
@@ -471,14 +484,18 @@ describe('AgentSwarmService', () => {
     expect(messageText(context.get()[1])).toBe('later prompt');
   });
 
-  it('refuses the tool trigger so only the user can turn swarm mode on', async () => {
+  it('accepts the tool trigger and records it as active', async () => {
     const swarm = ix.get(IAgentSwarmService);
     const context = ix.get(IAgentContextMemoryService);
+    const swarmModes: boolean[] = [];
+    const subscription = ix.get(IEventBus).subscribe(AgentStatusUpdated, (event) => {
+      if (event.swarmMode !== undefined) swarmModes.push(event.swarmMode);
+    });
 
-    expect(() => {
-      swarm.enter('tool');
-    }).toThrow('Only the user can turn on swarm mode.');
-    await runInjectionBoundary(ix.get(IAgentLoopService));
+    swarm.enter('tool');
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('tool');
+    expect(swarm.isActive).toBe(true);
 
     const records: WireRecord[] = [];
     for await (const record of ix.get(IAppendLogStore).read<WireRecord>(
@@ -487,15 +504,176 @@ describe('AgentSwarmService', () => {
     )) {
       records.push(record);
     }
-    expect(records).toEqual([]);
-    expect(swarm.isActive).toBe(false);
-    expect(telemetryTrack2).not.toHaveBeenCalled();
+    expect(records).toEqual([
+      {
+        type: 'swarm_mode.enter',
+        agentId: 'test-agent',
+        trigger: 'tool',
+        time: expect.any(Number),
+      },
+    ]);
+    expect(swarmModes).toEqual([true]);
+    expect(telemetryTrack2.mock.calls).toEqual([['swarm_mode_entered', { trigger: 'tool' }]]);
+    subscription.dispose();
+
+    await runInjectionBoundary(ix.get(IAgentLoopService));
+
     expect(context.get()).toHaveLength(0);
   });
 
-  it('ignores tool-triggered entries that older versions recorded, on replay', async () => {
+  it('keeps manual precedence when the tool trigger enters an active mode', async () => {
+    const swarm = ix.get(IAgentSwarmService);
+    swarm.enter('manual');
+
+    const before: WireRecord[] = [];
+    for await (const record of ix.get(IAppendLogStore).read<WireRecord>(
+      testWireScope('wire', 'swarm-test'),
+      AGENT_WIRE_RECORD_KEY,
+    )) {
+      before.push(record);
+    }
+    telemetryTrack2.mockClear();
+
+    swarm.enter('tool');
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('manual');
+    expect(swarm.isActive).toBe(true);
+
+    const after: WireRecord[] = [];
+    for await (const record of ix.get(IAppendLogStore).read<WireRecord>(
+      testWireScope('wire', 'swarm-test'),
+      AGENT_WIRE_RECORD_KEY,
+    )) {
+      after.push(record);
+    }
+    expect(after.length).toBe(before.length);
+    expect(telemetryTrack2).not.toHaveBeenCalled();
+  });
+
+  it('keeps task precedence when the tool trigger enters an active mode', async () => {
+    const swarm = ix.get(IAgentSwarmService);
+    swarm.enter('task');
+
+    const before: WireRecord[] = [];
+    for await (const record of ix.get(IAppendLogStore).read<WireRecord>(
+      testWireScope('wire', 'swarm-test'),
+      AGENT_WIRE_RECORD_KEY,
+    )) {
+      before.push(record);
+    }
+    telemetryTrack2.mockClear();
+
+    swarm.enter('tool');
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('task');
+    expect(swarm.isActive).toBe(true);
+
+    const after: WireRecord[] = [];
+    for await (const record of ix.get(IAppendLogStore).read<WireRecord>(
+      testWireScope('wire', 'swarm-test'),
+      AGENT_WIRE_RECORD_KEY,
+    )) {
+      after.push(record);
+    }
+    expect(after.length).toBe(before.length);
+  });
+
+  it('injects no swarm reminder across a tool-triggered cycle', async () => {
     const swarm = ix.get(IAgentSwarmService);
     const context = ix.get(IAgentContextMemoryService);
+
+    swarm.enter('tool');
+    await runInjectionBoundary(ix.get(IAgentLoopService));
+    swarm.exit();
+    await runInjectionBoundary(ix.get(IAgentLoopService));
+
+    expect(
+      context
+        .get()
+        .filter((m) => m.origin?.kind === 'injection' && m.origin.variant === 'swarm_mode'),
+    ).toHaveLength(0);
+  });
+
+  it('agrees with transcript folding on the active verdict for the same journal', async () => {
+    const swarm = ix.get(IAgentSwarmService);
+    void ix.get(IAgentContextMemoryService);
+    const base = () => groupMessagesIntoSnapshot([]);
+    const sequences: WireRecord[][] = [
+      [{ type: 'swarm_mode.enter', agentId: 'test-agent', trigger: 'tool' }],
+      [
+        { type: 'swarm_mode.enter', agentId: 'test-agent', trigger: 'tool' },
+        { type: 'swarm_mode.exit', agentId: 'test-agent' },
+      ],
+      [{ type: 'swarm_mode.enter', agentId: 'test-agent', trigger: 'manual' }],
+      [
+        { type: 'swarm_mode.enter', agentId: 'test-agent', trigger: 'tool' },
+        { type: 'swarm_mode.exit', agentId: 'test-agent' },
+        { type: 'swarm_mode.enter', agentId: 'test-agent', trigger: 'tool' },
+      ],
+      [{ type: 'swarm_mode.enter', agentId: 'test-agent', trigger: 'task' }],
+    ];
+
+    const pairs: [boolean, boolean][] = [];
+    for (const sequence of sequences) {
+      await restoreTestEventDispatcher(
+        ix.get(IEventDispatcher),
+        ix.get(IAppendLogStore),
+        testWireScope('wire', 'swarm-test'),
+        sequence,
+      );
+      const engineActive = swarm.isActive;
+
+      const folded = foldWireRecordFacts(sequence, base());
+      const transcriptActive = folded.meta.modes?.swarm !== undefined;
+
+      expect(engineActive).toBe(transcriptActive);
+      pairs.push([engineActive, transcriptActive]);
+    }
+
+    expect(pairs).toEqual([
+      [true, true],
+      [false, false],
+      [true, true],
+      [true, true],
+      [true, true],
+    ]);
+  });
+
+  it.each(['completed', 'cancelled', 'failed'] as const)('exits on %s', async (reason) => {
+    const swarm = ix.get(IAgentSwarmService);
+    void ix.get(IAgentContextMemoryService);
+    swarm.enter('tool');
+    const before = await exitRecordCount(ix);
+
+    await ix.get(IEventDispatcher).dispatch(
+      new TurnEnded({ agentId: 'test-agent', turnId: 0, reason }),
+    );
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe(null);
+    expect((await exitRecordCount(ix)) - before).toBe(1);
+  });
+
+  it('keeps the manual trigger active across turn end', async () => {
+    const swarm = ix.get(IAgentSwarmService);
+    void ix.get(IAgentContextMemoryService);
+    swarm.enter('manual');
+    const before = await exitRecordCount(ix);
+
+    await ix.get(IEventDispatcher).dispatch(
+      new TurnEnded({ agentId: 'test-agent', turnId: 0, reason: 'completed' }),
+    );
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('manual');
+    expect((await exitRecordCount(ix)) - before).toBe(0);
+  });
+
+  it('replays tool-triggered entries as active', async () => {
+    const swarm = ix.get(IAgentSwarmService);
+    const context = ix.get(IAgentContextMemoryService);
+    const swarmModes: boolean[] = [];
+    const subscription = ix.get(IEventBus).subscribe(AgentStatusUpdated, (event) => {
+      if (event.swarmMode !== undefined) swarmModes.push(event.swarmMode);
+    });
     await restoreTestEventDispatcher(
       ix.get(IEventDispatcher),
       ix.get(IAppendLogStore),
@@ -505,12 +683,21 @@ describe('AgentSwarmService', () => {
 
     await runInjectionBoundary(ix.get(IAgentLoopService));
 
-    expect(swarm.isActive).toBe(false);
+    expect(swarm.isActive).toBe(true);
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('tool');
     expect(context.get()).toHaveLength(0);
+    expect(swarmModes).toEqual([]);
+
+    await ix.get(IEventDispatcher).dispatch(
+      new SwarmModeEnter({ agentId: ix.get(IAgentScopeContext).agentId, trigger: 'tool' }),
+    );
+
+    expect(swarmModes).toEqual([true]);
+    subscription.dispose();
 
     swarm.enter('manual');
 
-    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('manual');
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('tool');
   });
 
   it('does not duplicate the enter guidance on resume while it is still live in history', async () => {
@@ -575,6 +762,61 @@ describe('AgentSwarmService', () => {
 
     expect(swarm.isActive).toBe(true);
     expect(context.get()).toHaveLength(1);
+  });
+
+  it('keeps manual and task replay semantics unchanged', async () => {
+    const swarm = ix.get(IAgentSwarmService);
+    const context = ix.get(IAgentContextMemoryService);
+    await restoreTestEventDispatcher(
+      ix.get(IEventDispatcher),
+      ix.get(IAppendLogStore),
+      testWireScope('wire', 'swarm-test'),
+      [
+        { type: 'swarm_mode.enter', trigger: 'manual' },
+        { type: 'swarm_mode.exit' },
+      ],
+    );
+
+    await runInjectionBoundary(ix.get(IAgentLoopService));
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe(null);
+    expect(swarm.isActive).toBe(false);
+    expect(context.get()).toHaveLength(0);
+
+    await restoreTestEventDispatcher(
+      ix.get(IEventDispatcher),
+      ix.get(IAppendLogStore),
+      testWireScope('wire', 'swarm-test'),
+      [{ type: 'swarm_mode.enter', trigger: 'task' }],
+    );
+
+    await runInjectionBoundary(ix.get(IAgentLoopService));
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('task');
+    expect(swarm.isActive).toBe(true);
+    expect(context.get()).toHaveLength(1);
+  });
+
+  it('keeps an unknown trigger active without auto-exiting', async () => {
+    const swarm = ix.get(IAgentSwarmService);
+    void ix.get(IAgentContextMemoryService);
+    await restoreTestEventDispatcher(
+      ix.get(IEventDispatcher),
+      ix.get(IAppendLogStore),
+      testWireScope('wire', 'swarm-test'),
+      [{ type: 'swarm_mode.enter', trigger: 'bogus' }],
+    );
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('bogus');
+    expect(swarm.isActive).toBe(true);
+
+    const before = await exitRecordCount(ix);
+    await ix.get(IEventDispatcher).dispatch(
+      new TurnEnded({ agentId: 'test-agent', turnId: 0, reason: 'completed' }),
+    );
+
+    expect(ix.get(IAgentStateService).get(swarmKey)).toBe('bogus');
+    expect((await exitRecordCount(ix)) - before).toBe(0);
   });
 
   it('dispatch persists enter/exit records and replay rebuilds the trigger (silent)', async () => {
@@ -648,15 +890,55 @@ describe('AgentSwarmService', () => {
     expect(formatDenyMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('lets the other tools in a mixed batch run while swarm mode is off', async () => {
+  it('blocks an AgentSwarm call mixed with other tools while swarm mode is off', async () => {
     ix.get(IAgentSwarmService);
     const decision = await fire(
       hookContext([toolCall('AgentSwarm', 'call_swarm'), toolCall('Bash', 'call_bash')]),
     );
 
-    expect(decision).toBeUndefined();
-    expect(permissionGateRan).toBe(true);
-    expect(formatDenyMessage).not.toHaveBeenCalled();
+    expect(decision).toEqual({
+      veto: {
+        output: expect.stringContaining('must be the only tool call'),
+        isError: true,
+      },
+    });
+    expect(permissionGateRan).toBe(false);
+    expect(formatDenyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks a batch with multiple AgentSwarm calls while swarm mode is off', async () => {
+    ix.get(IAgentSwarmService);
+    const decision = await fire(
+      hookContext([toolCall('AgentSwarm', 'call_swarm_1'), toolCall('AgentSwarm', 'call_swarm_2')]),
+    );
+
+    expect(decision).toEqual({
+      veto: {
+        output: expect.stringContaining('one swarm at a time'),
+        isError: true,
+      },
+    });
+    expect(permissionGateRan).toBe(false);
+  });
+
+  it('reports both violations for multiple AgentSwarm calls mixed with other tools', async () => {
+    ix.get(IAgentSwarmService);
+    const decision = await fire(
+      hookContext([
+        toolCall('AgentSwarm', 'call_swarm_1'),
+        toolCall('AgentSwarm', 'call_swarm_2'),
+        toolCall('Bash', 'call_bash'),
+      ]),
+    );
+
+    expect(decision).toEqual({
+      veto: {
+        output: expect.stringContaining('one swarm at a time'),
+        isError: true,
+      },
+    });
+    expect(decision?.veto?.output).toContain('must not be combined with other tools');
+    expect(permissionGateRan).toBe(false);
   });
 
   it('abstains on a single AgentSwarm call', async () => {
@@ -804,7 +1086,7 @@ describe('AgentSwarmTool', () => {
 
     const result = await executeTool(tool, context(input));
 
-    expect(swarmMode.enter).not.toHaveBeenCalled();
+    expect(swarmMode.enter.mock.calls).toEqual([['tool']]);
     expect(host.swarmService.run).toHaveBeenCalledTimes(1);
     expect(host.swarmService.run).toHaveBeenCalledWith(expect.objectContaining({ tasks: [
       {
@@ -873,10 +1155,21 @@ describe('AgentSwarmTool', () => {
     expect(execution.matchesRule).toBeUndefined();
   });
 
-  it('rejects the call without starting subagents while swarm mode is off', async () => {
-    const host = mockSwarmHost();
+  it('runs a call while swarm mode is off and enters the mode for it', async () => {
+    const run = vi.fn().mockResolvedValue([]);
+    const host = mockSwarmHost({ run });
     const swarmMode = mockSwarmMode(false);
     const tool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), swarmMode, stubConfig(), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig(), stubCallerProfile()), stubCallerProfile());
+
+    const execution = tool.resolveExecution({
+      description: 'Review files',
+      prompt_template: 'Review {{item}}',
+      items: ['src/a.ts', 'src/b.ts'],
+    });
+
+    expect(execution.isError).not.toBe(true);
+    if (execution.isError === true) throw new Error('expected a runnable execution');
+    expect(typeof execution.execute).toBe('function');
 
     const result = await executeTool(
       tool,
@@ -887,15 +1180,15 @@ describe('AgentSwarmTool', () => {
       }),
     );
 
-    expect(result).toEqual({
-      isError: true,
-      output: expect.stringContaining('Swarm mode is off, so AgentSwarm did not run'),
-    });
-    expect(swarmMode.enter).not.toHaveBeenCalled();
-    expect(host.swarmService.run).not.toHaveBeenCalled();
+    expect(result.isError).toBeUndefined();
+    expect(swarmMode.enter.mock.calls).toEqual([['tool']]);
+    expect(swarmMode.enter.mock.invocationCallOrder[0]).toBeLessThan(
+      run.mock.invocationCallOrder[0]!,
+    );
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects the call when swarm mode turns off before it executes', async () => {
+  it('enters the mode at execution time when it went inactive after resolution', async () => {
     const host = mockSwarmHost();
     const swarmMode = mockSwarmMode();
     const tool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), swarmMode, stubConfig(), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig(), stubCallerProfile()), stubCallerProfile());
@@ -909,9 +1202,35 @@ describe('AgentSwarmTool', () => {
     swarmMode.isActive = false;
     const result = await execution.execute(context({}));
 
-    expect(result.isError).toBe(true);
-    expect(result.output).toContain('Swarm mode is off, so AgentSwarm did not run');
-    expect(host.swarmService.run).not.toHaveBeenCalled();
+    expect(result.isError).toBeUndefined();
+    expect(host.swarmService.run).toHaveBeenCalledTimes(1);
+    expect(swarmMode.enter.mock.calls).toEqual([['tool']]);
+  });
+
+  it('reports the failure message when the swarm run throws', async () => {
+    const host = mockSwarmHost({ run: vi.fn().mockRejectedValue(new Error('swarm exploded')) });
+    const swarmMode = mockSwarmMode(false);
+    const tool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), swarmMode, stubConfig(), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig(), stubCallerProfile()), stubCallerProfile());
+
+    const result = await executeTool(
+      tool,
+      context({
+        description: 'Review files',
+        prompt_template: 'Review {{item}}',
+        items: ['src/a.ts', 'src/b.ts'],
+      }),
+    );
+
+    expect(result).toEqual({ output: 'swarm exploded', isError: true });
+  });
+
+  it('keeps description and parameters independent of the active state', () => {
+    const host = mockSwarmHost();
+    const inactiveTool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), mockSwarmMode(false), stubConfig(), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig(), stubCallerProfile()), stubCallerProfile());
+    const activeTool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), mockSwarmMode(true), stubConfig(), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig(), stubCallerProfile()), stubCallerProfile());
+
+    expect(inactiveTool.description).toEqual(activeTool.description);
+    expect(inactiveTool.parameters).toEqual(activeTool.parameters);
   });
 
   it('description documents the {{item}} placeholder', () => {
@@ -957,7 +1276,7 @@ describe('AgentSwarmTool', () => {
     expect(host.swarmService.run).not.toHaveBeenCalled();
   });
 
-  it('rejects invalid launch shapes at execution time', async () => {
+  it('rejects invalid launch shapes at execution time without entering the mode', async () => {
     const cases = [
       {
         input: {
@@ -1003,13 +1322,15 @@ describe('AgentSwarmTool', () => {
 
     for (const testCase of cases) {
       const host = mockSwarmHost();
-      const tool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), mockSwarmMode(), stubConfig(), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig(), stubCallerProfile()), stubCallerProfile());
+      const swarmMode = mockSwarmMode();
+      const tool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), swarmMode, stubConfig(), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig(), stubCallerProfile()), stubCallerProfile());
 
       const result = await executeTool(tool, context(testCase.input));
 
       expect(result.output).toBe(testCase.output);
       expect(result.isError).toBe(true);
       expect(host.swarmService.run).not.toHaveBeenCalled();
+      expect(swarmMode.enter).not.toHaveBeenCalled();
     }
   });
 

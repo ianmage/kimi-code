@@ -1755,7 +1755,7 @@ describe('foldWireRecordFacts (cold facts)', () => {
     expect(stillPlanning.meta.modes).toEqual({ plan: {} });
   });
 
-  it('keeps a model-started swarm that an older version never closed out of meta.modes', () => {
+  it('folds a model-started swarm into meta.modes until it exits', () => {
     const base = baseWithMarker();
     const markersOf = (snapshot: AgentTranscriptSnapshot) =>
       snapshot.items
@@ -1766,8 +1766,18 @@ describe('foldWireRecordFacts (cold facts)', () => {
       [{ type: 'swarm_mode.enter', agentId: 'main', trigger: 'tool', time: 1000 }],
       base,
     );
-    expect(modelStarted.meta.modes?.swarm).toBeUndefined();
+    expect(modelStarted.meta.modes).toEqual({ swarm: {} });
     expect(markersOf(modelStarted)).toEqual(['compaction', 'swarm.enter']);
+
+    const exited = foldWireRecordFacts(
+      [
+        { type: 'swarm_mode.enter', agentId: 'main', trigger: 'tool', time: 1000 },
+        { type: 'swarm_mode.exit', agentId: 'main', time: 2000 },
+      ],
+      base,
+    );
+    expect(exited.meta.modes).toEqual({});
+    expect(markersOf(exited).slice(-2)).toEqual(['swarm.enter', 'swarm.exit']);
 
     const userStarted = foldWireRecordFacts(
       [{ type: 'swarm_mode.enter', agentId: 'main', trigger: 'manual', time: 1000 }],
