@@ -8,6 +8,7 @@ import type {
   ToolCall,
 } from '@moonshot-ai/kimi-code-sdk';
 
+import { isAgentSwarmRejection } from '../components/messages/agent-swarm-progress';
 import { ToolCallComponent } from '../components/messages/tool-call';
 import { REMOTE_APPROVED_LABEL } from '../../constant/app';
 import { ShellRunComponent } from '../components/messages/shell-run';
@@ -512,6 +513,10 @@ export class SessionReplayRenderer {
       output: toolResultOutput(message.content),
       is_error: message.isError,
     };
+    if (call.name === 'AgentSwarm' && result.is_error === true && isAgentSwarmRejection(result.output)) {
+      this.host.streamingUI.discardToolCall(toolCallId);
+      return;
+    }
     call.result = result;
     this.applyStepContext(context);
     this.host.streamingUI.onToolCallEnd(toolCallId, result);
