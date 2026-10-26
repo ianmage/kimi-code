@@ -496,7 +496,7 @@ export function foldWireRecordFacts(
         break;
       }
       case 'swarm_mode.enter': {
-        if (record['trigger'] !== 'tool') swarmActive = true;
+        swarmActive = true;
         pushMarker('swarm.enter', record);
         break;
       }

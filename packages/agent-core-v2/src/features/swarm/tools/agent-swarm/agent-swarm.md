@@ -1,6 +1,12 @@
 Launch multiple subagents from one prompt template, existing agent resumes, or both.
 
-AgentSwarm runs only while swarm mode is on, and only the user can turn swarm mode on. When swarm mode is off, do not call AgentSwarm: the call is rejected and no subagents start.
+Launch a swarm when both hold:
+- You can list ≥3 items up front.
+- The items touch different files and have no ordering between them.
+
+Weighing it: a swarm pays when each item is more than one read, and the full intermediate output would not fit your context.
+
+Do it yourself for one file with several small edits, a change-then-test loop, or items that share intermediate state. "It looks big" alone is not a reason.
 
 Use AgentSwarm when many subagents should run the same kind of task over different inputs. The placeholder is exactly `{{item}}`. For example, with `prompt_template` set to `Review {{item}} for likely regressions.` and `items` set to `["src/a.ts", "src/b.ts"]`, AgentSwarm launches two new subagents with those two concrete prompts. For a few differently-shaped tasks, make separate `Agent` calls in one message instead.
 
