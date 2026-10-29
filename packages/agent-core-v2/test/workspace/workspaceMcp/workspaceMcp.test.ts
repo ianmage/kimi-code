@@ -110,6 +110,7 @@ describe('WorkspaceMcpService', () => {
   let tunablesValue: McpTunables;
   let tunablesFn: Mock<() => McpTunables>;
   let configChanges: AsyncEmitter<McpServersChangeEvent>;
+  let tunablesChanges: Emitter<McpTunables>;
   let assemblyEvents: Emitter<SessionWillCreateEvent>;
   let oauthService: McpOAuthService;
   let oauthScheduler: ManualMcpOAuthScheduler;
@@ -122,6 +123,7 @@ describe('WorkspaceMcpService', () => {
     tunablesValue = {};
     tunablesFn = vi.fn(() => tunablesValue);
     configChanges = disposables.add(new AsyncEmitter<McpServersChangeEvent>());
+    tunablesChanges = disposables.add(new Emitter<McpTunables>());
     assemblyEvents = disposables.add(new Emitter<SessionWillCreateEvent>());
     oauthScheduler = new ManualMcpOAuthScheduler();
     oauthService = new McpOAuthService({
@@ -146,6 +148,7 @@ describe('WorkspaceMcpService', () => {
       servers: () => current,
       tunables: () => tunablesFn() as McpTunables,
       onDidChange: configChanges.event,
+      onDidChangeTunables: tunablesChanges.event,
     };
   }
 
@@ -194,7 +197,7 @@ describe('WorkspaceMcpService', () => {
     expect(Object.keys(connectAll.mock.calls[0]?.[0] ?? {}).toSorted()).toEqual(['alpha', 'beta']);
   });
 
-  it('reads timeout tunables from the config domain at connect', async () => {
+  it('reads timeout tunables from the config domain at connect and reschedules on retry changes', async () => {
     tunablesValue = { startupTimeoutMs: 4321, toolTimeoutMs: 9876 };
     current = { alpha: stdioServer() };
 
@@ -204,6 +207,9 @@ describe('WorkspaceMcpService', () => {
 
     expect(manager.get('alpha')?.status).toBe('connected');
     expect(tunablesFn).toHaveBeenCalled();
+    const reschedule = vi.spyOn(manager, 'rescheduleRetries');
+    tunablesChanges.fire({ reconnectInitialDelayMs: 25, reconnectMaxDelayMs: 100 });
+    expect(reschedule).toHaveBeenCalledTimes(1);
   }, 20000);
 
   it('applies upserts and removals from config change events', async () => {

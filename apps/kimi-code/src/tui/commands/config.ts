@@ -48,7 +48,6 @@ import {
 import { DEFAULT_OAUTH_PROVIDER_NAME } from '#/constant/app';
 import { NO_ACTIVE_SESSION_MESSAGE, TUI_MODE_RESTART_NOTICE } from '../constant/kimi-tui';
 import { formatErrorMessage } from '../utils/event-payload';
-import { isSessionOccupiedError } from '../utils/session-lock-errors';
 import { setMarkdownMermaidMode, type MermaidRenderMode } from '../utils/markdown-options';
 import {
   effectiveModelForHost,
@@ -151,8 +150,9 @@ export async function handleCompactCommand(host: SlashCommandHost, args: string)
   try {
     await session.compact({ instruction: customInstruction });
   } catch (error) {
-    if (!isSessionOccupiedError(error)) throw error;
-    host.showError(formatErrorMessage(error));
+    const message = formatErrorMessage(error);
+    host.setAppState({ isCompacting: false });
+    host.failSessionRequest(message);
   }
 }
 

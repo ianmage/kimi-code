@@ -7,6 +7,7 @@ import {
   type ToolExecution,
 } from '#/tool/toolContract';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
+import { IOAuthService } from '#/app/auth/auth';
 import { registerAgentToolService } from '#/agent/toolRegistry/toolContribution';
 import type { IHostEnvironment } from '#/os/interface/hostEnvironment';
 import type { IHostFileSystem } from '#/os/interface/hostFileSystem';
@@ -74,7 +75,8 @@ export class GrepTool implements IGrepTool {
     @ISessionWorkspaceContext private readonly workspaceCtx: ISessionWorkspaceContext,
     @ITelemetryService private readonly telemetry: ITelemetryService,
     @ILogService private readonly log: ILogService,
-    private readonly skillCatalog?: ISessionSkillCatalog,
+    @ISessionSkillCatalog private readonly skillCatalog?: ISessionSkillCatalog,
+    @IOAuthService private readonly auth?: IOAuthService,
   ) {}
 
   private workspace(view: RuntimeWorkspaceView): WorkspaceConfig {
@@ -154,6 +156,7 @@ export class GrepTool implements IGrepTool {
       const resolution = await ensureRgPath(this.createRgProbe(processService), {
         signal,
         allowCachedFallback: true,
+        resolveRegion: () => this.auth?.getRegion(),
       });
       rgPath = resolution.path;
       if (resolution.source !== 'system-path') {

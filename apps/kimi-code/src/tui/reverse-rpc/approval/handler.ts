@@ -3,14 +3,21 @@ import type { ApprovalHandler, ApprovalRequest, ApprovalResponse } from '@moonsh
 import { REMOTE_APPROVED_LABEL } from '#/constant/app';
 
 import { adaptApprovalRequest } from './adapter';
+import type { ProgramStatusInteractionTracker } from '#/tui/controllers/program-status';
+
 import type { ApprovalController } from './controller';
 import { consultRemoteApproval } from './remote-approval';
 
 export function createApprovalRequestHandler(
   controller: ApprovalController,
   onResponse?: (request: ApprovalRequest, response: ApprovalResponse) => void,
+  interactionTracker?: ProgramStatusInteractionTracker,
 ): ApprovalHandler {
   return async (event): Promise<ApprovalResponse> => {
+    const interaction = interactionTracker?.startInteraction({
+      agentId: event.agentId,
+      kind: 'permission',
+    });
     try {
       const data = adaptApprovalRequest(event);
       if (
@@ -36,6 +43,8 @@ export function createApprovalRequestHandler(
       };
       onResponse?.(event, response);
       return response;
+    } finally {
+      if (interaction !== undefined) interactionTracker?.endInteraction(interaction);
     }
   };
 }
